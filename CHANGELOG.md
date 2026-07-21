@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Compatibility with `@earendil-works/pi-ai` v0.80+.** The `./oauth` subpath export in
+  pi-ai v0.80.10 now only exports TypeScript types, not the runtime OAuth functions
+  (`loginAnthropic`, `openaiCodexOAuthProvider`, `refreshAnthropicToken`). `getModel` moved
+  to `@earendil-works/pi-ai/compat`. The extension now discovers `@earendil-works/pi-ai` on
+  disk and uses dynamic `import()` with explicit `dist/` paths to load the OAuth
+  implementations, bypassing jiti's broken subpath export resolution.
+
 ## [1.13.14] - 2026-07-07
 
 ### Fixed

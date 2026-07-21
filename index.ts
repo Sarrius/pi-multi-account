@@ -36,18 +36,44 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getModel } from "@earendil-works/pi-ai";
-import {
-	loginAnthropic,
-	openaiCodexOAuthProvider,
-	refreshAnthropicToken,
-} from "@earendil-works/pi-ai/oauth";
 import {
 	CURSOR_BASE,
 	isCursorProviderId,
 	setupCursorSubscription,
 } from "./cursor-bridge.ts";
+
+// jiti doesn't resolve @earendil-works/pi-ai subpath exports, so we find the
+// package on disk and import the actual dist/ files directly.
+const PI_AI_BASE = (() => {
+	// Walk up from this file to find @earendil-works/pi-ai in any node_modules
+	let dir = dirname(fileURLToPath(import.meta.url));
+	for (let i = 0; i < 10; i++) {
+		const candidate = join(dir, "node_modules", "@earendil-works", "pi-ai");
+		if (existsSync(join(candidate, "package.json"))) return candidate;
+		dir = dirname(dir);
+	}
+	return "";
+})();
+
+let anthropicOAuth: any;
+let openaiCodexOAuth: any;
+let _getModel: any;
+let piAiLoaded = false;
+async function ensurePiAiModules() {
+	if (piAiLoaded) return;
+	if (!PI_AI_BASE) throw new Error("@earendil-works/pi-ai not found");
+	const [{ anthropicProvider }, { openaiCodexProvider }, compat] = await Promise.all([
+		import(PI_AI_BASE + "/dist/providers/anthropic.js"),
+		import(PI_AI_BASE + "/dist/providers/openai-codex.js"),
+		import(PI_AI_BASE + "/dist/compat.js"),
+	]);
+	anthropicOAuth = anthropicProvider().auth.oauth;
+	openaiCodexOAuth = openaiCodexProvider().auth.oauth;
+	_getModel = compat.getModel;
+	piAiLoaded = true;
+}
 import {
 	fetchUsageSnapshot,
 	formatUsageCompact,
@@ -1088,7 +1114,7 @@ function parseTarget(
 // ---------------------------------------------------------------------------
 
 function anthropicModelDef(id: string, providerId: string) {
-	const canonical = getModel("anthropic", id as any) as any;
+	const canonical = _getModel ? (_getModel("anthropic", id as any) as any) : undefined;
 	if (canonical) return { ...canonical, provider: providerId };
 	return {
 		id,
@@ -1142,7 +1168,7 @@ export function mergeRefreshedCredentials(credentials: any, refreshed: any) {
 async function refreshAnthropicCredentials(credentials: any) {
 	return mergeRefreshedCredentials(
 		credentials,
-		await refreshAnthropicToken(credentials.refresh),
+		await anthropicOAuth.refresh(credentials),
 	);
 }
 
@@ -1156,7 +1182,7 @@ function registerAnthropicSlot(pi: ExtensionAPI, id: string) {
 		oauth: {
 			name: `Claude Pro/Max (${id})`,
 			async login(callbacks: any) {
-				return rejectDuplicateLogin(id, await loginAnthropic(callbacks));
+				return rejectDuplicateLogin(id, await anthropicOAuth.login(callbacks));
 			},
 			refreshToken: refreshAnthropicCredentials,
 			getApiKey: (credentials: any) => credentials.access,
@@ -1168,15 +1194,14 @@ function registerAnthropicSlot(pi: ExtensionAPI, id: string) {
 function codexOAuthOverride(providerId: string, name: string) {
 	return {
 		name,
-		usesCallbackServer: openaiCodexOAuthProvider.usesCallbackServer,
 		async login(callbacks: any) {
 			return rejectDuplicateLogin(
 				providerId,
-				await openaiCodexOAuthProvider.login(callbacks),
+				await openaiCodexOAuth.login(callbacks),
 			);
 		},
-		refreshToken: openaiCodexOAuthProvider.refreshToken,
-		getApiKey: openaiCodexOAuthProvider.getApiKey,
+		refreshToken: (credentials: any) => openaiCodexOAuth.refresh(credentials),
+		getApiKey: (credentials: any) => credentials.access,
 	};
 }
 
@@ -1781,7 +1806,7 @@ function anthropicOAuthOverride(providerId: string, name: string) {
 		name,
 		usesCallbackServer: true,
 		async login(callbacks: any) {
-			return rejectDuplicateLogin(providerId, await loginAnthropic(callbacks));
+			return rejectDuplicateLogin(providerId, await anthropicOAuth.login(callbacks));
 		},
 		refreshToken: refreshAnthropicCredentials,
 		getApiKey: (credentials: any) => credentials.access,
@@ -1793,6 +1818,9 @@ function anthropicOAuthOverride(providerId: string, name: string) {
 // ===========================================================================
 
 export default function piMultiAccount(pi: ExtensionAPI) {
+	// Kick off module loading (async, but all consumers are async event handlers
+	// that fire after pi startup completes, so the modules will be ready).
+	void ensurePiAiModules();
 	let config = loadConfig();
 	debugLogEnabled = config.debugLog;
 	let configuredFallbacks = config.fallbacks.slice();
@@ -2094,7 +2122,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			} else if (family === "openai-codex") {
 				refreshed = mergeRefreshedCredentials(
 					entry,
-					await openaiCodexOAuthProvider.refreshToken(entry as any),
+					await openaiCodexOAuth.refresh(entry as any),
 				);
 			} else if (family === "cursor") {
 				const authMod = await import(
