@@ -1172,6 +1172,51 @@ async function refreshAnthropicCredentials(credentials: any) {
 	);
 }
 
+/** Adapt Pi extension OAuth callbacks to pi-ai's current AuthInteraction shape. */
+function toAuthInteraction(callbacks: any) {
+	return {
+		signal: callbacks?.signal,
+		notify(notification: any) {
+			if (!notification || typeof notification !== "object") {
+				callbacks?.onProgress?.(String(notification ?? ""));
+				return;
+			}
+			if (notification.type === "auth_url") {
+				callbacks?.onAuth?.({
+					url: notification.url,
+					instructions: notification.instructions,
+				});
+				return;
+			}
+			if (notification.type === "device_code") {
+				callbacks?.onDeviceCode?.({
+					userCode: notification.userCode,
+					verificationUri: notification.verificationUri,
+					intervalSeconds: notification.intervalSeconds,
+					expiresInSeconds: notification.expiresInSeconds,
+				});
+				return;
+			}
+			callbacks?.onProgress?.(
+				typeof notification.message === "string"
+					? notification.message
+					: JSON.stringify(notification),
+			);
+		},
+		prompt(prompt: any) {
+			if (prompt?.type === "select") return callbacks.onSelect(prompt);
+			if (prompt?.type === "manual_code" && callbacks?.onManualCodeInput) {
+				return callbacks.onManualCodeInput();
+			}
+			return callbacks.onPrompt({
+				message: prompt?.message ?? "",
+				placeholder: prompt?.placeholder,
+				allowEmpty: prompt?.allowEmpty,
+			});
+		},
+	};
+}
+
 function registerAnthropicSlot(pi: ExtensionAPI, id: string) {
 	if (id === ANTHROPIC_BASE) return; // base provider: oauth + shaping registered in piMultiAccount()
 	const models = DEFAULT_ANTHROPIC_MODELS.map((m) => anthropicModelDef(m, id));
@@ -1182,7 +1227,7 @@ function registerAnthropicSlot(pi: ExtensionAPI, id: string) {
 		oauth: {
 			name: `Claude Pro/Max (${id})`,
 			async login(callbacks: any) {
-				return rejectDuplicateLogin(id, await anthropicOAuth.login(callbacks));
+				return rejectDuplicateLogin(id, await anthropicOAuth.login(toAuthInteraction(callbacks)));
 			},
 			refreshToken: refreshAnthropicCredentials,
 			getApiKey: (credentials: any) => credentials.access,
@@ -1197,7 +1242,7 @@ function codexOAuthOverride(providerId: string, name: string) {
 		async login(callbacks: any) {
 			return rejectDuplicateLogin(
 				providerId,
-				await openaiCodexOAuth.login(callbacks),
+				await openaiCodexOAuth.login(toAuthInteraction(callbacks)),
 			);
 		},
 		refreshToken: (credentials: any) => openaiCodexOAuth.refresh(credentials),
@@ -1806,7 +1851,7 @@ function anthropicOAuthOverride(providerId: string, name: string) {
 		name,
 		usesCallbackServer: true,
 		async login(callbacks: any) {
-			return rejectDuplicateLogin(providerId, await anthropicOAuth.login(callbacks));
+			return rejectDuplicateLogin(providerId, await anthropicOAuth.login(toAuthInteraction(callbacks)));
 		},
 		refreshToken: refreshAnthropicCredentials,
 		getApiKey: (credentials: any) => credentials.access,
