@@ -58,11 +58,9 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.80.10",
     "@earendil-works/pi-coding-agent": "^0.80.10",
     "@types/node": "^22.15.3",
     "typescript": "^6.0.3"
@@ -71,5 +69,8 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.80.10"
   }
 }
