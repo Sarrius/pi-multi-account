@@ -2322,7 +2322,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let desiredThinkingLevel: any;
 
 	function captureDesiredThinking() {
-		desiredThinkingLevel = config.reasoningLevel;
+		// Capture the session's ACTUAL thinking level (the per-agent configured value,
+		// e.g. Mimir=low, Brokkr=high) rather than the global config.reasoningLevel.
+		// Using the global default here clobbered per-agent thinking on every agent_start.
+		// This still preserves the level across failovers via restoreDesiredThinking.
+		desiredThinkingLevel = (pi as any).getThinkingLevel?.() ?? config.reasoningLevel;
 		try {
 			(pi as any).setThinkingLevel?.(desiredThinkingLevel);
 		} catch {
