@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Persisted Codex model catalogs now seed numbered account aliases during startup, before Pi
+  resolves saved scoped models. Empty catalogs and disabled model discovery continue to use the
+  host/static fallback instead.
+
 ## [1.14.3] - 2026-08-02
 
 ### Fixed

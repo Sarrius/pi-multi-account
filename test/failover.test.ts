@@ -3579,6 +3579,101 @@ test("failover messages are stamped with the running version so a stale (un-rest
 	);
 });
 
+test("persisted Codex catalog is registered before session_start so scoped models can resolve", () => {
+	const provider = "openai-codex-account-2";
+	const model = {
+		id: "gpt-5.6-sol",
+		name: "GPT-5.6 Sol",
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
+		contextWindow: 272_000,
+		maxTokens: 128_000,
+	};
+	const t = setup({
+		config: { autoDiscoverModels: true },
+		seedState: {
+			stateVersion: 5,
+			codexModelCatalogByProvider: {
+				[provider]: { fetchedAt: Date.now(), models: [model] },
+			},
+		},
+	});
+
+	assert.equal(
+		t.ctx.modelRegistry.find(provider, model.id)?.name,
+		model.name,
+		"the cached alias model must exist during extension initialization, before Pi resolves enabledModels",
+	);
+});
+
+test("an empty persisted Codex catalog keeps the static fallback through session_start", async () => {
+	const provider = "openai-codex-account-2";
+	const t = setup({
+		config: { autoDiscoverModels: true },
+		seedState: {
+			stateVersion: 5,
+			codexModelCatalogByProvider: {
+				[provider]: { fetchedAt: Date.now(), models: [] },
+			},
+		},
+	});
+
+	await t.fire("session_start");
+	assert.equal(t.ctx.modelRegistry.find(provider, "gpt-5.5")?.name, "GPT-5.5");
+	await t.fire("session_shutdown");
+});
+
+test("disabled Codex discovery ignores persisted catalogs and keeps host models on aliases", async () => {
+	const provider = "openai-codex-account-2";
+	const t = setup({
+		config: { autoDiscoverModels: false },
+		hostCodexModels: ["gpt-5.7-sol"],
+		seedState: {
+			stateVersion: 5,
+			codexModelCatalogByProvider: {
+				[provider]: {
+					fetchedAt: Date.now(),
+					models: [{ id: "gpt-5.6-sol", name: "Cached 5.6 Sol" }],
+				},
+			},
+		},
+	});
+
+	await t.fire("session_start");
+	assert.equal(t.ctx.modelRegistry.find(provider, "gpt-5.7-sol")?.id, "gpt-5.7-sol");
+	assert.equal(t.ctx.modelRegistry.find(provider, "gpt-5.6-sol"), undefined);
+	await t.fire("session_shutdown");
+});
+
+test("reload disabling Codex discovery replaces cached alias models with host models", async () => {
+	const provider = "openai-codex-account-2";
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { autoDiscoverModels: true },
+		hostCodexModels: ["gpt-5.7-sol"],
+		seedState: {
+			stateVersion: 5,
+			codexModelCatalogByProvider: {
+				[provider]: {
+					fetchedAt: Date.now(),
+					models: [{ id: "gpt-5.6-sol", name: "Cached 5.6 Sol" }],
+				},
+			},
+		},
+	});
+	await t.fire("session_start");
+	assert.equal(t.ctx.modelRegistry.find(provider, "gpt-5.6-sol")?.name, "Cached 5.6 Sol");
+
+	writeFileSync(CONFIG, JSON.stringify({ autoDiscoverModels: false }));
+	await t.command("reload");
+	assert.equal(t.ctx.modelRegistry.find(provider, "gpt-5.7-sol")?.id, "gpt-5.7-sol");
+	assert.equal(t.ctx.modelRegistry.find(provider, "gpt-5.6-sol"), undefined);
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.equal(t.rec.setModels.at(-1), provider + "/gpt-5.7-sol");
+	await t.fire("session_shutdown");
+});
+
 test(
 	"live OpenAI catalog adds an unseen flagship to account aliases and failover selects it at high",
 	{ concurrency: false },

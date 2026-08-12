@@ -2742,7 +2742,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// authoritative for that specific account.
 		for (const provider of registeredSlots) {
 			if (classifyProvider(provider, config.qwenProvider) !== "openai-codex") continue;
-			if (codexModelCatalogByProvider.has(provider)) continue;
+			if (
+				config.autoDiscoverModels &&
+				codexModelCatalogByProvider.get(provider)?.models.length
+			)
+				continue;
 			registerCodexCatalog(pi, provider, merged as Array<Record<string, unknown>>);
 		}
 	}
@@ -2830,7 +2834,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		discoveredCodexModelOrder = allKnown.map((model) => model.id);
 
 		for (const provider of providers) {
-			const models = codexModelCatalogByProvider.get(provider)?.models ?? registryFallback;
+			const cached = codexModelCatalogByProvider.get(provider)?.models;
+			const models = cached?.length ? cached : registryFallback;
 			registerCodexCatalog(pi, provider, models as Array<Record<string, unknown>>);
 		}
 		// Also keep unauthenticated spare login slots current so a newly logged-in account can select
@@ -3594,8 +3599,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				if (index <= 1) continue; // base provider is native
 				if (registeredSlots.has(id)) continue;
 				if (family === "anthropic") registerAnthropicSlot(pi, id);
-				else if (family === "openai-codex") registerCodexSlot(pi, id);
-				else if (family === "ollama") registerApiKeySlot(pi, id, "ollama");
+				else if (family === "openai-codex") {
+					const cached = codexModelCatalogByProvider.get(id)?.models;
+					registerCodexSlot(
+						pi,
+						id,
+						config.autoDiscoverModels && cached?.length
+							? (cached as Array<Record<string, unknown>>)
+							: undefined,
+					);
+				} else if (family === "ollama") registerApiKeySlot(pi, id, "ollama");
 				else if (family === "qwen") registerApiKeySlot(pi, id, "qwen");
 				registeredSlots.add(id);
 			}
@@ -5154,9 +5167,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 
 		if (command === "reload") {
+			const previousAutoDiscoverModels = config.autoDiscoverModels;
 			config = loadConfig();
 			debugLogEnabled = config.debugLog;
 			configuredFallbacks = config.fallbacks.slice();
+			if (config.autoDiscoverModels !== previousAutoDiscoverModels) {
+				registryCodexModelOrder = [];
+				if (!config.autoDiscoverModels) discoveredCodexModelOrder = [];
+			}
 			refreshDiscovery(true, ctx);
 			startUsageStatusTimer(ctx);
 			runBackground("reload account metadata refresh", ctx, async () => {
