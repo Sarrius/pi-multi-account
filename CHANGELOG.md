@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.0] - 2026-08-16
+
+### Added
+
+- **The interrupted turn now survives the switch.** On a quota failover the turn that triggered the switch is exactly the turn pi-ai refuses to replay: `transform-messages` skips every assistant message with stopReason `error`/`aborted`, and degrades thinking blocks to plain text whenever the next request runs on a different model. The account taking over was therefore told "do not repeat completed work" with the record of that work already deleted, and its tool results left with no originating call. A new `context` hook rewrites each interrupted turn into a verbatim `user` handoff record — the one role `transform-messages` passes through unchanged on every provider — folding in the tool results that belonged to it and flagging every call that never returned. Rendering is deterministic (no timestamps, no rng) so replaying the hook on each request never moves the prompt-cache breakpoint, and every section is hard-capped so rescuing context cannot blow the context window of the account just switched to. Opt out with `preserveInterruptedContext: false`.
+- **`continuationPrompt` no longer claims context that was deleted.** The default prompt told the next account the full conversation was still in the session while the interrupted turn had just been dropped. It now points at the `[handoff:interrupted-turn]` record and asks the model to verify state before redoing work.
+
+### Fixed
+
+- **`VERSION` in `index.ts` matched `package.json` again.** It had been left at `1.14.3` through the 1.14.4 and 1.14.5 releases, so `host_capabilities` debug entries and the startup notices reported a stale version.
+
+### Tests
+
+- Added `test/interrupted-context.test.ts`, including an integration assertion that runs the REAL pi-ai `transformMessages` over an interrupted transcript: it asserts the loss first (baseline) and then that reasoning, output, tool calls and folded results all survive a cross-provider switch. Added live-harness coverage in `test/failover.test.ts` for the full path (limit error → account switch → context handoff) and for the `preserveInterruptedContext: false` opt-out.
+
 ## [1.14.5] - 2026-08-15
 
 ### Fixed

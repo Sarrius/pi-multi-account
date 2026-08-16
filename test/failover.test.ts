@@ -3950,3 +3950,80 @@ test("re-login with new credentials clears stale authFailures for transient-cool
 		"after re-login, a single 401 must not invalidate — stale same-key counter was cleared",
 	);
 });
+
+// ---------------------------------------------------------------------------
+// Interrupted-turn preservation across a real failover
+// ---------------------------------------------------------------------------
+
+test("the turn that triggered the failover survives into the account that takes over", async () => {
+	const t = setup({
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: { autoDiscover: true, fallbacks: ["ollama"] },
+	});
+	await t.fire("agent_start");
+	// A turn that got real work done before the quota wall hit mid tool-batch.
+	const interrupted = {
+		role: "assistant",
+		provider: "openai-codex",
+		model: "gpt-5.5",
+		stopReason: "error",
+		errorMessage: "Codex error: The usage limit has been reached",
+		timestamp: messageTimestamp++,
+		content: [
+			{ type: "thinking", thinking: "Schema first, then the seed." },
+			{ type: "text", text: "Applied migration 0042." },
+			{
+				type: "toolCall",
+				id: "call_seed",
+				name: "bash",
+				arguments: { command: "npm run db:seed" },
+			},
+		],
+	};
+	await t.fire("message_end", { message: interrupted });
+	t.setIdle(true);
+	await t.fire("agent_end", { messages: [interrupted] });
+	assert.ok(t.rec.setModels.length > 0, "the account must actually have switched");
+
+	// The next request on the account we switched TO goes through the context hook.
+	const result = await t.fire("context", {
+		messages: [
+			{ role: "user", content: [{ type: "text", text: "migrate + seed" }], timestamp: 1 },
+			interrupted,
+		],
+	});
+	assert.ok(result?.messages, "the hook must rewrite the transcript");
+	assert.equal(
+		result.messages.some((m: any) => m.role === "assistant"),
+		false,
+		"nothing may be left for pi-ai to drop",
+	);
+	const handoff = JSON.stringify(result.messages);
+	assert.ok(handoff.includes("Schema first, then the seed."), "reasoning survives");
+	assert.ok(handoff.includes("Applied migration 0042."), "output survives");
+	assert.ok(handoff.includes("npm run db:seed"), "the unfinished tool call survives");
+	assert.ok(
+		handoff.includes("result: NONE"),
+		"the account taking over must be told which call never returned",
+	);
+});
+
+test("preserveInterruptedContext: false restores the old drop-everything behaviour", async () => {
+	const t = setup({
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: { autoDiscover: true, preserveInterruptedContext: false },
+	});
+	const result = await t.fire("context", {
+		messages: [
+			{
+				role: "assistant",
+				provider: "openai-codex",
+				model: "gpt-5.5",
+				stopReason: "error",
+				content: [{ type: "text", text: "work" }],
+				timestamp: messageTimestamp++,
+			},
+		],
+	});
+	assert.equal(result, undefined, "opted out: the transcript must pass through untouched");
+});

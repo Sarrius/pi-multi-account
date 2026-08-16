@@ -136,6 +136,7 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 | `usageStatusRefreshMs` | 1 min | Re-render the footer and sweep idle sessions for stale usage/model catalogs; network refreshes remain limited by their five-minute (Anthropic: ten-minute) TTLs. |
 | `maxAutoContinuesPerPrompt` | `8` | Cap on auto-resume hops per task. |
 | `continuationPrompt` | (built-in) | Template; supports `{from}`, `{to}`, `{reason}`. |
+| `preserveInterruptedContext` | `true` | Rewrite the turn that triggered the failover into a verbatim `[handoff:interrupted-turn]` record so the account taking over still sees the reasoning, output and tool calls of the turn pi-ai would otherwise drop as unreplayable — including which calls never returned. Deterministic (never moves the prompt-cache breakpoint) and hard-capped. Set to `false` for the previous drop-everything behaviour. |
 | `routeCompactionToHealthyAccount` | `true` | When the active account is rate-limited/invalid and Pi needs to compact (context overflow or threshold), generate the summary on a healthy fallback account instead of letting it hang on the dead one. |
 | `resumeIdleTimeoutMs` | 90 s | Max time to wait for the previous turn to go idle before a resume gives up and retries later (never an unbounded loop). |
 | `stuckWatchdogMs` | 180 s | A resumed turn silent for this long (with no tool running) is treated as wedged. |
