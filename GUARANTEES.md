@@ -40,6 +40,8 @@ test, not a one-off patch.
 
 | 26 | **A provider's forecast never parks an account.** Reset timestamps and used-percentages are predictions — providers refresh quota windows early and unannounced, and resize the windows themselves — so no cooldown, reset time or usage reading keeps an account from being tried again for longer than `maxRecheckIntervalMs` (default 10 min). Forecasts still order the queue: an account nothing predicts as spent is tried first, and among equals the one that refused longest ago wins. | `a month-long quota forecast cannot park an account past the recheck ceiling` · `once the recheck ceiling elapses, an untried account still outranks one that refused` · `a spent account known ONLY from a STALE usage snapshot ... is still benched` · `a genuinely maxed monthly Codex account is benched for its REAL reset ...` |
 
+| 27 | **Every thinking level a model advertises is available — and none that it doesn't.** `max` is offered on models that advertise it (GPT-5.6 Sol/Terra/Luna do) and accepted as an explicit `reasoningLevel`, restored after a switch like any other level. The known-levels list is a filter, never a grant: provider gradations differ wildly and do not nest, so what a model gets comes from its own advertised efforts. | `a model that advertises max gets max — and one that does not, does not` · `reasoningLevel: max is honoured instead of being silently dropped to auto` · `max survives a switch through a weaker model, exactly like every other level` |
+
 ## How to keep this honest
 
 - **Every bug fix adds a row here and a test.** A fix without a locking test is not done.

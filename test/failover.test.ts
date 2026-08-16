@@ -188,7 +188,15 @@ function setup(opts: {
 	// Pi's real thinking-level semantics: a single mutable session level, clamped to what the
 	// CURRENT model supports, and re-clamped on every model switch (see AgentSession.setModel).
 	// That re-clamp is exactly how the level used to drift downward across failovers.
-	const THINKING_ORDER = ["off", "minimal", "low", "medium", "high", "xhigh"];
+	const THINKING_ORDER = [
+		"off",
+		"minimal",
+		"low",
+		"medium",
+		"high",
+		"xhigh",
+		"max",
+	];
 	let sessionThinkingLevel = opts.thinkingLevel ?? "high";
 	const clampThinking = (level: string) => {
 		const cap = opts.thinkingCaps?.[ctx.model?.provider ?? ""];
@@ -4243,5 +4251,57 @@ test("once the recheck ceiling elapses, an untried account still outranks one th
 	assert.ok(
 		landed[0].startsWith("openai-codex-account-6/"),
 		`the never-tried account must win over the one that refused moments ago (went to ${landed[0]})`,
+	);
+});
+
+test("reasoningLevel: max is honoured instead of being silently dropped to auto", async () => {
+	// Issue #15, second half: adding `max` to the catalog is not enough. The config parser
+	// enumerated the accepted levels and stopped at `xhigh`, so `reasoningLevel: "max"` fell
+	// through to "auto" — the level was never forced, and nothing said why.
+	const t = setup({
+		accounts: THINKING_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		thinkingLevel: "low",
+		config: { reasoningLevel: "max" }, // opt-in override, same as any other explicit level
+	});
+
+	await t.fire("session_start");
+	await t.fire("agent_start");
+
+	assert.equal(
+		t.thinkingLevel(),
+		"max",
+		"an explicitly configured max must be applied, not discarded as unknown",
+	);
+});
+
+test("max survives a switch through a weaker model, exactly like every other level", async () => {
+	// Guarantee #22 ("your thinking level is yours") must hold for the newly-accepted level too:
+	// a weaker fallback model's clamp is restored, never adopted as the new intent.
+	const t = setup({
+		accounts: THINKING_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		thinkingLevel: "max",
+		// The codex account tops out at high — Pi clamps max down to high there.
+		thinkingCaps: { "openai-codex-account-2": "high" },
+	});
+
+	await t.fire("session_start");
+	await t.fire("agent_start");
+	assert.equal(t.thinkingLevel(), "max");
+
+	await t.command("next"); // → codex, where max is clamped to high
+	assert.equal(t.thinkingLevel(), "high", "the host clamp is expected here");
+
+	await t.fire("agent_start");
+	await t.command("next"); // → back to a model that supports max
+	assert.equal(
+		t.thinkingLevel(),
+		"max",
+		`max must return once a capable model is back: ${JSON.stringify(t.rec.thinkingLevels)}`,
+	);
+	assert.ok(
+		!t.rec.thinkingLevels.includes("high"),
+		`the extension must never ASK for the clamped level: ${JSON.stringify(t.rec.thinkingLevels)}`,
 	);
 });

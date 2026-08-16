@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.0] - 2026-08-16
+
+### Added
+
+- **`max` thinking is available on models that advertise it.** Pi understands `max` — it is in `ThinkingLevel` and `--thinking max` works — but the extension's known-levels list stopped at `xhigh`, so the strongest level of a model offering it was filtered out. GPT-5.6 Sol/Terra/Luna all advertise `max` in the live Codex catalog. Reported by @devtm1123 in #15.
+- **`reasoningLevel: "max"` is accepted in config.** Adding `max` to the catalog alone was not enough: the config parser enumerated the accepted levels and stopped at `xhigh`, so an explicit `max` fell through to `"auto"` — never forced, with nothing said about why. `max` also joins the weakest→strongest ordering, so guarantee #22 (a weaker fallback model's clamp is restored, never adopted) covers it like every other level.
+
+### Notes
+
+- The known-levels list is a **filter, not a grant**: a model's own advertised efforts are intersected with it, so a level named there only ever reaches a model that asked for it. Provider gradations differ wildly and do not nest — Claude Opus 4.6 advertises `max` alone, glm-5.2 has `max` but no `xhigh`, GPT-5.6 has `max`/`xhigh`/`minimal` but no `medium` — which is why the per-model intersection, not the list, decides what any given model gets. Locked by test.
+- The fallback definition for an **unknown** Codex model is deliberately left at `xhigh`. That path is a guess about a model we have no catalog for, and guessing `max` would hand a level to a model that never claimed it.
+
+### Tests
+
+- Guarantee #27: a model that advertises `max` gets it, one that does not is left untouched (including not acquiring a `medium` it never claimed), `reasoningLevel: "max"` is honoured, and `max` is restored after a switch through a weaker model. Verified red→green.
+
 ## [1.16.0] - 2026-08-16
 
 ### Changed

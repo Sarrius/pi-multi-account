@@ -25,7 +25,20 @@ export type CodexCatalogSnapshot = {
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const DEFAULT_CONTEXT_WINDOW = 272_000;
 const DEFAULT_MAX_TOKENS = 128_000;
-const KNOWN_PI_THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh"];
+// Levels Pi itself understands, weakest → strongest. This is a FILTER, not a grant: a model's
+// own advertised efforts are intersected with this list (see thinkingLevelMap), so a level named
+// here only ever reaches a model that asked for it. Provider gradations differ wildly and do not
+// nest — Claude Opus 4.6 advertises `max` alone, glm-5.2 has `max` but no `xhigh`, gpt-5.6 has
+// `max`/`xhigh`/`minimal` but no `medium` — which is exactly why the per-model intersection, not
+// this list, decides what a given model gets.
+const KNOWN_PI_THINKING_LEVELS = [
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+];
 
 function record(value: unknown): Record<string, any> {
 	return value && typeof value === "object" ? (value as Record<string, any>) : {};
