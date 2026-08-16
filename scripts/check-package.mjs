@@ -22,6 +22,26 @@ for (const required of ["package.json", "README.md", "CHANGELOG.md", "LICENSE", 
 if (!Number.isSafeInteger(packed[0].unpackedSize) || packed[0].unpackedSize > 512 * 1024) {
 	throw new Error(`npm package is unexpectedly large: ${packed[0].unpackedSize}`);
 }
+// `const VERSION` in index.ts is what the runtime reports — startup notices, the
+// host_capabilities debug entry, `/multi-account status`. It silently drifted from
+// package.json through the 1.14.4 and 1.14.5 releases, so every debug log from those
+// versions blamed 1.14.3. publish.yml already pins the git tag to package.json; this
+// pins the source constant to it as well, and fails the release instead of shipping a
+// build that misreports itself.
+const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+const declaredVersion = /^const VERSION = "([^"]+)";$/m.exec(
+	readFileSync(join(root, "index.ts"), "utf8"),
+)?.[1];
+if (!declaredVersion) {
+	throw new Error(
+		'index.ts no longer declares `const VERSION = "…";` — the release version check cannot run',
+	);
+}
+if (declaredVersion !== manifest.version) {
+	throw new Error(
+		`VERSION mismatch: index.ts says ${declaredVersion}, package.json says ${manifest.version}`,
+	);
+}
 const secretPatterns = [
 	/gh[pousr]_[A-Za-z0-9_]{20,}/,
 	/sk-[A-Za-z0-9_-]{8,}/,
