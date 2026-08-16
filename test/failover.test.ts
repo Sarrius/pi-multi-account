@@ -4119,3 +4119,129 @@ test("a blocked continuation records why, instead of failing silently", async ()
 		"if a refusal is logged at all it must name the real reason, never a generic failure",
 	);
 });
+
+// ---------------------------------------------------------------------------
+// Verify, don't predict: a provider's forecast never parks an account
+// ---------------------------------------------------------------------------
+
+test("a month-long quota forecast cannot park an account past the recheck ceiling", async () => {
+	// Providers reset quota windows early and unannounced, and resize the windows themselves, so
+	// "used 100%, resets in 29 days" is a forecast about the future — not evidence. Before the
+	// ceiling it was treated as authoritative ground truth REGARDLESS of snapshot age, so a single
+	// stale reading could park an account for weeks and the work simply waited. Now the forecast
+	// only orders the queue; the account is asked again within maxRecheckIntervalMs and answers
+	// for itself. (A refused request costs no tokens, so asking is close to free.)
+	const now = Date.now();
+	const accounts: Account = {
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "b",
+			refresh: "br",
+			accountId: "codex-2",
+		},
+		"openai-codex-account-6": {
+			type: "oauth",
+			access: "f",
+			refresh: "fr",
+			accountId: "codex-6",
+		},
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		// Ceiling squeezed to sub-second so the test asserts the mechanism, not the clock.
+		config: { maxRecheckIntervalMs: 700, pendingPollMs: 150 },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				"openai-codex-account-6": {
+					provider: "openai-codex-account-6",
+					family: "codex",
+					fetchedAt: now,
+					primary: {
+						usedPercent: 100,
+						resetAt: now + 29 * 24 * 60 * 60 * 1000,
+					},
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"openai-codex-account-2",
+		"gpt-5.5",
+		"You have hit your ChatGPT usage limit (free plan). Try again in ~41762 min.",
+	);
+	// account-6 is the only other account and its forecast says "29 days". The work must still
+	// reach it once the ceiling elapses, instead of waiting out a prediction.
+	await wait(1500);
+	assert.ok(
+		t.rec.setModels.some((target: string) =>
+			target.startsWith("openai-codex-account-6/"),
+		),
+		`a forecast must not park an account past the ceiling; switches were ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("once the recheck ceiling elapses, an untried account still outranks one that refused", async () => {
+	// The ceiling deliberately puts a refused account BACK in the candidate pool. Ordering is then
+	// the only thing keeping us off it: rotation position alone would send us straight back to the
+	// account that just said "usage limit reached", get the same refusal, and loop between spent
+	// accounts while a never-tried one sat further down the ring.
+	const accounts: Account = {
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "b",
+			refresh: "br",
+			accountId: "codex-2",
+		},
+		"openai-codex-account-6": {
+			type: "oauth",
+			access: "f",
+			refresh: "fr",
+			accountId: "codex-6",
+		},
+		"openai-codex-account-7": {
+			type: "oauth",
+			access: "g",
+			refresh: "gr",
+			accountId: "codex-7",
+		},
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex-account-7", id: "gpt-5.5" },
+		// Squeezed so the ceiling elapses inside the test rather than in ten minutes.
+		config: { autoDiscover: true, maxRecheckIntervalMs: 300 },
+	});
+	await t.fire("session_start");
+	// account-2 refuses. It is not the account we are on, so it earns no anti-ping-pong credit.
+	await finishError(
+		t,
+		"openai-codex-account-2",
+		"gpt-5.5",
+		"You have hit your ChatGPT usage limit (free plan). Try again in ~41762 min.",
+	);
+	// Let its (ceiling-capped) cooldown lapse: account-2 is selectable again on paper.
+	await wait(600);
+	const before = t.rec.setModels.length;
+	t.setCurrent("openai-codex-account-7", "gpt-5.5");
+	await finishError(
+		t,
+		"openai-codex-account-7",
+		"gpt-5.5",
+		"You have hit your ChatGPT usage limit (free plan). Try again in ~43190 min.",
+	);
+	const landed = t.rec.setModels.slice(before);
+	assert.ok(landed.length > 0, "the refusal must move us somewhere");
+	assert.ok(
+		landed[0].startsWith("openai-codex-account-6/"),
+		`the never-tried account must win over the one that refused moments ago (went to ${landed[0]})`,
+	);
+});

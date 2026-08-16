@@ -38,6 +38,8 @@ test, not a one-off patch.
 
 | 25 | **Work resumes by itself even when nothing rotated.** A transient overload or an expired cooldown that returns to the SAME account auto-continues on hosts without `pi.continueAgent` — it does not stall waiting for you to re-send. When a continuation genuinely cannot be dispatched, the debug log names the actual reason instead of blaming the Pi build. | `a same-account pending resume auto-continues on a host without pi.continueAgent` · `a blocked continuation records why, instead of failing silently` · `transient overload retries the same account instead of rotating siblings` |
 
+| 26 | **A provider's forecast never parks an account.** Reset timestamps and used-percentages are predictions — providers refresh quota windows early and unannounced, and resize the windows themselves — so no cooldown, reset time or usage reading keeps an account from being tried again for longer than `maxRecheckIntervalMs` (default 10 min). Forecasts still order the queue: an account nothing predicts as spent is tried first, and among equals the one that refused longest ago wins. | `a month-long quota forecast cannot park an account past the recheck ceiling` · `once the recheck ceiling elapses, an untried account still outranks one that refused` · `a spent account known ONLY from a STALE usage snapshot ... is still benched` · `a genuinely maxed monthly Codex account is benched for its REAL reset ...` |
+
 ## How to keep this honest
 
 - **Every bug fix adds a row here and a test.** A fix without a locking test is not done.

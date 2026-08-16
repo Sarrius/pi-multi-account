@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.0] - 2026-08-16
+
+### Changed
+
+- **Availability is now verified, not predicted.** Every number a provider gives us about the future is a forecast: reset timestamps move when a quota window is refreshed early and unannounced, and a used-percentage is a fraction whose denominator the provider can resize at will. Treating those as ground truth meant a single reading of "used 100%, resets in 29 days" could bench an account for weeks — the work simply waited while the account may have been live within the hour. A forecast may now only *order* the queue; it can no longer stop us from asking. `maxRecheckIntervalMs` (default 10 minutes) caps how long any prediction — a recorded cooldown, a usage window, a reset timestamp — may keep an account from being tried again. A refused request costs no tokens, so re-asking is close to free, and only the account's own answer proves anything.
+- **Ranking keeps the old protection.** An account nothing predicts as spent is always tried before one that is only back in the pool because its forecast went stale, and among equals the account that refused longest ago wins. This is what stops the ceiling from turning into a loop between two spent accounts: without it, rotation order alone sent us straight back to the account that had just answered "usage limit reached" while a never-tried account sat further down the ring.
+
+### Fixed
+
+- **Failover no longer bounces back onto an account that refused moments ago.** The existing 60-second anti-ping-pong guard only remembers the single account we left last, so with three or more accounts the rotation could return to a spent one minutes later and loop.
+
+### Tests
+
+- Guarantee #26, with coverage for a month-long forecast no longer parking an account past the ceiling, and for an untried account outranking a freshly-refused one once the ceiling elapses. Verified red→green in isolation: disabling the ceiling fails the first, disabling the ranking fails the second **and** the pre-existing stale-snapshot guarantee — the two halves are load-bearing together.
+
 ## [1.15.1] - 2026-08-16
 
 ### Fixed

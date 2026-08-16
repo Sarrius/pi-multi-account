@@ -445,6 +445,12 @@ type ProviderFailoverConfig = {
 	modelErrorPatterns?: string[];
 	ignoreErrorPatterns?: string[];
 	continuationPrompt?: string;
+	// Hard ceiling on how long ANY prediction may stop us from simply trying an account again.
+	// Providers reset quota windows early and without notice, and they resize the windows
+	// themselves — so a reset timestamp, a "try again in N min" sentence and a used-percentage are
+	// all forecasts, not facts. The only fact is what the account answers when asked. Default: 10
+	// minutes. Set higher to probe less often, never to "trust" a provider's own estimate.
+	maxRecheckIntervalMs?: number;
 	// Rewrite the interrupted turn into a verbatim `user` handoff record so the account
 	// taking over still sees exactly where the previous one stopped. Without this, pi-ai
 	// drops the interrupted assistant message entirely before the next request is built,
@@ -510,6 +516,7 @@ type RuntimeConfig = Required<
 		| "modelErrorPatterns"
 		| "ignoreErrorPatterns"
 		| "continuationPrompt"
+		| "maxRecheckIntervalMs"
 		| "preserveInterruptedContext"
 		| "routeCompactionToHealthyAccount"
 		| "autoRecoverStuck"
@@ -580,6 +587,13 @@ const MAX_MIGRATED_COOLDOWN_MS = 8 * 24 * 60 * 60 * 1000;
 // moment the primary window has headroom. Cooling-down accounts are otherwise never probed, so
 // without this cap the far-future estimate is a dead end (the "bogus cooldown" bug, open since v1.13.1).
 const MAX_LIVE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+// Default ceiling on any predicted unavailability. Every number a provider gives us about the
+// FUTURE — reset timestamps, "try again in N min", used-percentage against a quota size the
+// provider can resize at will — is a forecast that goes stale silently the moment the provider
+// refreshes a window early. Rather than trying to predict better, we cap how long any forecast
+// may prevent us from simply asking the account again. A rejected request costs no tokens, so
+// re-asking is close to free; only a successful one proves availability.
+const MAX_RECHECK_INTERVAL_MS = 10 * 60 * 1000;
 const MIN_PENDING_WAKE_MS = 1000;
 // The usage-% endpoint tracks an account's QUOTA window; it does NOT reflect session/rate limits.
 // So a session-limited account keeps 429ing "usage limit reached" while usage still reports
@@ -611,7 +625,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.15.1";
+const VERSION = "1.16.0";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -1109,6 +1123,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	modelErrorPatterns: DEFAULT_MODEL_ERROR_PATTERNS,
 	ignoreErrorPatterns: DEFAULT_IGNORE_PATTERNS,
 	continuationPrompt: DEFAULT_CONTINUATION_PROMPT,
+	maxRecheckIntervalMs: MAX_RECHECK_INTERVAL_MS,
 	preserveInterruptedContext: true,
 	routeCompactionToHealthyAccount: true,
 	autoRecoverStuck: true,
@@ -1229,6 +1244,10 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		),
 		continuationPrompt:
 			raw.continuationPrompt?.trim() || DEFAULT_CONTINUATION_PROMPT,
+		maxRecheckIntervalMs: positiveOr(
+			raw.maxRecheckIntervalMs,
+			MAX_RECHECK_INTERVAL_MS,
+		),
 		preserveInterruptedContext: raw.preserveInterruptedContext ?? true,
 		routeCompactionToHealthyAccount:
 			raw.routeCompactionToHealthyAccount ?? true,
@@ -3485,7 +3504,29 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return count;
 	}
 
-	function providerRecoveryAt(provider: string, now = Date.now()): number {
+	function providerRecoveryAt(
+		provider: string,
+		now = Date.now(),
+		options: { ignoreCeiling?: boolean } = {},
+	): number {
+		// Nothing may push the next attempt beyond the recheck ceiling. Providers refresh quota
+		// windows early and unannounced, AND resize the windows themselves — so a reset timestamp
+		// is a forecast and a used-percentage is a fraction whose denominator can change under us.
+		// Neither is evidence about the future. Capping here is what converts this extension from
+		// predicting availability to verifying it: worst case we ask again in `maxRecheckIntervalMs`
+		// and the account itself answers. A refusal costs no tokens, so asking is close to free.
+		//
+		// Applied to the usage FORECAST only. A cooldown we recorded ourselves was already capped
+		// when it was written (see markExhausted).
+		//
+		// The ceiling is anchored to when the snapshot was TAKEN, never to `now`: an offset from
+		// `now` is recomputed on every call, so it stays permanently in the future and never
+		// elapses. Anchoring says what we actually mean — this reading is worth believing for
+		// maxRecheckIntervalMs after we took it, and then the account itself gets asked again.
+		const capped = (at: number, takenAt: number) =>
+			options.ignoreCeiling
+				? at
+				: Math.max(now, Math.min(at, takenAt + config.maxRecheckIntervalMs));
 		let at = Math.max(now, exhaustedUntilByProvider.get(provider) ?? now);
 		const cached = usageByProvider.get(provider);
 		if (cached) {
@@ -3499,13 +3540,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// maxed on its monthly window) that never threw an error yet and had no recorded cooldown
 			// was treated as "available" and selected as the failover target — so failover kept landing
 			// on dead accounts instead of advancing to a live Qwen/Ollama one.
-			if (usageMs !== undefined && usageMs > 0) return now + usageMs;
+			if (usageMs !== undefined && usageMs > 0)
+				return capped(now + usageMs, cached.fetchedAt);
 			// "Available now" (usageMs === 0) is only trusted while FRESH — a stale pre-limit reading
 			// must never clear a real cooldown early — AND only while usage is still trusted for this
 			// provider. A session/rate-limited account keeps 429ing while its quota window shows
 			// headroom; once that has been proven (usageUntrusted), we respect the recorded cooldown
 			// (`at`) instead of falsely reporting "recovered now" and hot-looping a ~1s retry.
-			if (fresh && usageMs === 0) return usageUntrusted(provider, now) ? at : now;
+			if (fresh && usageMs === 0)
+				return usageUntrusted(provider, now) ? at : now;
 		}
 		return at;
 	}
@@ -3600,10 +3643,21 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function markExhausted(provider: string, cooldownMs: number) {
 		if (cooldownMs <= 0) return; // killed accounts are in invalidatedByProvider, not cooldowns
-		// Invariant backstop: no LIVE cooldown may exceed the ceiling, regardless of caller. A
-		// far-future reset from a long/rolling limit window must never evict an account for weeks —
-		// it is re-probed at the cap and usage reconciliation shortens it further if truly free.
-		const until = Date.now() + Math.min(Math.max(cooldownMs, 1000), MAX_LIVE_COOLDOWN_MS);
+		// This is the moment the account was last actually asked, and it is what the recheck
+		// ceiling is measured from. Without it the ceiling has no anchor and can never elapse.
+		setLastProbe(provider);
+		// Invariant backstop: no LIVE cooldown may exceed the recheck ceiling, regardless of what
+		// the provider predicted. A reset timestamp is a forecast — providers refresh windows early
+		// and unannounced and resize the windows themselves — so it may order the queue but must
+		// never bench an account for hours or weeks. At the ceiling we simply ask again; a refusal
+		// costs no tokens, and only the account itself can prove it is still spent.
+		const until =
+			Date.now() +
+			Math.min(
+				Math.max(cooldownMs, 1000),
+				config.maxRecheckIntervalMs,
+				MAX_LIVE_COOLDOWN_MS,
+			);
 		for (const candidate of providersSharingAccount(provider)) {
 			exhaustedUntilByProvider.set(
 				candidate,
@@ -4088,6 +4142,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			remaining: number;
 			rotIndex: number;
 			rank: number;
+			/** When this account last refused with a limit error. 0 = never, in this session. */
+			lastRefusalAt: number;
+			/**
+			 * Whether the UNCAPPED forecast still considers this account spent. The recheck ceiling
+			 * decides whether an account may be tried at all; this decides the ORDER. An account
+			 * nothing predicts as spent is always tried before one we are only re-probing because
+			 * its forecast went stale.
+			 */
+			predictedBusy: boolean;
 		};
 		// When preferLatestModel is on, the newest model wins ACROSS accounts — not just
 		// within one account. Without this, failing over from gpt-5.5 could land on the
@@ -4144,6 +4207,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				remaining,
 				rotIndex: i,
 				rank: modelRecencyRank(pick),
+				lastRefusalAt: limitStreakByProvider.get(pick.provider)?.lastAt ?? 0,
+				predictedBusy:
+					providerRecoveryAt(pick.provider, now, { ignoreCeiling: true }) >
+					now,
 			});
 		}
 		if (scored.length === 0) return [];
@@ -4178,9 +4245,21 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return ordered.map((s) => s.model);
 		}
 
+		// Among accounts that are selectable right now, prefer the one that refused LONGEST ago —
+		// an account that just answered "usage limit reached" is the least likely to answer
+		// differently seconds later, no matter how good its position or model rank is. Without this
+		// the rotation order alone could send us straight back to the account we just left, get the
+		// same refusal, and loop between two spent accounts while a live one sat further down.
+		const byRefusalAgeThenRank = (a: Scored, b: Scored) =>
+			// An account nothing predicts as spent always outranks one we are only re-probing
+			// because its forecast went stale — a maxed usage window is still the best hint we
+			// have about which account to ask FIRST. It just may not veto asking at all.
+			Number(a.predictedBusy) - Number(b.predictedBusy) ||
+			a.lastRefusalAt - b.lastRefusalAt ||
+			byRankThenRot(a, b);
 		let availableNow = scored
 			.filter((s) => s.remaining === 0)
-			.sort(byRankThenRot);
+			.sort(byRefusalAgeThenRank);
 		if (
 			lastLeftProvider &&
 			now - lastLeftAt < ANTI_PINGPONG_MS &&
@@ -4195,7 +4274,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 		if (options.availableNowOnly) return [];
 		return scored
-			.sort((a, b) => a.remaining - b.remaining || byRankThenRot(a, b))
+			.sort(
+				(a, b) => a.remaining - b.remaining || byRefusalAgeThenRank(a, b),
+			)
 			.map((s) => s.model);
 	}
 
