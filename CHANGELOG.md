@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.1] - 2026-08-16
+
+### Fixed
+
+- **A same-account resume now auto-continues on every host without `pi.continueAgent`.** `currentPromptSwitch` is set only when accounts actually rotate, but the pending-resume path deliberately returns to the SAME account — a transient overload, or a cooldown that expired where it started — so it never has a switch record. The injection fallback required one, so on every build since pi-coding-agent 0.80.3 (where seamless resume was removed) that combination silently refused to continue and the session stalled until the user re-sent the prompt by hand. The resume context is now passed explicitly.
+- **The stall no longer blames the Pi build.** The warning claimed "switched account, but this Pi build cannot auto-resume" even when no switch had happened and the real cause was elsewhere — a spent auto-continue budget, `autoContinue: false`, or a failed dispatch. A missing `pi.continueAgent` is only why the fallback path is taken, never why the fallback itself declined. The message now states what it knows and points at the recorded reason.
+- **Every refused or failed continuation is recorded.** Refusals were entirely silent and the dispatch `catch` swallowed its error, so a session that stopped continuing by itself left nothing in the debug log to explain why. `continuation_injection_blocked` now names the specific reason and `continuation_injection_failed` carries the error.
+- **A rejected dispatch can no longer be reported as success.** `pi.sendUserMessage` is async on the host, so a rejected promise escaped the synchronous `try`/`catch` as an unhandled rejection while the injection still returned `true`. The promise is now attached.
+
+### Tests
+
+- Live-harness coverage for a transient overload resuming on a host without `pi.continueAgent` (asserting the continuation is injected as `followUp`, not stalled), and for a blocked continuation naming its real reason. Verified red→green: both fail against the previous behaviour.
+
 ## [1.15.0] - 2026-08-16
 
 ### Added

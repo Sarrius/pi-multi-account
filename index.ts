@@ -611,7 +611,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.15.0";
+const VERSION = "1.15.1";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -4731,31 +4731,45 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// continueAgent() cannot pick up. Inject the continuation prompt as a fresh USER turn so the
 	// session keeps moving on the account we just switched to, WITHOUT the user re-typing anything.
 	// Bounded by maxAutoContinuesPerPrompt. Returns true when it started a continuation turn.
-	function injectContinuationPrompt(ctx: any): boolean {
-		if (
-			!currentPromptSwitch ||
-			!config.autoContinue ||
-			userAbortedChain ||
-			ctx.signal?.aborted ||
-			autoContinuesThisPrompt >= config.maxAutoContinuesPerPrompt ||
-			typeof pi.sendUserMessage !== "function"
-		)
+	function injectContinuationPrompt(
+		ctx: any,
+		resumeFrom?: { from?: ModelRef; reason?: string },
+	): boolean {
+		// `currentPromptSwitch` is set ONLY when we actually rotated accounts. The pending-resume
+		// path (transient overload, or a cooldown that expired on the same account) deliberately
+		// returns to the SAME account, so it never has a switch record. Requiring one here meant
+		// that on every host without `pi.continueAgent` — i.e. every pi-coding-agent 0.80.3+,
+		// where seamless resume was removed — the pending resume silently refused to inject, and
+		// the user had to re-send the prompt by hand. Accept an explicit resume context instead.
+		const source = currentPromptSwitch ?? resumeFrom;
+		const blocked = !source
+			? "no switch or resume context"
+			: !config.autoContinue
+				? "autoContinue disabled"
+				: userAbortedChain
+					? "user aborted the chain"
+					: ctx.signal?.aborted
+						? "abort signal raised"
+						: autoContinuesThisPrompt >= config.maxAutoContinuesPerPrompt
+							? `auto-continue budget spent (${autoContinuesThisPrompt}/${config.maxAutoContinuesPerPrompt})`
+							: typeof pi.sendUserMessage !== "function"
+								? "host build has no pi.sendUserMessage"
+								: undefined;
+		if (blocked) {
+			// Every refusal used to be silent, so a session that stopped continuing by itself left
+			// nothing in the debug log to explain why. Record the reason.
+			logEvent("continuation_injection_blocked", { reason: blocked });
 			return false;
+		}
 		const to =
-			currentPromptSwitch.to ??
+			currentPromptSwitch?.to ??
 			(ctx.model
 				? ref(ctx.model.provider, ctx.model.id)
 				: "the active account");
 		const prompt = config.continuationPrompt
-			.replaceAll(
-				"{from}",
-				String(currentPromptSwitch.from ?? "the previous account"),
-			)
+			.replaceAll("{from}", String(source?.from ?? "the previous account"))
 			.replaceAll("{to}", String(to))
-			.replaceAll(
-				"{reason}",
-				currentPromptSwitch.reason ?? "provider failover",
-			);
+			.replaceAll("{reason}", source?.reason ?? "provider failover");
 		try {
 			expectingInjectedContinuation = true;
 			// The host throws "Agent is already processing. Specify streamingBehavior ('steer' or
@@ -4764,16 +4778,40 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// (the host maps deliverAs → streamingBehavior internally — see the queued-input resume
 			// path below which already uses it). "followUp" QUEUES the continuation to run after the
 			// current turn settles instead of being rejected; the host ignores it when not streaming.
-			pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+			// `sendUserMessage` is async on the host: a rejected promise would otherwise escape this
+			// synchronous try/catch as an unhandled rejection AND still report success here.
+			const dispatched = pi.sendUserMessage(prompt, {
+				deliverAs: "followUp",
+			}) as unknown;
+			if (
+				dispatched &&
+				typeof (dispatched as Promise<void>).catch === "function"
+			) {
+				(dispatched as Promise<void>).catch((error) => {
+					expectingInjectedContinuation = false;
+					logEvent("continuation_injection_failed", {
+						error: String(error).slice(0, 200),
+					});
+					reportExtensionError("continuation injection", error, ctx);
+				});
+			}
 			autoContinuesThisPrompt++;
 			return true;
-		} catch {
+		} catch (error) {
 			expectingInjectedContinuation = false;
+			logEvent("continuation_injection_failed", {
+				error: String(error).slice(0, 200),
+			});
 			return false;
 		}
 	}
 
-	async function resumeWithExistingContext(ctx: any): Promise<boolean> {
+	async function resumeWithExistingContext(
+		ctx: any,
+		// Set by the pending-resume path, which returns to the SAME account and therefore has no
+		// `currentPromptSwitch`. Without it the prompt-injection fallback refuses to fire.
+		resumeFrom?: { from?: ModelRef; reason?: string },
+	): Promise<boolean> {
 		if (userAbortedChain || ctx.signal?.aborted) return false;
 		const continueAgent = (
 			pi as {
@@ -4787,9 +4825,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// @earendil-works/pi-coding-agent). Do NOT dead-end the failover with a red error that
 			// leaves the user reloading by hand: fall back to injecting the continuation prompt so the
 			// work resumes by itself on the account we just switched to.
-			if (injectContinuationPrompt(ctx)) return true;
+			if (injectContinuationPrompt(ctx, resumeFrom)) return true;
+			// Reaching here means the injection fallback ALSO declined — the reason is in the
+			// debug log as continuation_injection_blocked/_failed. Do not blame the Pi build:
+			// the missing pi.continueAgent is only why we took the fallback path, never why the
+			// fallback itself refused.
 			ctx.ui.notify(
-				"Provider failover: switched account, but this Pi build cannot auto-resume the turn (needs pi.continueAgent, or the previous turn to be idle). Send your message to continue on the new account.",
+				`Provider failover [v${VERSION}]: could not auto-resume this turn; send your message to continue on ${
+					ctx.model
+						? ref(ctx.model.provider, ctx.model.id)
+						: "the active account"
+				}. Run /multi-account status for the reason.`,
 				"warning",
 			);
 			return false;
@@ -4850,7 +4896,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// continuation prompt as a user message instead. That always starts a turn, so the
 				// session keeps moving by itself (this is how auto-recovery after a watchdog abort
 				// continues without the user re-typing anything). Bounded by maxAutoContinuesPerPrompt.
-				if (injectContinuationPrompt(ctx)) return true;
+				if (injectContinuationPrompt(ctx, resumeFrom)) return true;
 				// Nothing to continue (spurious) or injection unavailable — drop stale state quietly.
 				currentPromptSwitch = undefined;
 				clearPendingContinuation();
@@ -5043,7 +5089,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						if (automaticModelTarget === same) automaticModelTarget = undefined;
 					}
 				}
-				await resumeWithExistingContext(ctx);
+				// Same-account resume: no rotation happened, so there is no currentPromptSwitch.
+				// Pass the context explicitly or the injection fallback declines and the user has
+				// to re-send the prompt by hand.
+				await resumeWithExistingContext(ctx, {
+					from: same,
+					reason: persistedState.pendingReason,
+				});
 				return;
 			}
 			schedulePendingWake(ctx);
@@ -5072,7 +5124,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (otherCandidates.length === 0) {
 			if (sourceRecovered) {
 				clearPendingContinuation();
-				await resumeWithExistingContext(ctx);
+				// The original account came back and there is no alternative: this is also a
+				// same-account resume with no switch record.
+				await resumeWithExistingContext(ctx, {
+					from: sourceRef,
+					reason: persistedState.pendingReason,
+				});
 				return;
 			}
 			schedulePendingWake(ctx);

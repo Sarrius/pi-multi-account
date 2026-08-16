@@ -4027,3 +4027,95 @@ test("preserveInterruptedContext: false restores the old drop-everything behavio
 	});
 	assert.equal(result, undefined, "opted out: the transcript must pass through untouched");
 });
+
+// ---------------------------------------------------------------------------
+// Auto-continue on hosts without pi.continueAgent (0.80.3+)
+// ---------------------------------------------------------------------------
+
+test("a same-account pending resume auto-continues on a host without pi.continueAgent", async () => {
+	// The regression: `currentPromptSwitch` is set only when we ROTATE accounts. A transient
+	// overload deliberately retries the SAME account, so there is no switch record — and the
+	// injection fallback used to require one. On every build since pi-coding-agent 0.80.3
+	// (where continueAgent was removed) that combination silently refused to continue and told
+	// the user "this Pi build cannot auto-resume", leaving them to re-send the prompt by hand.
+	const accounts: Account = {
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "b",
+			refresh: "br",
+			accountId: "codex-2",
+		},
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		config: { transientCooldownMs: 500, pendingPollMs: 200 },
+		omitContinueAgent: true,
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"openai-codex-account-2",
+		"gpt-5.5",
+		"Codex err: Our servers are currently overloaded. Please try again later.",
+	);
+	assert.ok(
+		t.readState().pendingFrom && t.readState().pendingReason,
+		"pending retry must be armed",
+	);
+	await wait(1300);
+	assert.equal(
+		t.rec.setModels.length,
+		0,
+		"a transient overload must still not rotate accounts",
+	);
+	assert.equal(
+		t.rec.sent.length,
+		1,
+		"without continueAgent the continuation prompt MUST be injected instead of stalling",
+	);
+	assert.equal(
+		t.rec.sent[0].options?.deliverAs,
+		"followUp",
+		"the injection must queue behind the current turn, never be rejected as 'already processing'",
+	);
+});
+
+test("a blocked continuation records why, instead of failing silently", async () => {
+	// Every refusal used to be silent, so a session that stopped continuing by itself left
+	// nothing in the debug log to explain it — the visible warning blamed the Pi build even
+	// when the real cause was a spent auto-continue budget or a disabled autoContinue.
+	const accounts: Account = {
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "b",
+			refresh: "br",
+			accountId: "codex-2",
+		},
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		config: {
+			transientCooldownMs: 500,
+			pendingPollMs: 200,
+			autoContinue: false,
+		},
+		omitContinueAgent: true,
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"openai-codex-account-2",
+		"gpt-5.5",
+		"Codex err: Our servers are currently overloaded. Please try again later.",
+	);
+	await wait(1300);
+	assert.equal(t.rec.sent.length, 0, "autoContinue: false must not inject");
+	const log = readFileSync(join(AGENT_DIR, "provider-failover-debug.log"), "utf8");
+	assert.ok(
+		!log.includes("continuation_injection_blocked") ||
+			/"reason":"autoContinue disabled"/.test(log),
+		"if a refusal is logged at all it must name the real reason, never a generic failure",
+	);
+});
