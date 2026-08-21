@@ -3,6 +3,7 @@ import test from "node:test";
 import {
 	compareCodexModelStrength,
 	parseCodexModelCatalog,
+	preserveHostMaxReasoningLevel,
 	rankAnthropicModelIds,
 } from "../model-catalog.ts";
 
@@ -106,6 +107,44 @@ test("live Codex catalog follows server priority: Sol beats Terra and Luna", () 
 	assert.equal(models[0].thinkingLevelMap?.minimal, "low");
 	assert.equal(models[2].thinkingLevelMap?.max, "max");
 	assert.deepEqual(models[0].input, ["text", "image"]);
+});
+
+test("host Codex metadata preserves max when the live catalog omits it", () => {
+	const live = parseCodexModelCatalog({
+		models: [
+			{
+				slug: "gpt-5.6-luna",
+				visibility: "list",
+				supported_reasoning_levels: [{ effort: "high" }, { effort: "xhigh" }],
+			},
+		],
+	});
+	const preserved = preserveHostMaxReasoningLevel(live, [
+		{
+			id: "gpt-5.6-luna",
+			thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+		},
+	]);
+	assert.equal(preserved[0].thinkingLevelMap?.max, "max");
+});
+
+test("explicitly reported live max metadata wins", () => {
+	const models = preserveHostMaxReasoningLevel(
+		[
+			{
+				id: "gpt-5.6-luna",
+				name: "Luna",
+				reasoning: true,
+				thinkingLevelMap: { max: null },
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1,
+				maxTokens: 1,
+			},
+		],
+		[{ id: "gpt-5.6-luna", thinkingLevelMap: { max: "max" } }],
+	);
+	assert.equal(models[0].thinkingLevelMap?.max, null);
 });
 
 test("unknown future Codex generations rank without an extension release", () => {

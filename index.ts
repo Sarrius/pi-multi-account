@@ -356,6 +356,7 @@ import {
 	CodexCatalogFetchError,
 	compareCodexModelStrength,
 	fetchCodexModelCatalog,
+	preserveHostMaxReasoningLevel,
 	rankAnthropicModelIds,
 	type CodexCatalogModel,
 	type CodexCatalogSnapshot,
@@ -2576,7 +2577,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		} catch {
 			return [];
 		}
-		return models
+		const mapped = models
 			.filter(
 				(model) =>
 					typeof model?.id === "string" &&
@@ -2598,6 +2599,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					typeof model.contextWindow === "number" ? model.contextWindow : 272_000,
 				maxTokens: typeof model.maxTokens === "number" ? model.maxTokens : 128_000,
 			})) as CodexCatalogModel[];
+		// The host registry may have been replaced by a previous live-catalog refresh.
+		// Read Pi's canonical Codex metadata too, so a later refresh can still recover
+		// levels such as Luna's `max` instead of permanently inheriting xhigh.
+		const canonical = mapped.map((model) => ({
+			id: model.id,
+			thinkingLevelMap: piAiGetModel(CODEX_BASE, model.id)?.thinkingLevelMap,
+		}));
+		return preserveHostMaxReasoningLevel(mapped, canonical);
 	}
 
 	function mergeCodexModels(...groups: CodexCatalogModel[][]): CodexCatalogModel[] {
@@ -2724,7 +2733,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					return;
 				}
 				try {
-					const models = await fetchFreshCodexCatalog(ctx, provider);
+					const models = preserveHostMaxReasoningLevel(
+						await fetchFreshCodexCatalog(ctx, provider),
+						registryFallback,
+					);
 					codexModelCatalogByProvider.set(provider, {
 						fetchedAt: Date.now(),
 						models,
@@ -2752,7 +2764,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		discoveredCodexModelOrder = allKnown.map((model) => model.id);
 
 		for (const provider of providers) {
-			const models = codexModelCatalogByProvider.get(provider)?.models ?? registryFallback;
+			const models = preserveHostMaxReasoningLevel(
+				codexModelCatalogByProvider.get(provider)?.models ?? registryFallback,
+				registryFallback,
+			);
 			registerCodexCatalog(pi, provider, models as Array<Record<string, unknown>>);
 		}
 		// Also keep unauthenticated spare login slots current so a newly logged-in account can select

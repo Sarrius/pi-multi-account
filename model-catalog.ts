@@ -60,6 +60,36 @@ function thinkingLevelMap(efforts: string[]): Record<string, string | null> | un
 	return Object.keys(result).length > 0 ? result : undefined;
 }
 
+/**
+ * Preserve a host-declared `max` level when the account catalog omits it.
+ * Pi's built-in Codex metadata knows about max for Luna, while the live
+ * account endpoint currently reports only through xhigh. The live catalog
+ * still wins for every explicitly reported level.
+ */
+export function preserveHostMaxReasoningLevel(
+	models: CodexCatalogModel[],
+	hostModels: Array<Pick<CodexCatalogModel, "id" | "thinkingLevelMap">>,
+): CodexCatalogModel[] {
+	const hostMax = new Set(
+		hostModels
+			.filter((model) => model.thinkingLevelMap?.max === "max")
+			.map((model) => model.id),
+	);
+	return models.map((model) => {
+		if (
+			!model.reasoning ||
+			!hostMax.has(model.id) ||
+			Object.hasOwn(model.thinkingLevelMap ?? {}, "max")
+		) {
+			return model;
+		}
+		return {
+			...model,
+			thinkingLevelMap: { ...model.thinkingLevelMap, max: "max" },
+		};
+	});
+}
+
 function versionParts(id: string): number[] {
 	const match = id.match(/(?:^|[-_])(?:gpt[-_]?)?(\d+)(?:\.(\d+))?(?:\.(\d+))?/i);
 	return match ? [Number(match[1]), Number(match[2] ?? 0), Number(match[3] ?? 0)] : [0, 0, 0];
