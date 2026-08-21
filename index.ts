@@ -583,6 +583,31 @@ const CONFIG_PATH = join(AGENT_DIR, "provider-failover.json");
 const STATE_PATH = join(AGENT_DIR, "provider-failover-state.json");
 const AUTH_PATH = join(AGENT_DIR, "auth.json");
 const MODELS_CONFIG_PATH = join(AGENT_DIR, "models.json");
+const PINNED_MODELS_PATH = join(AGENT_DIR, "pinned-models.json");
+
+/** Read optional model pins stored in Pi's agent directory. */
+function pinnedModelIdsForFamily(family: string | undefined): string[] {
+	if (!family) return [];
+	const keys =
+		family === "openai-codex" ? ["openai-codex", "chatgpt"] : [family];
+	try {
+		const values = JSON.parse(readFileSync(PINNED_MODELS_PATH, "utf8"));
+		if (!values || typeof values !== "object" || Array.isArray(values)) return [];
+		const ids: string[] = [];
+		for (const key of keys) {
+			const entry = (values as Record<string, unknown>)[key];
+			if (!Array.isArray(entry)) continue;
+			for (const modelId of entry) {
+				if (typeof modelId === "string" && modelId && !ids.includes(modelId)) {
+					ids.push(modelId);
+				}
+			}
+		}
+		return ids;
+	} catch {
+		return [];
+	}
+}
 
 /**
  * Model ids the user configured for a provider in Pi's own models.json.
@@ -4542,12 +4567,25 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 							: [];
 	}
 
+	function pinnedFamilyPreferredModels(family: string | undefined): string[] {
+		const preferred = familyPreferredModels(family);
+		const pinned = pinnedModelIdsForFamily(family);
+		const pinnedSet = new Set(pinned);
+		return [
+			...new Set([
+				...preferred.filter((modelId) => pinnedSet.has(modelId)),
+				...pinned,
+				...preferred,
+			]),
+		];
+	}
+
 	// Rank of a model within its family's newest-first preferred order (0 = newest).
 	// Unknown models sort last. Used to keep the latest model across accounts, not
 	// just within one account, during fallback ranking.
 	function modelRecencyRank(model: any): number {
 		const family = classifyProvider(model?.provider, config.qwenProvider);
-		const order = familyPreferredModels(family);
+		const order = pinnedFamilyPreferredModels(family);
 		const idx = order.indexOf(model?.id);
 		return idx < 0 ? Number.MAX_SAFE_INTEGER : idx;
 	}
@@ -4572,7 +4610,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const sameFamily = !!family && !!currentFamily && family === currentFamily;
 		// A per-family config override (preferredModels) wins, so a new flagship model can be
 		// pinned without a code change. Order is newest-first either way.
-		const preferred = familyPreferredModels(family);
+		const preferred = pinnedFamilyPreferredModels(family);
 		const keepCurrent = sameFamily && currentModel?.id ? [currentModel.id] : [];
 		// `preferredOnly` means "take this family's flagship, not an arbitrary model". A provider
 		// outside the managed families has no flagship list at all, so honouring it literally

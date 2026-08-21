@@ -60,6 +60,7 @@ const AUTH = join(AGENT_DIR, "auth.json");
 const CONFIG = join(AGENT_DIR, "provider-failover.json");
 const STATE = join(AGENT_DIR, "provider-failover-state.json");
 const DEBUG_LOG = join(AGENT_DIR, "provider-failover-debug.log");
+const PINNED_MODELS = join(AGENT_DIR, "pinned-models.json");
 
 function readDebugLog(): Array<Record<string, any>> {
 	try {
@@ -3579,6 +3580,81 @@ test("preferredModels config override pins the newest model per provider without
 		`override should select gpt-5.5, got: ${t.rec.setModels.join(", ")}`,
 	);
 });
+
+test(
+	"Dashboard pins outrank live catalog recency without reordering pinned models",
+	{ concurrency: false },
+	async (testContext) => {
+		testContext.mock.method(globalThis, "fetch", async () =>
+			new Response(
+				JSON.stringify({
+					models: [
+						{
+							slug: "gpt-5.6-luna",
+							display_name: "5.6 Luna",
+							visibility: "list",
+							priority: 30,
+							supported_reasoning_levels: [{ effort: "xhigh" }],
+						},
+						{
+							slug: "gpt-5.6-sol",
+							display_name: "5.6 Sol",
+							visibility: "list",
+							priority: 10,
+							supported_reasoning_levels: [{ effort: "xhigh" }],
+						},
+						{
+							slug: "gpt-5.6-terra",
+							display_name: "5.6 Terra",
+							visibility: "list",
+							priority: 20,
+							supported_reasoning_levels: [{ effort: "xhigh" }],
+						},
+					],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			),
+		);
+		const failoverWithPins = async (contents: string, expectedModel: string) => {
+			writeFileSync(PINNED_MODELS, contents);
+			const t = setup({
+				accounts: {
+					anthropic: {
+						type: "oauth",
+						access: "anthropic-access",
+						refresh: "anthropic-refresh",
+					},
+					"openai-codex-account-4": {
+						type: "oauth",
+						access: "codex-access",
+						refresh: "codex-refresh",
+						accountId: "codex-account-4",
+					},
+				},
+				current: { provider: "anthropic", id: "claude-opus-4-8" },
+				config: { autoDiscoverModels: true, reasoningLevel: "xhigh" },
+			});
+			await t.fire("session_start");
+			await t.fire("agent_start");
+			await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+			assert.equal(t.rec.setModels[0], expectedModel);
+			await t.fire("session_shutdown");
+		};
+		try {
+			await failoverWithPins("{", "openai-codex-account-4/gpt-5.6-sol");
+			await failoverWithPins(
+				JSON.stringify({ chatgpt: ["gpt-5.6-luna"] }),
+				"openai-codex-account-4/gpt-5.6-luna",
+			);
+			await failoverWithPins(
+				JSON.stringify({ chatgpt: ["gpt-5.6-luna", "gpt-5.6-sol"] }),
+				"openai-codex-account-4/gpt-5.6-sol",
+			);
+		} finally {
+			rmSync(PINNED_MODELS, { force: true });
+		}
+	},
+);
 
 test("failover messages are stamped with the running version so a stale (un-restarted) Pi window is obvious at a glance", async () => {
 	const t = setup({
