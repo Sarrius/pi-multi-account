@@ -66,7 +66,7 @@ test("live Codex catalog follows server priority: Sol beats Terra and Luna", () 
 				display_name: "5.6 Luna",
 				visibility: "list",
 				priority: 30,
-				supported_reasoning_levels: [{ effort: "high" }, { effort: "xhigh" }],
+				supported_reasoning_levels: [{ effort: "high" }, { effort: "xhigh" }, { effort: "max" }],
 				context_window: 272_000,
 			},
 			{
@@ -104,6 +104,7 @@ test("live Codex catalog follows server priority: Sol beats Terra and Luna", () 
 	);
 	assert.equal(models[0].thinkingLevelMap?.xhigh, "xhigh");
 	assert.equal(models[0].thinkingLevelMap?.minimal, "low");
+	assert.equal(models[2].thinkingLevelMap?.max, "max");
 	assert.deepEqual(models[0].input, ["text", "image"]);
 });
 

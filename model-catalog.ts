@@ -25,7 +25,7 @@ export type CodexCatalogSnapshot = {
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const DEFAULT_CONTEXT_WINDOW = 272_000;
 const DEFAULT_MAX_TOKENS = 128_000;
-const KNOWN_PI_THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh"];
+const KNOWN_PI_THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
 function record(value: unknown): Record<string, any> {
 	return value && typeof value === "object" ? (value as Record<string, any>) : {};
