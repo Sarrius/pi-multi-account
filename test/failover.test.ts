@@ -200,6 +200,8 @@ function setup(opts: {
 	thinkingCaps?: Record<string, string>;
 	/** Pi settings.json defaultProvider/defaultModel, used after catalog load. */
 	settings?: { defaultProvider: string; defaultModel: string };
+	/** Simulate a child process launched by pi-subagents. */
+	subagentChild?: boolean;
 	/**
 	 * Shape of the host's AuthStorage.
 	 *
@@ -481,7 +483,15 @@ function setup(opts: {
 	// Tests always take this hook so they never import the real compact() (network).
 	(pi as any).__testCompactFn = opts.compactFn;
 
-	piMultiAccount(pi);
+	const previousSubagentChild = process.env.PI_SUBAGENT_CHILD;
+	if (opts.subagentChild) process.env.PI_SUBAGENT_CHILD = "1";
+	else delete process.env.PI_SUBAGENT_CHILD;
+	try {
+		piMultiAccount(pi);
+	} finally {
+		if (previousSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+		else process.env.PI_SUBAGENT_CHILD = previousSubagentChild;
+	}
 
 	const fire = async (event: string, payload: any = {}) => {
 		const handlers = events[event];
@@ -2729,6 +2739,85 @@ test("session_start restores lastUserModel after Pi falls back to anthropic/clau
 		`startup must put the session back on the last live model, not Pi's anthropic default; setModels=${t.rec.setModels.join(",")}`,
 	);
 	uninstallCursorProvider();
+});
+
+test("pi-subagents child keeps its explicit launch model and delegates fallback to the parent runner", async () => {
+	const t = setup({
+		accounts: {
+			qoder: { type: "api_key", key: "qoder-key" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "codex-token",
+				refresh: "codex-refresh",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "qoder", id: "qfmodel" },
+		thinkingLevel: "high",
+		subagentChild: true,
+		settings: {
+			defaultProvider: "openai-codex-account-2",
+			defaultModel: "gpt-5.6-sol",
+		},
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: {
+				provider: "openai-codex-account-2",
+				id: "gpt-5.6-sol",
+			},
+			lastUserThinkingLevel: "medium",
+			lastModelByFamily: { "openai-codex": "gpt-5.6-sol" },
+			exhaustedUntilByProvider: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+			pendingFrom: "openai-codex-account-2/gpt-5.6-sol",
+			pendingReason: "parent session is waiting for quota reset",
+			pendingSince: 123,
+		},
+	});
+
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, { provider: "qoder", id: "qfmodel" });
+	assert.equal(t.thinkingLevel(), "high");
+	assert.deepEqual(
+		t.rec.setModels,
+		[],
+		"child startup must not restore the parent process's remembered model",
+	);
+
+	await finishError(t, "qoder", "qfmodel", "429 rate limit");
+	assert.deepEqual(
+		t.rec.setModels,
+		[],
+		"child errors must surface to pi-subagents instead of starting a competing failover chain",
+	);
+	assert.equal(t.rec.continueCalls.length, 0);
+	assert.equal(t.rec.sent.length, 0);
+
+	await t.fire("model_select", {
+		model: { provider: "qoder", id: "qfmodel" },
+		source: "set",
+	});
+	await t.fire("session_shutdown");
+	assert.deepEqual(t.readState().lastUserModel, {
+		provider: "openai-codex-account-2",
+		id: "gpt-5.6-sol",
+	});
+	assert.equal(
+		t.readState().lastUserThinkingLevel,
+		"medium",
+		"a delegated child must not overwrite the interactive session preference",
+	);
+	assert.equal(
+		t.readState().pendingFrom,
+		"openai-codex-account-2/gpt-5.6-sol",
+		"a delegated child must not clear the parent process's pending recovery",
+	);
+	assert.equal(
+		t.readState().pendingReason,
+		"parent session is waiting for quota reset",
+	);
 });
 
 test("session_start restores settings.json default when lastUserModel is missing", async () => {

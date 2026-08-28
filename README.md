@@ -155,6 +155,10 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 
 State (cooldowns, invalidations, recent switches, credential-free Codex model catalogs, and an in-session pending resume marker) is persisted to `~/.pi/agent/provider-failover-state.json`. Pending work is deliberately discarded when the session closes or a different session starts.
 
+### pi-subagents compatibility
+
+`pi-subagents` marks native child processes with `PI_SUBAGENT_CHILD=1` and owns their explicit model plus `fallbackModels` chain. In those children this extension stays loaded only for provider/account registration, OAuth request shaping, and catalog support. It deliberately does **not** restore the interactive process's remembered model, persist the child's model as a user preference, switch models, queue work, or auto-continue after errors. The original provider error is returned unchanged so the parent runner can advance its verified fallback chain without a second router competing for model identity.
+
 ## Staying unstuck (resilience)
 
 A failover is only useful if the agent actually keeps working afterward. These guarantees keep a switch from silently freezing the session:
