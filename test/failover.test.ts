@@ -144,6 +144,22 @@ type Credential = {
 };
 type Account = Record<string, Credential>;
 
+function codexAccessToken(
+	workspaceId: string,
+	accountUserId: string,
+	tokenVersion = "1",
+): string {
+	const payload = Buffer.from(
+		JSON.stringify({
+			"https://api.openai.com/auth": {
+				chatgpt_account_id: workspaceId,
+				chatgpt_account_user_id: accountUserId,
+			},
+		}),
+	).toString("base64url");
+	return `eyJhbGciOiJub25lIn0.${payload}.${tokenVersion}`;
+}
+
 const TWO_ACCOUNTS: Account = {
 	anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
 	"openai-codex-account-2": {
@@ -1033,26 +1049,26 @@ test("no-fallback warning reports invalidated accounts separately from cooldowns
 	assert.ok(!warning.includes("Cooldowns: openai-codex-account-2"));
 });
 
-test("same Codex accountId in two slots is one rotation account and shares cooldown", async () => {
+test("same Codex workspace membership in two slots is one rotation account and shares cooldown", async () => {
 	const accounts: Account = {
 		anthropic: { type: "oauth", access: "a", refresh: "ar" },
 		"openai-codex": {
 			type: "oauth",
-			access: "base",
+			access: codexAccessToken("shared-workspace", "membership-a", "base"),
 			refresh: "base-r",
-			accountId: "same-account",
+			accountId: "shared-workspace",
 		},
 		"openai-codex-account-2": {
 			type: "oauth",
-			access: "other",
+			access: codexAccessToken("other-workspace", "membership-b", "other"),
 			refresh: "other-r",
-			accountId: "other-account",
+			accountId: "other-workspace",
 		},
 		"openai-codex-account-3": {
 			type: "oauth",
-			access: "duplicate",
+			access: codexAccessToken("shared-workspace", "membership-a", "refreshed"),
 			refresh: "duplicate-r",
-			accountId: "same-account",
+			accountId: "shared-workspace",
 		},
 	};
 	const t = setup({
@@ -1082,19 +1098,56 @@ test("same Codex accountId in two slots is one rotation account and shares coold
 	);
 });
 
+test("different users in the same Codex workspace remain distinct rotation accounts", async () => {
+	const workspace = "shared-team-workspace";
+	const t = setup({
+		accounts: {
+			"openai-codex": {
+				type: "oauth",
+				access: codexAccessToken(workspace, "membership-alice"),
+				refresh: "alice-r",
+				accountId: workspace,
+			},
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: codexAccessToken(workspace, "membership-bob"),
+				refresh: "bob-r",
+				accountId: workspace,
+			},
+		},
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: {
+			fallbacks: ["openai-codex", "openai-codex-account-2"],
+			autoContinue: false,
+		},
+	});
+
+	await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+	assert.equal(
+		t.rec.setModels[0],
+		"openai-codex-account-2/gpt-5.5",
+		"a second user in the same workspace must remain available as a fallback",
+	);
+	assert.ok(t.readState().exhaustedUntilByProvider?.["openai-codex"]);
+	assert.ok(
+		!t.readState().exhaustedUntilByProvider?.["openai-codex-account-2"],
+		"one workspace member's cooldown must not fan out to another member",
+	);
+});
+
 test("session start reports deterministic duplicate account slots", async () => {
 	const accounts: Account = {
 		"openai-codex": {
 			type: "oauth",
-			access: "base",
+			access: codexAccessToken("shared-workspace", "membership-a", "base"),
 			refresh: "base-r",
-			accountId: "same-account",
+			accountId: "shared-workspace",
 		},
 		"openai-codex-account-2": {
 			type: "oauth",
-			access: "duplicate",
+			access: codexAccessToken("shared-workspace", "membership-a", "refreshed"),
 			refresh: "duplicate-r",
-			accountId: "same-account",
+			accountId: "shared-workspace",
 		},
 	};
 	const t = setup({
@@ -1836,9 +1889,9 @@ test("a cooled account stays skipped after its OAuth access token refreshes", as
 		anthropic: { type: "oauth", access: "a-tok", refresh: "a-ref" },
 		"openai-codex-account-2": {
 			type: "oauth",
-			access: "c-old",
+			access: codexAccessToken("workspace-2", "membership-2", "old"),
 			refresh: "c-ref",
-			accountId: "codex-2",
+			accountId: "workspace-2",
 		},
 	};
 	const t = setup({
@@ -1848,16 +1901,16 @@ test("a cooled account stays skipped after its OAuth access token refreshes", as
 	});
 	await t.fire("session_start");
 	t.rec.setModels.length = 0;
-	// Pi rotates the OAuth access token in place — same real account (same accountId).
+	// Pi rotates the OAuth access token in place — same workspace membership, new token.
 	writeFileSync(
 		AUTH,
 		JSON.stringify({
 			...accounts,
 			"openai-codex-account-2": {
 				type: "oauth",
-				access: "c-NEW",
+				access: codexAccessToken("workspace-2", "membership-2", "new"),
 				refresh: "c-ref",
-				accountId: "codex-2",
+				accountId: "workspace-2",
 			},
 		}),
 	);
@@ -1872,6 +1925,48 @@ test("a cooled account stays skipped after its OAuth access token refreshes", as
 		t.readState().pendingFrom && t.readState().pendingReason,
 		"both accounts cooling → pending resume armed",
 	);
+});
+
+test("re-login as another user in the same Codex workspace clears the old user's cooldown", async () => {
+	const provider = "openai-codex-account-2";
+	const workspace = "shared-team-workspace";
+	const accounts: Account = {
+		anthropic: { type: "oauth", access: "a-tok", refresh: "a-ref" },
+		[provider]: {
+			type: "oauth",
+			access: codexAccessToken(workspace, "membership-alice"),
+			refresh: "alice-r",
+			accountId: workspace,
+		},
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedCooldownsMsFromNow: { [provider]: 60 * 60 * 1000 },
+		config: { autoContinue: false },
+	});
+	await t.fire("session_start");
+
+	writeFileSync(
+		AUTH,
+		JSON.stringify({
+			...accounts,
+			[provider]: {
+				type: "oauth",
+				access: codexAccessToken(workspace, "membership-bob"),
+				refresh: "bob-r",
+				accountId: workspace,
+			},
+		}),
+	);
+	await t.command("rediscover");
+
+	assert.ok(
+		!t.readState().exhaustedUntilByProvider?.[provider],
+		"a different workspace membership must not inherit the previous user's cooldown",
+	);
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.equal(t.rec.setModels[0], `${provider}/gpt-5.5`);
 });
 
 test("manual next cycles through every account instead of ping-ponging between two", async () => {
