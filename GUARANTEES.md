@@ -1,7 +1,7 @@
 # What "working" means — and what locks it
 
 This file is the contract. Each row is a promise the extension makes, written in plain language,
-next to the automated test that will FAIL the moment that promise breaks. `npm test` (469 tests)
+next to the automated test that will FAIL the moment that promise breaks. `npm test` (496 tests)
 runs them all; CI blocks any change that violates a promise. If you hit a behaviour that feels
 broken and it is **not** on this list, that is a missing guarantee — it should become a new row +
 test, not a one-off patch.

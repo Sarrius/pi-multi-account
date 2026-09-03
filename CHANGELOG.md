@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.1] - 2026-09-03
+
 ### Fixed
 
 - **Rotation now preserves the user's model class as well as reasoning effort.** Exact-model siblings remain first, while cross-provider fallback uses explicit quality bands: frontier (Sol, Opus and provider flagships), balanced (Terra, Sonnet), and fast (Luna, Haiku). Manual `next`, automatic failover, pending resume, startup preflight, and `best` share the rule, so a Sol task can no longer silently land on Terra because that happened to be the next account's flagship.
@@ -15,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Automatic routing no longer wastes turns on accounts whose fresh usage verdict already says 100% / blocked.** Background usage refresh makes an account eligible as soon as the provider reports recovery; manual `next` remains the explicit one-attempt override for stale telemetry.
 - **Repeated same-model 500 retries are bounded by the recovery breaker.** The extension stops after three failed automatic recoveries instead of multiplying its eight-hop budget by the provider's own HTTP retries, and the continuation text says `retrying` when no account/model switch occurred.
 - **Pending work is session-local.** Parallel Pi windows may still publish a diagnostic marker to the shared state file, but no window reads another window's marker as executable work. Switch, error, resume, continuation, and session-start log events now include a session id so overlapping workdays can be reconstructed reliably.
+- **Explicit CLI model and thinking selections remain authoritative.** A launch with `--model`, `--provider`, `--thinking`, or a model thinking suffix no longer gets overwritten by remembered interactive state and no longer writes the one-shot launch choice back as the global preference. Pi's own CLI resolver supplies the parsing semantics, native model clamps are distinguished from genuine user thinking changes, and later manual `next`, `best`, `switch`, model, or thinking choices correctly take ownership. Integrated from PR #39 by Gabriel Vinhaes.
 
 ### Tests
 
