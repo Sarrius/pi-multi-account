@@ -10195,6 +10195,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (slotProxyPort !== undefined) return Promise.resolve(slotProxyPort);
 		if (slotProxyStarting) return slotProxyStarting;
 		slotProxyStarting = new Promise<number | undefined>((resolve) => {
+			let retriedOnEphemeralPort = false;
 			const server = createServer((req, res) => {
 				handleProxyRequest(req, res).catch((error) => {
 					logEvent("slot_proxy_handler_failed", {
@@ -10220,20 +10221,43 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// A dead listener must never take Pi down with it — the same rule the Cursor bridge
 			// learned the hard way.
 			server.on("error", (error: NodeJS.ErrnoException) => {
-				if (error.code === "EADDRINUSE" && server.listening === false && !slotProxyPort) {
+				if (
+					error.code === "EADDRINUSE" &&
+					server.listening === false &&
+					!slotProxyPort &&
+					!retriedOnEphemeralPort
+				) {
 					// Another live process owns this port, and with it every route published
 					// against it. We still take an ephemeral port — serving our own in-process
 					// callers costs nothing — but we are no longer the publisher: the shared
 					// files stay exactly as the owner left them. See slotProxyForeignOwner.
+					//
+					// Do not re-enter listen() from the error callback. With an independent
+					// process holding the port, Pi's compiled Bun runtime can leave the server
+					// in its failed-listen transition until the next event-loop turn, so the retry never
+					// reaches the original callback and session_start remains pending forever.
+					retriedOnEphemeralPort = true;
 					slotProxyForeignOwner = true;
 					logEvent("slot_proxy_foreign_owner", { port: SLOT_PROXY_PORT });
-					server.listen(0, "127.0.0.1");
+					setImmediate(() => {
+						try {
+							server.listen(0, "127.0.0.1");
+						} catch (retryError) {
+							logEvent("slot_proxy_listen_failed", {
+								reason: retryError instanceof Error ? retryError.message : String(retryError),
+							});
+							resolve(undefined);
+						}
+					});
 					return;
 				}
 				logEvent("slot_proxy_listen_failed", { reason: error.message });
 				resolve(undefined);
 			});
-			server.listen(SLOT_PROXY_PORT, "127.0.0.1", () => {
+			// Register independently of either listen() attempt. A callback passed only to the
+			// canonical listen can be lost when that attempt emits EADDRINUSE before the server
+			// retries on an ephemeral port.
+			server.once("listening", () => {
 				const address = server.address();
 				slotProxyPort = typeof address === "object" && address ? address.port : undefined;
 				slotProxyServer = server;
@@ -10241,6 +10265,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				logEvent("slot_proxy_listening", { port: slotProxyPort });
 				resolve(slotProxyPort);
 			});
+			server.listen(SLOT_PROXY_PORT, "127.0.0.1");
 		}).finally(() => {
 			slotProxyStarting = undefined;
 		});

@@ -5,6 +5,7 @@
  * provider responses (possibly retried) -> final assistant message -> agent_end.
  */
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	existsSync,
@@ -9162,6 +9163,46 @@ test("with the proxy off, status warns that the account a bare child picks up is
 	assert.match(status, /openai-codex-account-2/);
 	assert.match(status, /first-available provider/);
 	await t.fire("session_shutdown");
+});
+
+test("a canonical port held by an independent process cannot hang session_start", async () => {
+	// A same-process listener can re-enter listen() synchronously after EADDRINUSE on some Node
+	// versions, which let the ownership test below pass while every second real Pi process hung.
+	// Hold the canonical port from another process to reproduce the actual multi-session boundary.
+	process.env.PI_MULTI_ACCOUNT_SLOT_PROXY_PORT = String(nextSlotProxyPort++);
+	const port = currentSlotProxyPort();
+	const blocker = spawn(
+		process.execPath,
+		[
+			"-e",
+			`require("node:net").createServer().listen(${port}, "127.0.0.1", () => process.stdout.write("ready\\n"))`,
+		],
+		{ stdio: ["ignore", "pipe", "inherit"] },
+	);
+	await new Promise<void>((resolve, reject) => {
+		blocker.once("error", reject);
+		blocker.stdout.once("data", () => resolve());
+	});
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const t = setup({
+			reuseSlotProxyPort: true,
+			current: { provider: "anthropic", id: "claude-opus-4-8" },
+		});
+		await Promise.race([
+			t.fire("session_start"),
+			new Promise((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error("session_start remained pending after EADDRINUSE")),
+					2_000,
+				);
+			}),
+		]);
+		await t.fire("session_shutdown");
+	} finally {
+		if (timer) clearTimeout(timer);
+		blocker.kill();
+	}
 });
 
 test("a second process that cannot own the canonical port leaves the owner's files alone", async () => {
