@@ -91,6 +91,7 @@ const {
 	canPersistRefreshedCredentials,
 	mergeRefreshedCredentials,
 	modelIdentityKey,
+	modelQualityBand,
 	persistRefreshedCredentials,
 	sameModelIdentity,
 } = (await import("../index.ts")) as {
@@ -101,6 +102,7 @@ const {
 	) => boolean;
 	mergeRefreshedCredentials: (credentials: any, refreshed: any) => any;
 	modelIdentityKey: (modelId: string) => string;
+	modelQualityBand: (modelId: string) => "frontier" | "balanced" | "fast" | undefined;
 	persistRefreshedCredentials: (
 		authStorage: any,
 		provider: string,
@@ -123,6 +125,18 @@ test("model identity folds Cursor effort suffixes and the cursor- prefix", () =>
 	assert.ok(!sameModelIdentity("cursor-grok-4.6", "claude-4-sonnet"));
 	assert.ok(!sameModelIdentity("gpt-5.4", "gpt-5.4-mini"));
 	assert.ok(!sameModelIdentity("k3", "k3-256k"));
+});
+
+test("cross-provider quality bands map Sol/Opus, Terra/Sonnet, and Luna/Haiku", () => {
+	assert.equal(modelQualityBand("gpt-5.6-sol"), "frontier");
+	assert.equal(modelQualityBand("claude-opus-5"), "frontier");
+	assert.equal(modelQualityBand("composer-2.5"), "frontier");
+	assert.equal(modelQualityBand("qwen3.8-max"), "frontier");
+	assert.equal(modelQualityBand("glm-5.2:cloud"), "frontier");
+	assert.equal(modelQualityBand("gpt-5.6-terra"), "balanced");
+	assert.equal(modelQualityBand("claude-sonnet-4-6"), "balanced");
+	assert.equal(modelQualityBand("gpt-5.6-luna"), "fast");
+	assert.equal(modelQualityBand("claude-haiku-4-5"), "fast");
 });
 
 const AUTH = join(AGENT_DIR, "auth.json");
@@ -1888,7 +1902,27 @@ test("manual next can override cooldowns without arming an automatic continuatio
 	);
 });
 
-test("a manual account switch immediately drains the message held behind the old account cooldown", async () => {
+test("manual next cancels the old automatic resume chain before it rotates", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedCooldownsMsFromNow: {
+			anthropic: 60 * 60 * 1000,
+			"openai-codex-account-2": 60 * 60 * 1000,
+		},
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 usage limit");
+	assert.ok(t.readState().pendingFrom, "precondition: the failed turn armed a wake");
+
+	await t.command("next");
+	assert.equal(
+		t.readState().pendingFrom,
+		undefined,
+		"the user's new route owns the session; the old wake must not survive",
+	);
+	await t.fire("session_shutdown");
+});
+
+test("a fresh user message is never swallowed into a private cooldown queue", async () => {
 	const t = setup({
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
 		seedCooldownsMsFromNow: {
@@ -1897,20 +1931,16 @@ test("a manual account switch immediately drains the message held behind the old
 		},
 	});
 
-	const held = await t.input("send this after I choose another account");
-	assert.deepEqual(held, { action: "handled" });
-	assert.equal(t.rec.sent.length, 0, "the message is held while every account is cooling");
-
-	await t.command("switch openai-codex-account-2");
-	assert.deepEqual(t.rec.sent, [
-		{
-			prompt: "send this after I choose another account",
-			options: { deliverAs: "followUp" },
-		},
-	]);
+	const result = await t.input("keep this visible in the transcript");
+	assert.deepEqual(
+		result,
+		{ action: "continue" },
+		"Pi must receive the original input so the user's text remains visible and recoverable",
+	);
+	assert.equal(t.rec.sent.length, 0, "the extension must not clone the prompt into its own queue");
 	assert.ok(
-		t.rec.notifies.some((message) => /resumed 1 queued message/i.test(message)),
-		"the switch confirms that the held work was actually submitted",
+		t.rec.notifies.some((message) => /no account is ready|keeps? your message/i.test(message)),
+		"the user must be told why the current request may fail over",
 	);
 });
 
@@ -3838,20 +3868,13 @@ test("a genuinely maxed monthly Codex account is benched for its REAL reset, so 
 		"gpt-5.5",
 		"usage limit has been reached",
 	);
-	assert.equal(
-		t.rec.setModels[0],
-		"openai-codex-account-3/gpt-5.5",
-		`first hop must try the other Codex slot, not skip it for Qwen; got ${JSON.stringify(t.rec.setModels)}`,
-	);
-	await finishError(
-		t,
-		"openai-codex-account-3",
-		"gpt-5.5",
-		"usage limit has been reached",
-	);
 	assert.ok(
 		t.rec.setModels.some((m) => m.startsWith("alibaba/")),
-		`after the sibling also refused, failover must reach the healthy Qwen/Alibaba account; got ${JSON.stringify(t.rec.setModels)}`,
+		`a fresh 100% sibling is known dead, so failover must go directly to healthy Qwen/Alibaba; got ${JSON.stringify(t.rec.setModels)}`,
+	);
+	assert.ok(
+		!t.rec.setModels.some((m) => m.startsWith("openai-codex-account-3/")),
+		"automatic routing must not spend a user turn re-proving a fresh provider verdict",
 	);
 	assert.equal(
 		t.rec.setModels.filter((m) => m.startsWith("openai-codex-account-2/")).length,
@@ -4765,9 +4788,10 @@ test("a sibling that already refused yields to another family", async () => {
 	);
 });
 
-test("a 100% usage forecast on a Codex sibling does not skip it for Claude", async () => {
-	// Live 2026-08-20: openai-codex/gpt-5.6-sol plus-limit → anthropic/claude-opus-5 because every
-	// Codex slot's usage snapshot said 100% / blocked, so siblings were dropped from availableNow.
+test("a fresh provider verdict of 100% skips the dead Codex sibling", async () => {
+	// Live 2026-09-03: Sol failed, then automation selected two Codex accounts whose fresh usage
+	// snapshots already said 100% / blocked. The user paid for those redundant refusals with two
+	// broken turns. Only a manual next may override this evidence; automatic routing must not.
 	const now = Date.now();
 	const t = setup({
 		accounts: {
@@ -4820,26 +4844,25 @@ test("a 100% usage forecast on a Codex sibling does not skip it for Claude", asy
 		"gpt-5.5",
 		"You have hit your ChatGPT usage limit (plus plan). Try again in ~1596 min.",
 	);
-	assert.equal(
-		t.rec.setModels[0],
-		"openai-codex-account-2/gpt-5.5",
-		`must try the other Codex slot at the same thinking level, not Claude; got ${t.rec.setModels.join(", ")}`,
+	assert.ok(
+		t.rec.setModels.some((m) => m.startsWith("anthropic/claude-opus-")),
+		`Opus is the compatible live peer after a frontier Codex slot is known spent; got ${t.rec.setModels.join(", ")}`,
 	);
 	assert.ok(
-		!t.rec.setModels.some((m) => m.startsWith("anthropic")),
-		`must not jump to Claude while a Codex sibling has not refused; got ${t.rec.setModels.join(", ")}`,
+		!t.rec.setModels.some((m) => m.startsWith("openai-codex-account-2/")),
+		`the explicitly blocked sibling must not be retried automatically; got ${t.rec.setModels.join(", ")}`,
 	);
 	assert.equal(
 		t.thinkingLevel(),
 		"high",
-		"the session thinking level must survive the Codex sibling switch",
+		"the session thinking level must survive the cross-provider switch",
 	);
 	const afterHop = t.rec.setModels.length;
 	await t.fire("before_agent_start", {});
 	assert.equal(
 		t.rec.setModels.length,
 		afterHop,
-		`the sibling hop must survive last-moment preflight; it bounced to ${t.rec.setModels.slice(afterHop).join(", ")}`,
+		`the compatible live hop must survive last-moment preflight; it bounced to ${t.rec.setModels.slice(afterHop).join(", ")}`,
 	);
 });
 
@@ -5167,6 +5190,80 @@ test("credential-free catalog snapshots preserve account-specific Codex availabi
 	const account5 = snapshot.models.filter((entry: any) => entry.provider === "openai-codex-account-5").map((entry: any) => entry.id);
 	assert.ok(base.includes("gpt-5.6-sol"));
 	assert.deepEqual(account5.sort(), ["gpt-5.5", "gpt-5.6-terra"]);
+});
+
+test("Sol rotation stays frontier: next skips a Terra-only account and preserves effort", async () => {
+	const accounts = {
+		"openai-codex": { type: "oauth", access: "base", refresh: "base-r", accountId: "base" },
+		"openai-codex-account-2": { type: "oauth", access: "two", refresh: "two-r", accountId: "two" },
+		"openai-codex-account-5": { type: "oauth", access: "five", refresh: "five-r", accountId: "five" },
+		anthropic: { type: "oauth", access: "anthropic", refresh: "anthropic-r" },
+	};
+	const model = (id: string) => ({
+		id,
+		name: id,
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 272000,
+		maxTokens: 128000,
+	});
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		thinkingLevel: "xhigh",
+		config: { autoDiscoverModels: true, preferLatestModel: false },
+		seedState: {
+			stateVersion: 5,
+			codexModelCatalogByProvider: {
+				"openai-codex": { fetchedAt: Date.now(), models: [model("gpt-5.6-sol")] },
+				"openai-codex-account-2": { fetchedAt: Date.now(), models: [model("gpt-5.6-sol")] },
+				"openai-codex-account-5": { fetchedAt: Date.now(), models: [model("gpt-5.6-terra")] },
+			},
+		},
+	});
+	await t.fire("agent_start");
+	await t.command("next");
+	assert.equal(t.rec.setModels.at(-1), "openai-codex-account-2/gpt-5.6-sol");
+	assert.equal(t.thinkingLevel(), "xhigh");
+
+	await t.command("next");
+	assert.match(
+		t.rec.setModels.at(-1) ?? "",
+		/^anthropic\/claude-opus-/,
+		"a Terra-only slot must be skipped; Opus is the cross-provider frontier peer",
+	);
+	assert.equal(t.thinkingLevel(), "xhigh", "manual rotation must keep the user's effort");
+	assert.ok(
+		!t.rec.setModels.includes("openai-codex-account-5/gpt-5.6-terra"),
+		"Sol must never silently become Terra",
+	);
+	await t.fire("session_shutdown");
+});
+
+test("automatic failover from Sol never lands on a Terra-only account", async () => {
+	const accounts = {
+		"openai-codex": { type: "oauth", access: "base", refresh: "base-r", accountId: "base" },
+		"openai-codex-account-5": { type: "oauth", access: "five", refresh: "five-r", accountId: "five" },
+		anthropic: { type: "oauth", access: "anthropic", refresh: "anthropic-r" },
+	};
+	const model = (id: string) => ({ id, name: id, reasoning: true, input: ["text"] });
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { autoDiscoverModels: true, preferLatestModel: false },
+		seedState: {
+			stateVersion: 5,
+			codexModelCatalogByProvider: {
+				"openai-codex": { fetchedAt: Date.now(), models: [model("gpt-5.6-sol")] },
+				"openai-codex-account-5": { fetchedAt: Date.now(), models: [model("gpt-5.6-terra")] },
+			},
+		},
+	});
+	await finishError(t, "openai-codex", "gpt-5.6-sol", "429 usage limit");
+	assert.match(t.rec.setModels.at(-1) ?? "", /^anthropic\/claude-opus-/);
+	assert.ok(!t.rec.setModels.some((entry) => entry.endsWith("/gpt-5.6-terra")));
+	await t.fire("session_shutdown");
 });
 
 test(
@@ -5574,6 +5671,85 @@ test("a same-account pending resume auto-continues on a host without pi.continue
 		"followUp",
 		"the injection must queue behind the current turn, never be rejected as 'already processing'",
 	);
+	assert.match(String(t.rec.sent[0].prompt), /retrying .*no account or model switch occurred/i);
+	assert.doesNotMatch(String(t.rec.sent[0].prompt), /switched to .* after .*\/gpt-5\.5/i);
+});
+
+test("one Pi window never resumes another window's pending task", async () => {
+	const provider = "openai-codex-account-2";
+	const t = setup({
+		accounts: {
+			[provider]: {
+				type: "oauth",
+				access: "b",
+				refresh: "br",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider, id: "gpt-5.5" },
+		config: { transientCooldownMs: 500, pendingPollMs: 200 },
+		omitContinueAgent: true,
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			invalidatedByProvider: {},
+			lastProbeAtByProvider: {},
+			pendingFrom: "anthropic/claude-opus-5",
+			pendingReason: "another window's task",
+			pendingSince: Date.now(),
+			pendingOwner: "some-other-live-session",
+		},
+	});
+	await t.fire("session_start");
+	await finishError(t, provider, "gpt-5.5", "500 server error");
+	await wait(1300);
+
+	assert.equal(t.rec.sent.length, 1, "this session's own retry must still run");
+	assert.match(String(t.rec.sent[0].prompt), new RegExp(provider));
+	assert.doesNotMatch(String(t.rec.sent[0].prompt), /another window|anthropic/);
+	assert.equal(
+		t.readState().pendingOwner,
+		"some-other-live-session",
+		"the shared diagnostic marker remains owned by the other window",
+	);
+	await t.fire("session_shutdown");
+});
+
+test("repeated 500s on an automatic same-model retry trip the breaker instead of looping eight times", async () => {
+	const provider = "openai-codex-account-2";
+	const error = "500 server error";
+	const t = setup({
+		accounts: {
+			[provider]: {
+				type: "oauth",
+				access: "b",
+				refresh: "br",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider, id: "gpt-5.5" },
+		config: { transientCooldownMs: 25, pendingPollMs: 25 },
+		omitContinueAgent: true,
+	});
+	await t.fire("session_start");
+	await finishError(t, provider, "gpt-5.5", error);
+
+	for (let attempt = 0; attempt < 3; attempt++) {
+		await wait(1100);
+		assert.equal(t.rec.sent.length, attempt + 1, "one extension retry per recovery attempt");
+		await t.fire("before_agent_start", {});
+		await finishError(t, provider, "gpt-5.5", error);
+	}
+
+	assert.ok(
+		t.rec.notifies.some((message) => /safe mode|pausing auto-continue/i.test(message)),
+		"three failed retries must visibly stop automatic continuation",
+	);
+	assert.equal(t.readState().pendingFrom, undefined, "the breaker must leave no wake armed");
+	await wait(1100);
+	assert.equal(t.rec.sent.length, 3, "no fourth synthetic user prompt may be injected");
+	await t.fire("session_shutdown");
 });
 
 test("a blocked continuation records why, instead of failing silently", async () => {
@@ -8859,8 +9035,9 @@ test("the resume timer only rotates onto an account it could actually resume on"
 		`at most the one sibling that gets a real request may be tried; got: ${chosen.join(", ")}`,
 	);
 	assert.ok(
-		chosen.some((target) => target.startsWith("anthropic/")),
-		`and the session must land somewhere it can actually work; got: ${chosen.join(", ")}`,
+		t.ctx.model.provider === "anthropic" ||
+			chosen.some((target) => target.startsWith("anthropic/")),
+		`and the session must land somewhere it can actually work; got current ${t.ctx.model.provider}/${t.ctx.model.id}, switches: ${chosen.join(", ")}`,
 	);
 	await t.fire("session_shutdown");
 });
@@ -9197,10 +9374,9 @@ test("a session that acts and acts without a single request reaching a provider 
 });
 
 test("stopping never eats the words the user typed", async () => {
-	// The wait queue exists so a message typed during a cooldown is not lost. Every path that
-	// abandons that queue — the governor stopping itself, or the user stopping it by hand — hands
-	// the text back in the same sentence that explains the stop. `/multi-account stop` used to
-	// drop it in silence, which from the outside is the tool eating what you typed.
+	// A fresh prompt belongs in Pi's transcript, not in extension-owned memory. That makes the
+	// message recoverable by the ordinary failed-turn handoff even if the user immediately stops
+	// automation; `/multi-account stop` must not claim it consumed or returned text it never owned.
 	const cooling: Record<string, number> = {};
 	for (const provider of Object.keys(WIDE_FLEET)) cooling[provider] = 10 * 60 * 1000;
 	const t = setup({
@@ -9213,20 +9389,13 @@ test("stopping never eats the words the user typed", async () => {
 	});
 	await t.fire("session_start");
 
-	const held = await t.input("this sentence must come back to me");
-	assert.equal(held?.action, "handled", "with nothing free, the message is held");
-	assert.equal(t.rec.sent.length, 0, "and nothing was sent");
+	const input = await t.input("this sentence stays in Pi's transcript");
+	assert.equal(input?.action, "continue", "Pi, not the extension, must own the message");
+	assert.equal(t.rec.sent.length, 0, "the extension must not make a private copy");
 
 	await t.command("stop");
 	const stop = t.rec.notifies.at(-1) ?? "";
-	assert.ok(
-		stop.includes("this sentence must come back to me"),
-		`stopping must hand the held text back verbatim; got: ${stop}`,
-	);
-	assert.ok(
-		readDebugLog().some((entry) => entry.kind === "held_messages_returned"),
-		"and record that it did",
-	);
+	assert.doesNotMatch(stop, /held .*not sent/i);
 	await t.fire("session_shutdown");
 });
 

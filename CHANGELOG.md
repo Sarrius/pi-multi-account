@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Rotation now preserves the user's model class as well as reasoning effort.** Exact-model siblings remain first, while cross-provider fallback uses explicit quality bands: frontier (Sol, Opus and provider flagships), balanced (Terra, Sonnet), and fast (Luna, Haiku). Manual `next`, automatic failover, pending resume, startup preflight, and `best` share the rule, so a Sol task can no longer silently land on Terra because that happened to be the next account's flagship.
+- **Manual control now invalidates the complete previous failover chain.** A user prompt, Pi model selection, `next`, `best`, or `switch` advances the chain epoch and clears pending wakes, watchdogs, injected-continuation state, and recovery counters. A timer armed by an earlier failure can no longer restart its old rotation underneath the account the user selected.
+- **Fresh user messages are no longer swallowed into an extension-private cooldown queue.** When no account is ready the message remains in Pi's visible transcript and Pi owns delivery/retry; the extension only uses Pi's native follow-up queue when an automatic agent turn is genuinely active.
+- **Automatic routing no longer wastes turns on accounts whose fresh usage verdict already says 100% / blocked.** Background usage refresh makes an account eligible as soon as the provider reports recovery; manual `next` remains the explicit one-attempt override for stale telemetry.
+- **Repeated same-model 500 retries are bounded by the recovery breaker.** The extension stops after three failed automatic recoveries instead of multiplying its eight-hop budget by the provider's own HTTP retries, and the continuation text says `retrying` when no account/model switch occurred.
+- **Pending work is session-local.** Parallel Pi windows may still publish a diagnostic marker to the shared state file, but no window reads another window's marker as executable work. Switch, error, resume, continuation, and session-start log events now include a session id so overlapping workdays can be reconstructed reliably.
+
+### Tests
+
+- Added regression replays for the observed 2026-09-03 workday failures: Sol-to-Terra downgrade, manual `next` followed by stale automatic rotation, invisible cooldown input, fresh-100%-account selection, repeated Kimi 500 continuation loops, and cross-window pending-state contamination.
+
 ## [1.21.0] - 2026-09-03
 
 ### Added
