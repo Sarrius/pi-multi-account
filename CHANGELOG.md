@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A second concurrent Pi session no longer hangs before it can submit prompts.** When another process owns the canonical child-proxy port, the fallback listener now retries on an ephemeral port on the next event-loop turn and resolves from a standalone `listening` handler. This avoids leaving `session_start` pending forever under Pi's compiled Bun runtime after `EADDRINUSE`.
+
 ## [1.21.1] - 2026-09-03
 
 ### Fixed
