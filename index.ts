@@ -24,6 +24,7 @@
  * State:   ~/.pi/agent/provider-failover-state.json
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import {
 	accessSync,
@@ -1098,7 +1099,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.21.0";
+const VERSION = "1.21.1";
 const MODEL_CATALOG_REQUEST_EVENT = "pi:model-catalog:request:v1";
 const MODEL_CATALOG_SNAPSHOT_EVENT = "pi:model-catalog:snapshot:v1";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
@@ -2542,6 +2543,37 @@ export function sameModelIdentity(
 	return a === b || modelIdentityKey(a) === modelIdentityKey(b);
 }
 
+type ModelQualityBand = "frontier" | "balanced" | "fast";
+
+/**
+ * Coarse cross-provider quality bands used only to prevent an automatic downgrade.
+ *
+ * Provider names are intentionally mapped by product tier rather than generation: Sol ↔ Opus,
+ * Terra ↔ Sonnet, and Luna ↔ Haiku. Unknown models stay unclassified; an explicit `switch` may
+ * still select them, but automatic failover and `next` will not pretend that an unknown model is
+ * equivalent to a known tier.
+ */
+export function modelQualityBand(modelId: string | undefined): ModelQualityBand | undefined {
+	if (!modelId) return undefined;
+	// Do not use modelIdentityKey here: a trailing `-max` is an effort suffix for some Cursor
+	// aliases, but it is the actual product tier in `qwen-max`.
+	const id = modelId.trim().toLowerCase().replace(/^cursor-/, "");
+	if (/(^|[-/:])(luna|haiku|mini|spark|flash|nano|lite)([-/:]|$)/i.test(id))
+		return "fast";
+	if (/(^|[-/:])(terra|sonnet|jamba)([-/:]|$)/i.test(id))
+		return "balanced";
+	if (
+		/(^|[-/:])(sol|opus)([-/:]|$)/i.test(id) ||
+		/(^|[-/:])composer(?:[-/:]|$)/i.test(id) ||
+		/^gpt-5(?:\.\d+)?$/i.test(id) ||
+		/(^|[-/:])(?:k3|kimi-k3|grok-4\.6|minimax-m2\.7)([-/:]|$)/i.test(id) ||
+		/^glm-5(?:[.:-]|$)/i.test(id) ||
+		/qwen.*max/i.test(id)
+	)
+		return "frontier";
+	return undefined;
+}
+
 /** Family when we know one; otherwise the un-numbered provider id (`zai` from `zai-account-2`). */
 function accountGroup(id: string, qwenProvider: string): string {
 	return classifyProvider(id, qwenProvider) ?? id.replace(/-account-\d+$/, "");
@@ -3551,6 +3583,76 @@ export function isSubagentChildProcess(
 	return env[SUBAGENT_CHILD_ENV] === "1";
 }
 
+function parseExplicitCliArgs(argv: readonly string[] = process.argv): {
+	model?: string;
+	provider?: string;
+	thinking?: ReasoningLevel;
+} {
+	let model: string | undefined;
+	let provider: string | undefined;
+	let thinking: ReasoningLevel | undefined;
+	for (let i = 2; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "--") break;
+		if (arg === "--provider" && i + 1 < argv.length) provider = argv[++i];
+		else if (arg === "--model" && i + 1 < argv.length) model = argv[++i];
+		else if (arg === "--thinking" && i + 1 < argv.length) {
+			const value = argv[++i];
+			if (REASONING_LEVELS.includes(value as ReasoningLevel)) {
+				thinking = value as ReasoningLevel;
+			}
+		}
+	}
+	return { model, provider, thinking };
+}
+
+// Registration has no model catalog. Once session_start supplies one, delegate model suffix
+// parsing to the same resolver as Pi's CLI, including exact colon IDs and provider custom IDs.
+async function resolveExplicitCliModelThinkingLevel(
+	args: ReturnType<typeof parseExplicitCliArgs>,
+	ctx: any,
+): Promise<ReasoningLevel | undefined> {
+	if (!args.model) return undefined;
+	try {
+		const registry = ctx?.modelRegistry;
+		const models = registry?.getAll?.() ?? [];
+		const { resolveCliModel } = await import(
+			"@earendil-works/pi-coding-agent"
+		);
+		const { thinkingLevel } = resolveCliModel({
+			cliProvider: args.provider,
+			cliModel: args.model,
+			cliThinking: args.thinking,
+			modelRuntime: {
+				getModels: () => models,
+				hasConfiguredAuth: (provider: string) =>
+					models.some(
+						(model: any) =>
+							model.provider === provider &&
+							(registry.hasConfiguredAuth?.(model) ??
+								registry.getProviderAuthStatus?.(provider)?.configured ??
+								false),
+					),
+			} as any,
+		});
+		return REASONING_LEVELS.includes(thinkingLevel as ReasoningLevel)
+			? (thinkingLevel as ReasoningLevel)
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export function explicitCliSelections(
+	argv: readonly string[] = process.argv,
+): { model: boolean; thinking: boolean } {
+	const parsed = parseExplicitCliArgs(argv);
+	return {
+		model: parsed.model !== undefined,
+		thinking: parsed.thinking !== undefined,
+	};
+}
+
 export default function piMultiAccount(pi: ExtensionAPI) {
 	// Warm up the OAuth helpers before any provider registration: providers are
 	// registered synchronously below and their `usesCallbackServer`/`getApiKey`
@@ -3560,6 +3662,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// logins are unavailable, and the user is told once at session start.
 	const oauthUnavailable = piAiOauthUnavailableReason();
 	const subagentChild = isSubagentChildProcess();
+	const explicitCliArgs = parseExplicitCliArgs();
+	const explicitCli = {
+		model: explicitCliArgs.model !== undefined,
+		thinking: explicitCliArgs.thinking !== undefined,
+	};
+	const explicitCliThinkingAtRegistration = explicitCliArgs.thinking;
+	const hasExplicitCliSelection = explicitCli.model || explicitCli.thinking;
+	// A CLI launch owns both remembered dimensions until a genuine user change takes ownership
+	// of that dimension. Otherwise a model-only launch can persist its thinking clamp (or vice versa).
+	let modelPreferenceChanged = !hasExplicitCliSelection;
+	let thinkingPreferenceChanged = !hasExplicitCliSelection;
 	const sessionInstanceId = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
 	let config = loadConfig();
 	const automaticFailoverEnabled = () => config.enabled && !subagentChild;
@@ -3669,6 +3782,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	/** pi.setModel that first restores the target's models when the filter hid them. */
+	let internalModelChanges = 0;
 	async function setModelEnsuringVisible(
 		target: { provider: string; id: string },
 		ctx: any,
@@ -3676,7 +3790,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (onlyActiveModels) unhideProvider(target.provider);
 		// Pi rewrites settings.json on this path; the next turn checks that it actually did.
 		pendingSettingsCheck = true;
-		return pi.setModel(target as any);
+		internalModelChanges++;
+		try {
+			return await pi.setModel(target as any);
+		} finally {
+			internalModelChanges--;
+		}
 	}
 
 	/**
@@ -3766,7 +3885,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * single attempt its stale forecast has earned. Cleared when the account proves itself
 	 * (`noteAuthSuccess`) or a genuine user prompt begins a fresh chain.
 	 */
-	const spentSiblingsTried = new Set<string>();
 	// Seeded from disk: the proof that an account's meter lies must outlive the process that
 	// observed it, or every new session re-selects the spent account all over again. Only
 	// still-future entries are carried; an expired one has already served its purpose.
@@ -3920,6 +4038,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let pendingWakeTimer: ReturnType<typeof setTimeout> | undefined;
 	let queuedInputWakeTimer: ReturnType<typeof setTimeout> | undefined;
 	let usageStatusTimer: ReturnType<typeof setInterval> | undefined;
+	// Pending work is session-local. The shared state file may contain another Pi window's marker;
+	// using that marker as this window's runtime state makes two unrelated tasks resume each other.
+	let pendingResume:
+		| { from: ModelRef; reason: string; since: number }
+		| undefined;
 
 	// ----- the governor ----------------------------------------------------
 	//
@@ -3981,7 +4104,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let userAbortedChain = false; // user pressed Esc → stop auto-continuing until a new prompt
 	let lastLeftProvider: string | undefined; // account we just failed away from (anti-ping-pong)
 	let lastLeftAt = 0;
+	type ThinkingChangeEvidence = {
+		model: string;
+		previousLevel: ReasoningLevel;
+		appliedLevel: ReasoningLevel;
+	};
 	let automaticModelTarget: ModelRef | undefined;
+	let lastObservedModelKey: string | undefined;
+	let lastObservedThinkingLevel: ReasoningLevel | undefined;
+	let pendingModelThinkingChange: ThinkingChangeEvidence | undefined;
 	// Forward-progress watchdog state. A "resume in flight" is a continuation WE dispatched
 	// (pi.continueAgent after a switch) whose new turn must keep showing activity. Any stream
 	// token, tool event, or provider response is "progress" and disarms the stuck timer; total
@@ -4029,11 +4160,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// read from the SESSION (per-agent `--thinking`, `/thinking`), not from a global default:
 	// forcing config.reasoningLevel on every agent_start clobbered per-agent thinking, so an
 	// agent configured `low` was flipped to `high` on its first turn (issue #6).
-	let desiredThinkingLevel: ReasoningLevel | undefined;
-	// What the host clamped our level down to, and on which model. A clamp is the fallback
-	// model's cap, NOT a user decision — it must never become the new intent, otherwise one
-	// failover to a weaker model would ratchet thinking down for the rest of the session.
+	let desiredThinkingLevel: ReasoningLevel | undefined =
+		explicitCliThinkingAtRegistration;
+	let explicitCliThinkingLevel: ReasoningLevel | undefined = explicitCliThinkingAtRegistration;
+	// What the host applied after we asserted the session's intent, and on which model. A
+	// capability clamp or model default is NOT a user decision, otherwise thinking ratchets.
 	let thinkingClamp: { model: string; level: ReasoningLevel } | undefined;
+	const thinkingChangeSource = new AsyncLocalStorage<"extension">();
 
 	const thinkingRank = (level: unknown) =>
 		REASONING_LEVELS.indexOf(level as ReasoningLevel);
@@ -4048,6 +4181,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 	}
 
+	if (explicitCli.thinking && !explicitCliThinkingLevel)
+		explicitCliThinkingLevel = readThinkingLevel();
+	if (explicitCli.thinking && explicitCliThinkingLevel)
+		desiredThinkingLevel = explicitCliThinkingLevel;
+
 	const thinkingModelKey = (ctx?: any) =>
 		ctx?.model?.provider && ctx?.model?.id
 			? ref(ctx.model.provider, ctx.model.id)
@@ -4060,7 +4198,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			!!thinkingClamp &&
 			thinkingClamp.level === level &&
 			thinkingClamp.model === thinkingModelKey(ctx) &&
-			thinkingRank(level) < thinkingRank(desiredThinkingLevel)
+			level !== desiredThinkingLevel
 		);
 	}
 
@@ -4092,13 +4230,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	function restoreDesiredThinking(ctx?: any) {
 		if (!desiredThinkingLevel) return;
 		try {
-			(pi as any).setThinkingLevel?.(desiredThinkingLevel);
+			thinkingChangeSource.run("extension", () =>
+				(pi as any).setThinkingLevel?.(desiredThinkingLevel),
+			);
 		} catch {
 			/* setThinkingLevel clamps to model caps; ignore if unsupported */
 		}
 		// Record a clamp so the next turn does not mistake the fallback model's cap for intent.
 		const applied = readThinkingLevel();
 		if (!applied) return;
+		lastObservedThinkingLevel = applied;
 		if (applied !== desiredThinkingLevel) {
 			thinkingClamp = { model: thinkingModelKey(ctx), level: applied };
 			logEvent("thinking_clamped", {
@@ -5182,7 +5323,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// the limit-error streak and re-trust usage for this provider.
 		limitStreakByProvider.delete(provider);
 		// It answered, so whatever its meter said is beside the point: give it its reprieve back.
-		spentSiblingsTried.delete(provider);
 		// Distrust is not permanent: a real success is the only evidence that outranks the refusal
 		// that created it, and it must be written down too or a restart would resurrect the bench.
 		let changed = usageUntrustedUntilByProvider.delete(provider);
@@ -6265,6 +6405,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			includeCurrent?: boolean;
 			manualRoundRobin?: boolean;
 			excludeProviders?: Set<string>;
+			/** Keep the source model's product tier across accounts and provider families. */
+			preserveQualityBand?: boolean;
 			/**
 			 * Automatic failover: try another account that still has THIS model (and family)
 			 * before jumping to a different model. `best` turns this off so confirmation still
@@ -6329,12 +6471,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// "mini" models as separate rotation targets, or `/multi-account next` ping-pongs
 			// between e.g. gpt-5.4 ↔ gpt-5.4-mini and one chatty provider drowns out the others.
 			// resolveTargets returns this account's models newest-first, so models[0] is the flagship.
-			const models = resolveTargets(ctx, fallbacks[i], currentModel).filter(
+			let models = resolveTargets(ctx, fallbacks[i], currentModel).filter(
 				(model: any) =>
 					!options.excludeProviders?.has(model.provider) &&
 					!isInvalidated(model.provider) &&
 					providerHasUsableAuth(ctx, model.provider),
 			);
+			const sourceBand = modelQualityBand(currentModel?.id);
+			if (options.preserveQualityBand && sourceBand) {
+				models = models.filter(
+					(model: any) => modelQualityBand(model.id) === sourceBand,
+				);
+			}
 			if (models.length === 0) continue;
 			// Prefer the newest model that is not itself on a MODEL-level cooldown (a genuine
 			// "model unavailable" error is the only sanctioned reason to fall to an older model).
@@ -6449,11 +6597,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// the rotation order alone could send us straight back to the account we just left, get the
 		// same refusal, and loop between two spent accounts while a live one sat further down.
 		const byRefusalAgeThenRank = (a: Scored, b: Scored) =>
-			// Exhaustion of one account must try a sibling of the SAME family (same model first,
-			// otherwise that account's flagship, same thinking level) before any other family.
-			// A 100% usage forecast must not skip those siblings in favour of Claude — the live
-			// hop openai-codex/gpt-5.6-sol → anthropic/claude-opus-5 was that skip. Predicted-busy
-			// only orders siblings relative to each other, after family has already won.
+			// Among accounts not ruled out by liveness, stay in the same family and model first.
+			// A fresh blocked/100% verdict is filtered below before this preference is considered.
 			(options.preferSameIdentity !== false
 				? Number(b.sameModel) - Number(a.sameModel) ||
 					Number(b.sameFamily) - Number(a.sameFamily)
@@ -6476,30 +6621,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			comparePriority(a.group, b.group, config.providerPriority) ||
 			a.lastRefusalAt - b.lastRefusalAt ||
 			byRankThenRot(a, b);
+		// Automatic routing never spends a user turn on an account whose fresh quota verdict says
+		// it is unavailable. Background usage refresh is the proof that revives it. Manual `next`
+		// remains the explicit override for stale forecasts and therefore uses the separate ring
+		// above, which deliberately ignores cooldown ordering.
 		let availableNow = scored
-			.filter((s) => {
-				if (s.remaining === 0) return true;
-				// Same-family sibling that has not refused this session: a 100% usage forecast
-				// used to drop it from the candidate list, so failover jumped family (Codex →
-				// Opus) without ever asking the other Codex slots. An actual limit-error
-				// cooldown still excludes it (lastRefusalAt) so we do not ping-pong.
-				// The current account itself is never admitted this way — a different model id
-				// on the same spent slot would otherwise look like a destination (compaction
-				// would retry the cooled account; preflight would keep a dead pin alive).
-				//
-				// `spentSiblingsTried` closes the other half of that door. Refusal is only one of
-				// the two ways this reprieve gets used up: rotating onto the account is the other,
-				// and the pending-resume path takes it without ever sending a request. Without
-				// this check two forecast-spent siblings keep re-admitting each other for ever and
-				// no request is ever made — see the field's own comment.
-				return (
-					options.preferSameIdentity !== false &&
-					s.sameFamily &&
-					s.lastRefusalAt === 0 &&
-					!spentSiblingsTried.has(s.model.provider) &&
-					s.model.provider !== currentModel?.provider
-				);
-			})
+			.filter((s) => s.remaining === 0)
 			.sort(byRefusalAgeThenRank);
 		if (
 			lastLeftProvider &&
@@ -6572,6 +6699,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (failedProviders.has(fallback.provider)) continue;
 			const to = ref(fallback.provider, fallback.id);
 			if (to === from) {
+				if (options.manual && candidates.length === 1) {
+					modelPreferenceChanged = true;
+					rememberUserModel(sourceModel);
+					return true;
+				}
 				markExhausted(fallback.provider, config.transientCooldownMs);
 				failedProviders.add(fallback.provider);
 				continue;
@@ -6616,13 +6748,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				failedProviders.add(fallback.provider);
 				continue;
 			}
+			if (options.manual) {
+				modelPreferenceChanged = true;
+				rememberUserModel(ctx.model ?? fallback);
+			}
 			restoreDesiredThinking(ctx);
 			applyOnlyActiveFilter(ctx, fallback.provider);
-			// Rotating onto an account whose own forecast says it is spent IS the one attempt that
-			// forecast has earned. Spend it here, at the moment of selection, rather than waiting
-			// for a refusal that the pending-resume path never provokes.
-			if (providerRecoveryAt(fallback.provider) > Date.now())
-				spentSiblingsTried.add(fallback.provider);
 			setLastProbe(fallback.provider);
 			if (options.armContinuation !== false) {
 				pinFailoverProbe(fallback.provider);
@@ -6630,7 +6761,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			const record = { from, to, reason, at: Date.now() };
 			currentPromptSwitch =
 				options.armContinuation === false ? undefined : record;
-			logEvent("switch", { from, to, reason });
+			logEvent("switch", { session: sessionInstanceId, from, to, reason });
 			pi.appendEntry("provider-failover", record);
 			persist({
 				lastSwitches: [record, ...(persistedState.lastSwitches ?? [])].slice(
@@ -6683,6 +6814,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			availableNowOnly: !options.manual,
 			manualRoundRobin: options.manual,
 			excludeProviders,
+			preserveQualityBand: true,
 		});
 		// No OTHER account to move to. Because each account now offers only its flagship (the
 		// never-downgrade rule), a single-account session with a just-cleared cooldown lands here
@@ -6770,13 +6902,27 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function rememberUserModel(model: { provider?: string; id?: string } | undefined) {
-		if (subagentChild || !model?.provider || !model?.id) return;
-		const family = classifyProvider(model.provider, config.qwenProvider);
-		if (family) lastModelByFamily[family] = model.id;
+		if (
+			subagentChild ||
+			!model?.provider ||
+			!model?.id ||
+			(!modelPreferenceChanged && !thinkingPreferenceChanged)
+		)
+			return;
+		const rememberedModel = modelPreferenceChanged
+			? { provider: model.provider, id: model.id }
+			: persistedState.lastUserModel;
+		if (!rememberedModel?.provider || !rememberedModel.id) return;
+		if (modelPreferenceChanged) {
+			const family = classifyProvider(model.provider, config.qwenProvider);
+			if (family) lastModelByFamily[family] = model.id;
+		}
 		persist(
 			{
-				lastUserModel: { provider: model.provider, id: model.id },
-				lastUserThinkingLevel: desiredThinkingLevel ?? readThinkingLevel(),
+				lastUserModel: rememberedModel,
+				lastUserThinkingLevel: thinkingPreferenceChanged
+					? desiredThinkingLevel ?? readThinkingLevel()
+					: persistedState.lastUserThinkingLevel,
 				lastModelByFamily: { ...lastModelByFamily },
 			},
 			{ writeUserPreferences: true },
@@ -6794,6 +6940,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			logEvent("remembered_model_skipped", { reason: "pi-subagents child owns model selection" });
 			return false;
 		}
+		if (explicitCli.model) {
+			logEvent("remembered_model_skipped", { reason: "explicit CLI model" });
+			return false;
+		}
+		const cliThinkingLevel = explicitCli.thinking
+			? (explicitCliThinkingLevel ?? readThinkingLevel())
+			: undefined;
 		const intended = intendedStartupModel();
 		if (!intended) {
 			logEvent("remembered_model_skipped", { reason: "no intended model" });
@@ -6803,6 +6956,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			ctx.model?.provider === intended.provider &&
 			ctx.model?.id === intended.id;
 		if (alreadyThere) {
+			if (explicitCli.thinking) desiredThinkingLevel = cliThinkingLevel ?? desiredThinkingLevel;
 			restoreDesiredThinking(ctx);
 			return true;
 		}
@@ -6827,6 +6981,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				? ref(ctx.model.provider, ctx.model.id)
 				: "none";
 		const to = ref(intended.provider, intended.id);
+		if (explicitCli.thinking) {
+			desiredThinkingLevel = cliThinkingLevel ?? desiredThinkingLevel;
+		} else {
+			const rememberedLevel = persistedState.lastUserThinkingLevel;
+			if (rememberedLevel) desiredThinkingLevel = rememberedLevel as ReasoningLevel;
+		}
 		automaticModelTarget = to;
 		let ok = false;
 		try {
@@ -6842,11 +7002,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			source: persistedState.lastUserModel ? "state" : "settings",
 		});
 		if (ok) {
-			// Restore the user's level too — Pi clamped it to the fallback model's caps
-			// while creating the session.
-			const rememberedLevel = persistedState.lastUserThinkingLevel;
-			if (rememberedLevel) {
-				desiredThinkingLevel = rememberedLevel as ReasoningLevel;
+			// Pi resets thinking while changing models. Re-assert either the explicit CLI level
+			// captured before that reset or the ordinary remembered level.
+			if (explicitCli.thinking) {
+				desiredThinkingLevel = cliThinkingLevel ?? desiredThinkingLevel;
+			} else {
+				const rememberedLevel = persistedState.lastUserThinkingLevel;
+				if (rememberedLevel) desiredThinkingLevel = rememberedLevel as ReasoningLevel;
 			}
 			restoreDesiredThinking(ctx);
 			ctx.ui?.notify?.(
@@ -6891,6 +7053,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const candidates = findFallbackModels(ctx, ctx.model, {
 			availableNowOnly: true,
 			includeCurrent: true,
+			preserveQualityBand: true,
 		});
 		if (candidates.length === 0) return false;
 		return activateFallback(ctx, ctx.model, candidates, reason, {
@@ -6901,10 +7064,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// ----- pending auto-resume ---------------------------------------------
 
 	function hasPendingResume(): boolean {
-		return (
-			!!(persistedState.pendingFrom && persistedState.pendingReason) ||
-			!!persistedState.pendingContinuationPrompt
-		);
+		return !!pendingResume;
 	}
 
 	// Reject a promise that does not settle within `ms`. Used to bound every network-bound
@@ -7418,10 +7578,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			(ctx.model
 				? ref(ctx.model.provider, ctx.model.id)
 				: "the active account");
-		const prompt = config.continuationPrompt
-			.replaceAll("{from}", String(source?.from ?? "the previous account"))
-			.replaceAll("{to}", String(to))
-			.replaceAll("{reason}", source?.reason ?? "provider failover");
+		const sameModelRetry = source?.from === to;
+		const prompt = sameModelRetry
+			? `Provider retry activated: retrying ${to} after a temporary failure; no account or model switch occurred. Continue the interrupted task from where it stopped. The interrupted turn is preserved verbatim in this session as a [handoff:interrupted-turn] record — read it before acting and do not restart the task from the beginning.`
+			: config.continuationPrompt
+					.replaceAll("{from}", String(source?.from ?? "the previous account"))
+					.replaceAll("{to}", String(to))
+					.replaceAll("{reason}", source?.reason ?? "provider failover");
 		try {
 			expectingInjectedContinuation = true;
 			// The host throws "Agent is already processing. Specify streamingBehavior ('steer' or
@@ -7447,6 +7610,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					reportExtensionError("continuation injection", error, ctx);
 				});
 			}
+			logEvent("continuation_injected", {
+				session: sessionInstanceId,
+				from: source?.from,
+				to,
+				sameModelRetry,
+			});
 			autoContinuesThisPrompt++;
 			return true;
 		} catch (error) {
@@ -7522,6 +7691,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (userAbortedChain || ctx.signal?.aborted) return false;
 		beginResumeWatch(ctx);
 		logEvent("resume_start", {
+			session: sessionInstanceId,
 			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown",
 			hop: autoContinuesThisPrompt + 1,
 		});
@@ -7529,6 +7699,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			await continueAgent({ stripErrorAssistant: true });
 			autoContinuesThisPrompt++;
 			logEvent("resume_ok", {
+				session: sessionInstanceId,
 				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown",
 			});
 			return true;
@@ -7752,6 +7923,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			clearTimeout(pendingWakeTimer);
 			pendingWakeTimer = undefined;
 		}
+		pendingResume = undefined;
 		persistedState = {
 			...persistedState,
 			pendingContinuationPrompt: undefined,
@@ -7766,9 +7938,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function pendingWakeProviders(): string[] {
-		if (isSameModelResumeReason(persistedState.pendingReason ?? "")) {
-			const parsed = persistedState.pendingFrom
-				? parseTarget(persistedState.pendingFrom)
+		if (isSameModelResumeReason(pendingResume?.reason ?? "")) {
+			const parsed = pendingResume?.from
+				? parseTarget(pendingResume.from)
 				: undefined;
 			return parsed?.provider && !isInvalidated(parsed.provider)
 				? [parsed.provider]
@@ -7819,8 +7991,29 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * budget starts from zero, and the wait returns to its floor.
 	 */
 	function startFreshFailoverChain() {
-		spentSiblingsTried.clear();
 		resetPendingWakeBackoff();
+	}
+
+	/**
+	 * A real user action owns the session from this point forward.
+	 *
+	 * Advancing the epoch invalidates timer callbacks that already escaped `clearTimeout`; clearing
+	 * pending state handles callbacks that have not started yet. Both are required — clearing only
+	 * one is how an old automatic chain resumed after `/multi-account next` had already found a
+	 * working account.
+	 */
+	function claimUserControl(reason: string) {
+		chainEpoch++;
+		autoContinuesThisPrompt = 0;
+		resetGovernor();
+		startFreshFailoverChain();
+		userAbortedChain = false;
+		currentPromptSwitch = undefined;
+		continuationDispatchedForAgentTurn = false;
+		expectingInjectedContinuation = false;
+		endResumeWatch();
+		if (hasPendingResume()) clearPendingContinuation();
+		logEvent("user_control_claimed", { session: sessionInstanceId, reason, epoch: chainEpoch });
 	}
 
 	function schedulePendingWake(ctx: any) {
@@ -7828,6 +8021,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		pendingWakeTimer = undefined;
 		if (
 			governorStopped() ||
+			isBreakerOpen() ||
 			!hasPendingResume() ||
 			userAbortedChain ||
 			!automaticFailoverEnabled() ||
@@ -7857,6 +8051,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const epoch = chainEpoch;
 		if (
 			!hasPendingResume() ||
+			isBreakerOpen() ||
 			userAbortedChain ||
 			!automaticFailoverEnabled() ||
 			!config.autoContinue
@@ -7894,8 +8089,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		refreshDiscovery();
 		reconcileCooldownsFromUsage(ctx);
 		pruneCooldowns();
-		const parsedFrom = persistedState.pendingFrom
-			? parseTarget(persistedState.pendingFrom)
+		const parsedFrom = pendingResume?.from
+			? parseTarget(pendingResume.from)
 			: undefined;
 		const sourceModel = parsedFrom
 			? {
@@ -7912,7 +8107,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// NOT account/model failures: retry the SAME account/model after any brief cooldown —
 		// never rotate to a sibling model (which would silently downgrade e.g. gpt-5.5 → gpt-5.4
 		// on the same account, whose quota is shared, so the downgrade escapes nothing).
-		if (isSameModelResumeReason(persistedState.pendingReason ?? "")) {
+		if (isSameModelResumeReason(pendingResume?.reason ?? "")) {
 			const now = Date.now();
 			if (providerRecoveryAt(sourceModel.provider, now) <= now) {
 				clearPendingContinuation();
@@ -7928,6 +8123,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				) {
 					automaticModelTarget = same;
 					if (onlyActiveModels) unhideProvider(sourceModel.provider);
+					internalModelChanges++;
 					try {
 						await pi.setModel(
 							ctx.modelRegistry.find(sourceModel.provider, sourceModel.id) ?? {
@@ -7936,6 +8132,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 							},
 						);
 					} finally {
+						internalModelChanges--;
 						if (automaticModelTarget === same) automaticModelTarget = undefined;
 					}
 				}
@@ -7944,7 +8141,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// to re-send the prompt by hand.
 				await resumeWithExistingContext(ctx, {
 					from: same,
-					reason: persistedState.pendingReason,
+					reason: pendingResume?.reason,
 				});
 				return;
 			}
@@ -7952,7 +8149,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 
-		const pendingReason = persistedState.pendingReason ?? "";
+		const pendingReason = pendingResume?.reason ?? "";
 		const now = Date.now();
 		const sourceRef = ref(sourceModel.provider, sourceModel.id);
 		const sourceRecovered =
@@ -7964,6 +8161,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const candidates = findFallbackModels(ctx, sourceModel, {
 			availableNowOnly: true,
 			includeCurrent: false,
+			preserveQualityBand: true,
 			excludeProviders: isAuthPendingReason(pendingReason)
 				? new Set<string>([sourceModel.provider])
 				: undefined,
@@ -7991,7 +8189,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// same-account resume with no switch record.
 				await resumeWithExistingContext(ctx, {
 					from: sourceRef,
-					reason: persistedState.pendingReason,
+					reason: pendingResume?.reason,
 				});
 				return;
 			}
@@ -8002,7 +8200,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 
-		const reason = persistedState.pendingReason ?? "account cooldown expired";
+		const reason = pendingResume?.reason ?? "account cooldown expired";
 		const switched = await activateFallback(
 			ctx,
 			sourceModel,
@@ -8030,15 +8228,25 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// A stop that leaves an armed resume behind in the state file is not a stop: the next
 		// session reads it, `status` reports work pending, and the user is told something is
 		// waiting to continue when nothing is.
-		if (governorStopped()) return;
+		if (governorStopped() || isBreakerOpen()) return;
 		const from = ref(failedModel.provider, failedModel.id);
 		const alreadyPending = hasPendingResume();
+		pendingResume = {
+			from,
+			reason,
+			since: pendingResume?.since ?? Date.now(),
+		};
+		logEvent("pending_resume_set", {
+			session: sessionInstanceId,
+			from,
+			reason,
+		});
 		persistedState = {
 			...persistedState,
 			pendingReason: reason,
 			pendingFrom: from,
 			pendingContinuationPrompt: undefined,
-			pendingSince: persistedState.pendingSince ?? Date.now(),
+			pendingSince: pendingResume.since,
 			pendingOwner: sessionInstanceId,
 		};
 		persist();
@@ -8759,6 +8967,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				);
 				return;
 			}
+			claimUserControl(`manual switch ${target}`);
 			// Manual switch is an EXPLICIT override, so give the target a clean slate:
 			//  - clear any cooldown (the user is overriding a rate-limit wait), AND
 			//  - clear a STALE invalidation. An account can stay invalidated long after its real
@@ -8865,10 +9074,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				);
 				return;
 			}
+			claimUserControl("manual best");
 			const candidates = findFallbackModels(ctx, ctx.model, {
 				availableNowOnly: true,
 				includeCurrent: true,
 				preferSameIdentity: false,
+				preserveQualityBand: true,
 			});
 			if (candidates.length === 0) {
 				const wait = nextRecoveryStatus(ctx);
@@ -8882,6 +9093,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				candidates[0].provider === ctx.model.provider &&
 				candidates[0].id === ctx.model.id
 			) {
+				modelPreferenceChanged = true;
+				rememberUserModel(ctx.model);
 				ctx.ui.notify(
 					`pi-multi-account: already on the best available account (${ctx.model.provider}/${ctx.model.id})`,
 					"info",
@@ -9027,7 +9240,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 		if (command === "next") {
 			if (ctx.model) {
-				currentPromptSwitch = undefined;
+				claimUserControl("manual next");
 				// Manual rotation is a user override, NOT a rate-limit event: cooling the account
 				// we're leaving (the old 5-minute cooldown) drained the pool — after one lap every
 				// provider was "cooling" and the round-robin collapsed onto whatever was left. Pass
@@ -9125,7 +9338,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Cooldowns: ${cooldowns.length ? cooldowns.join(", ") : "none"}`,
 				`Next recovery: ${nextRecoveryStatus(ctx)}`,
 				`Invalidated (need re-login): ${invalids.length ? invalids.join(", ") : "none"}`,
-				`Pending auto-resume: ${hasPendingResume() ? `yes (reason: ${persistedState.pendingReason ?? "unknown"})` : "none"}`,
+				`Pending auto-resume: ${hasPendingResume() ? `yes (reason: ${pendingResume?.reason ?? "unknown"})` : "none"}`,
 				`Queued user messages: ${queuedUserInputs.length}`,
 				`Resume watchdog: ${resumeInFlight ? `watching${toolInFlight ? " · tool running" : ""}` : "idle"} · auto-recover ${config.autoRecoverStuck ? "ON" : "OFF"}`,
 				`Compaction routing: ${config.routeCompactionToHealthyAccount ? "to healthy account" : "off"}${compactionRoutedNote ? ` (last: ${compactionRoutedNote})` : ""}${lastContextOverflowAt ? ` · last overflow ${formatUntil(lastContextOverflowAt)}` : ""}`,
@@ -10182,7 +10395,21 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	safeOn("session_start", async (_event, ctx) => {
+		lastObservedModelKey = thinkingModelKey(ctx);
+		lastObservedThinkingLevel = readThinkingLevel();
+		pendingModelThinkingChange = undefined;
 		modelCatalogContext = ctx;
+		if (!explicitCliThinkingLevel) {
+			const resolved = await resolveExplicitCliModelThinkingLevel(
+				explicitCliArgs,
+				ctx,
+			);
+			if (resolved) {
+				explicitCli.thinking = true;
+				explicitCliThinkingLevel = resolved;
+				desiredThinkingLevel = resolved;
+			}
+		}
 		if (!subagentChild) preflightHostCapabilities(ctx);
 		// Looked at BEFORE discovery touches anything, so what is judged is the files as Pi
 		// published them rather than the version our own slot provisioning has just rewritten.
@@ -10207,7 +10434,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// inherit and silently restart a previous session's paused work, so we drop any leftover
 		// pending state and reset all in-memory guards here. A delegated child shares
 		// the state file with its parent process and must not erase the parent's wake.
-		if (!subagentChild && hasPendingResume())
+		if (
+			!subagentChild &&
+			((persistedState.pendingFrom && persistedState.pendingReason) ||
+				persistedState.pendingContinuationPrompt)
+		)
 			clearPendingContinuation({ allowLegacy: true });
 		autoContinuesThisPrompt = 0;
 		resetGovernor();
@@ -10221,6 +10452,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		handledAssistantErrors.clear();
 		clearQueuedInputs();
 		logEvent("session_start", {
+			session: sessionInstanceId,
 			version: VERSION,
 			enabled: automaticFailoverEnabled(),
 			mode: subagentChild ? "subagent-child-passive" : "interactive",
@@ -10399,12 +10631,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// Slash commands and shell shortcuts belong to Pi itself. Holding them in the cooldown queue
 		// makes /login, /model, /export, and even recovery commands appear completely broken.
 		if (/^\s*[/!]/.test(text)) return { action: "continue" as const };
-		autoContinuesThisPrompt = 0;
-		resetGovernor(); // the user is here and typing: the session is theirs again
-		startFreshFailoverChain();
-		userAbortedChain = false;
+		claimUserControl("interactive input");
 		noteRecoveryProgress(); // a fresh user prompt → clean slate, re-enable auto-continue
-		if (hasPendingResume()) clearPendingContinuation();
 		// A manual choice is owed ONE message. This is the next one, so a reprieve that already
 		// carried a message retires here — before the readiness check consults it.
 		retireSpentManualPin();
@@ -10445,8 +10673,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 		const delay = nextModelAvailabilityDelayMs(ctx);
 		if (delay !== undefined) {
-			queueUserInput(ctx, text, (event as any).images);
-			return { action: "handled" as const };
+			// Never remove a fresh user message from Pi's transcript and hide it in extension-owned
+			// memory. Let the real request record its refusal; the normal failed-turn preservation +
+			// pending resume path can then carry the visible message when an account becomes ready.
+			logEvent("input_passthrough_while_cooling", {
+				session: sessionInstanceId,
+				delayMs: delay,
+				provider: ctx.model?.provider,
+				model: ctx.model?.id,
+			});
+			ctx.ui.notify(
+				`pi-multi-account: no account is ready right now. Your message stays in Pi's transcript; if this request is refused, it will resume automatically when a compatible account recovers (next check in ~${formatDelay(delay)}).`,
+				"warning",
+			);
+			return { action: "continue" as const };
 		}
 
 		const providers = [
@@ -10484,13 +10724,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Provider failover: every account is currently unusable. ${parts.join(". ")}.`,
 				"error",
 			);
-			return { action: "handled" as const };
+			return { action: "continue" as const };
 		}
 		ctx.ui.notify(
 			`Provider failover: no usable authenticated account exists. Run /login, choose "Use a subscription", then select an account slot.${slotHint}`,
 			"error",
 		);
-		return { action: "handled" as const };
+		return { action: "continue" as const };
 	});
 
 	// Distinguish a genuine new user prompt from our own failover continuation. Only a
@@ -10502,25 +10742,24 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// switching models here; it must avoid clearing the parent's pending wake when its own
 		// explicitly selected turn starts.
 		if (subagentChild) return;
-		await ensureReadyModel(
-			ctx,
-			"last-moment preflight: selected account unavailable",
-		);
 		// Our own injected continuation (recovery fallback) must NOT be mistaken for a genuine
 		// new user prompt — otherwise it resets the auto-continue counter every iteration and the
 		// recovery loop becomes unbounded. Preserve the chain in that case.
 		if (expectingInjectedContinuation) {
 			expectingInjectedContinuation = false;
 			continuationDispatchedForAgentTurn = true; // this turn IS the continuation
+			await ensureReadyModel(
+				ctx,
+				"last-moment preflight: selected account unavailable",
+			);
 			return;
 		}
 		// Genuine user input → fresh task: reset the chain and stop any auto-resume.
-		autoContinuesThisPrompt = 0;
-		resetGovernor();
-		startFreshFailoverChain();
-		userAbortedChain = false;
-		continuationDispatchedForAgentTurn = false;
-		if (hasPendingResume()) clearPendingContinuation();
+		claimUserControl("before agent start");
+		await ensureReadyModel(
+			ctx,
+			"last-moment preflight: selected account unavailable",
+		);
 	});
 
 	safeOn("agent_start", async (_event, ctx) => {
@@ -10542,6 +10781,56 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		updateUsageStatus(ctx);
 	});
 
+	safeOn("thinking_level_select", (event, ctx) => {
+		if (subagentChild) return;
+		const level = (event as any).level;
+		if (thinkingRank(level) < 0) return;
+		const appliedLevel = level as ReasoningLevel;
+		const previousLevel = (event as any).previousLevel;
+		const previouslyObserved = lastObservedThinkingLevel;
+		if (thinkingChangeSource.getStore() === "extension") {
+			lastObservedThinkingLevel = appliedLevel;
+			return;
+		}
+		if (internalModelChanges > 0) {
+			lastObservedThinkingLevel = appliedLevel;
+			return;
+		}
+		const modelKey = thinkingModelKey(ctx);
+		if (
+			pendingModelThinkingChange?.model === modelKey &&
+			pendingModelThinkingChange.previousLevel === previousLevel &&
+			pendingModelThinkingChange.appliedLevel === appliedLevel
+		) {
+			pendingModelThinkingChange = undefined;
+			lastObservedThinkingLevel = appliedLevel;
+			return;
+		}
+		// Pi changes ctx.model and applies its default/clamp before model_select. When this handler
+		// wins the fire-and-forget race, the old model and exact level transition identify that one
+		// native change. model_select handles the opposite order below.
+		if (
+			lastObservedModelKey &&
+			modelKey !== "unknown" &&
+			modelKey !== lastObservedModelKey &&
+			thinkingRank(previousLevel) >= 0 &&
+			previousLevel === previouslyObserved
+		) {
+			pendingModelThinkingChange = {
+				model: modelKey,
+				previousLevel,
+				appliedLevel,
+			};
+			lastObservedThinkingLevel = appliedLevel;
+			return;
+		}
+		lastObservedThinkingLevel = appliedLevel;
+		thinkingPreferenceChanged = true;
+		desiredThinkingLevel = appliedLevel;
+		thinkingClamp = undefined;
+		rememberUserModel(ctx?.model);
+	});
+
 	safeOn("model_select", (event, ctx) => {
 		const model = (event as any).model;
 		if (!model?.provider || !model?.id || subagentChild) return;
@@ -10553,19 +10842,43 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			refreshUsage(ctx, model.provider),
 		);
 		const selected = ref(model.provider, model.id);
+		const appliedThinkingLevel = readThinkingLevel();
+		const pendingThinking = pendingModelThinkingChange;
+		pendingModelThinkingChange = undefined;
+		if (
+			pendingThinking?.model === selected &&
+			(!appliedThinkingLevel || pendingThinking.appliedLevel === appliedThinkingLevel)
+		) {
+			thinkingClamp = {
+				model: selected,
+				level: pendingThinking.appliedLevel,
+			};
+		} else if (
+			appliedThinkingLevel &&
+			lastObservedThinkingLevel &&
+			appliedThinkingLevel !== lastObservedThinkingLevel
+		) {
+			pendingModelThinkingChange = {
+				model: selected,
+				previousLevel: lastObservedThinkingLevel,
+				appliedLevel: appliedThinkingLevel,
+			};
+			thinkingClamp = { model: selected, level: appliedThinkingLevel };
+		}
+		if (appliedThinkingLevel) lastObservedThinkingLevel = appliedThinkingLevel;
+		lastObservedModelKey = selected;
 		if (automaticModelTarget === selected) {
 			automaticModelTarget = undefined;
 			rememberUserModel(model);
 			return;
 		}
 		if ((event as any).source === "restore") return;
+		modelPreferenceChanged = true;
 		rememberUserModel(model);
 		// A manual model change is user control, not a permanent "never fail over" pin.
 		// Cancel stale pending work; if the selected model then returns a real limit, normal
 		// failover still applies to that completed request.
-		currentPromptSwitch = undefined;
-		userAbortedChain = false;
-		if (hasPendingResume()) clearPendingContinuation();
+		claimUserControl("manual model selection");
 		if (queuedUserInputs.length > 0) {
 			runBackground("manual model selection queued input resume", ctx, () =>
 				attemptQueuedInputResume(ctx),
@@ -10652,6 +10965,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			id: modelId,
 		};
 		logEvent("assistant_error", {
+			session: sessionInstanceId,
 			provider,
 			model: modelId,
 			classified: isAuthError(errorText)
@@ -10799,6 +11113,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		if (isTransientError(errorText)) {
+			// A temporary error on an ordinary user turn gets one same-model retry. The same error on
+			// a turn WE resumed is a failed recovery and must feed the breaker; otherwise the provider's
+			// own four HTTP retries are wrapped in eight extension retries (32 requests and eight
+			// synthetic user prompts), exactly the Kimi 500 loop seen in the incident transcript.
+			if (continuationDispatchedForAgentTurn || resumeInFlight) {
+				noteRecoveryFailure(ctx);
+				if (isBreakerOpen()) {
+					currentPromptSwitch = undefined;
+					clearPendingContinuation();
+					return;
+				}
+			}
 			const reason = `${TRANSIENT_PENDING_PREFIX} ${errorText.slice(0, 120)}`;
 			markExhausted(provider, config.transientCooldownMs);
 			if (!config.autoContinue) {

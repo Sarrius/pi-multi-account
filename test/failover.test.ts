@@ -88,19 +88,25 @@ function uninstallCursorProvider() {
 
 const {
 	default: piMultiAccount,
+	explicitCliSelections,
 	canPersistRefreshedCredentials,
 	mergeRefreshedCredentials,
 	modelIdentityKey,
+	modelQualityBand,
 	persistRefreshedCredentials,
 	sameModelIdentity,
 } = (await import("../index.ts")) as {
 	default: (pi: any) => void;
+	explicitCliSelections: (
+		argv?: readonly string[],
+	) => { model: boolean; thinking: boolean };
 	canPersistRefreshedCredentials: (
 		authStorage: any,
 		authWritable?: () => boolean,
 	) => boolean;
 	mergeRefreshedCredentials: (credentials: any, refreshed: any) => any;
 	modelIdentityKey: (modelId: string) => string;
+	modelQualityBand: (modelId: string) => "frontier" | "balanced" | "fast" | undefined;
 	persistRefreshedCredentials: (
 		authStorage: any,
 		provider: string,
@@ -113,6 +119,57 @@ const {
 	sameModelIdentity: (a: string | undefined, b: string | undefined) => boolean;
 };
 
+test("explicit CLI selection detection follows Pi option parsing", () => {
+	assert.deepEqual(
+		explicitCliSelections([
+			"node",
+			"pi",
+			"--model",
+			"openai/gpt-5.5",
+			"--thinking",
+			"high",
+		]),
+		{ model: true, thinking: true },
+	);
+	for (const level of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+		assert.equal(
+			explicitCliSelections(["node", "pi", "--thinking", level]).thinking,
+			true,
+		);
+	}
+	assert.deepEqual(
+		explicitCliSelections([
+			"node",
+			"pi",
+			"--model",
+			"openrouter/acme:model/v1.2+fast@2026-09-01:high",
+		]),
+		{ model: true, thinking: false },
+		"a model suffix cannot be classified until the session catalog is available",
+	);
+	assert.deepEqual(
+		explicitCliSelections(["node", "pi", "--thinking", "invalid"]),
+		{ model: false, thinking: false },
+	);
+	assert.deepEqual(
+		explicitCliSelections([
+			"node",
+			"pi",
+			"--model",
+			"openrouter/acme:model/v1.2+fast@2026-09-01:turbo",
+		]),
+		{ model: true, thinking: false },
+	);
+	assert.deepEqual(
+		explicitCliSelections(["node", "pi", "--", "--model", "openai/gpt-5.5:high"]),
+		{ model: false, thinking: false },
+	);
+	assert.deepEqual(
+		explicitCliSelections(["node", "pi", "--models", "openai/*:high"]),
+		{ model: false, thinking: false },
+	);
+});
+
 test("model identity folds Cursor effort suffixes and the cursor- prefix", () => {
 	assert.equal(modelIdentityKey("cursor-grok-4.6-high"), "grok-4.6");
 	assert.equal(modelIdentityKey("cursor-grok-4.6"), "grok-4.6");
@@ -123,6 +180,18 @@ test("model identity folds Cursor effort suffixes and the cursor- prefix", () =>
 	assert.ok(!sameModelIdentity("cursor-grok-4.6", "claude-4-sonnet"));
 	assert.ok(!sameModelIdentity("gpt-5.4", "gpt-5.4-mini"));
 	assert.ok(!sameModelIdentity("k3", "k3-256k"));
+});
+
+test("cross-provider quality bands map Sol/Opus, Terra/Sonnet, and Luna/Haiku", () => {
+	assert.equal(modelQualityBand("gpt-5.6-sol"), "frontier");
+	assert.equal(modelQualityBand("claude-opus-5"), "frontier");
+	assert.equal(modelQualityBand("composer-2.5"), "frontier");
+	assert.equal(modelQualityBand("qwen3.8-max"), "frontier");
+	assert.equal(modelQualityBand("glm-5.2:cloud"), "frontier");
+	assert.equal(modelQualityBand("gpt-5.6-terra"), "balanced");
+	assert.equal(modelQualityBand("claude-sonnet-4-6"), "balanced");
+	assert.equal(modelQualityBand("gpt-5.6-luna"), "fast");
+	assert.equal(modelQualityBand("claude-haiku-4-5"), "fast");
 });
 
 const AUTH = join(AGENT_DIR, "auth.json");
@@ -245,12 +314,20 @@ function setup(opts: {
 	unknownProviders?: string[];
 	/** The level the SESSION runs at (what `--thinking` / `/thinking` produced). */
 	thinkingLevel?: string;
+	/** Thinking level Pi applies while changing models, before model_select is emitted. */
+	modelSetThinkingLevel?: string;
+	/** Deliver a model-induced thinking event before or after model_select. */
+	modelThinkingLevelSelectDelivery?: "before" | "after";
+	/** Emit setThinkingLevel's fire-and-forget host event, optionally after a prior-handler yield. */
+	thinkingLevelSelectDelivery?: "sync" | "delayed";
 	/** Highest thinking level a provider's models support — Pi clamps anything above it. */
 	thinkingCaps?: Record<string, string>;
 	/** Pi settings.json defaultProvider/defaultModel, used after catalog load. */
 	settings?: { defaultProvider: string; defaultModel: string };
 	/** Simulate a child process launched by pi-subagents. */
 	subagentChild?: boolean;
+	/** Simulate Pi CLI arguments before the extension is loaded. */
+	cliArgs?: string[];
 	/**
 	 * Shape of the host's AuthStorage.
 	 *
@@ -357,6 +434,10 @@ function setup(opts: {
 	const events: Record<string, Array<(event: any, ctx?: any) => any>> = {};
 	const busEvents = new Map<string, Array<(payload: any) => void>>();
 	const commands: Record<string, (args: string, ctx: any) => any> = {};
+	const pendingThinkingLevelSelects: Array<{
+		delivery: Promise<void>;
+		release?: () => void;
+	}> = [];
 
 	const ctx: any = {
 		model: opts.current
@@ -464,6 +545,25 @@ function setup(opts: {
 		getContextUsage: () => opts.contextUsage,
 	};
 
+	const dispatchThinkingLevelSelect = (
+		payload: { level: string; previousLevel: string },
+		delayed = opts.thinkingLevelSelectDelivery === "delayed",
+	) => {
+		let release: (() => void) | undefined;
+		const gate = delayed
+			? new Promise<void>((resolve) => {
+					release = resolve;
+				})
+			: undefined;
+		const delivery = (async () => {
+			if (gate) await gate;
+			for (const handler of events.thinking_level_select ?? [])
+				await handler(payload, ctx);
+		})();
+		pendingThinkingLevelSelects.push({ delivery, release });
+		return delivery;
+	};
+
 	const pi: any = {
 		events: {
 			on: (name: string, handler: (payload: any) => void) => {
@@ -505,8 +605,21 @@ function setup(opts: {
 			rec.setModels.push(target);
 			if (opts.setModelFailures?.includes(target)) return false;
 			ctx.model = mkModel(model.provider, model.id);
-			// Pi re-clamps (and persists) the thinking level for the new model's capabilities.
-			sessionThinkingLevel = clampThinking(sessionThinkingLevel);
+			// Pi applies a model default/clamp before emitting model_select.
+			const previousThinkingLevel = sessionThinkingLevel;
+			sessionThinkingLevel = opts.modelSetThinkingLevel ?? clampThinking(sessionThinkingLevel);
+			if (sessionThinkingLevel !== previousThinkingLevel) {
+				const payload = {
+					level: sessionThinkingLevel,
+					previousLevel: previousThinkingLevel,
+				};
+				if (opts.modelThinkingLevelSelectDelivery === "after") {
+					dispatchThinkingLevelSelect(payload, true);
+				} else {
+					for (const handler of events.thinking_level_select ?? [])
+						await handler(payload, ctx);
+				}
+			}
 			for (const handler of events.model_select ?? [])
 				await handler({ model: ctx.model, previousModel, source: "set" }, ctx);
 			return true;
@@ -526,7 +639,17 @@ function setup(opts: {
 		getThinkingLevel: () => sessionThinkingLevel,
 		setThinkingLevel: (level: string) => {
 			rec.thinkingLevels.push(level); // what the extension ASKED for
+			const previousLevel = sessionThinkingLevel;
 			sessionThinkingLevel = clampThinking(level); // what the host actually applied
+			if (
+				opts.thinkingLevelSelectDelivery &&
+				sessionThinkingLevel !== previousLevel
+			) {
+				dispatchThinkingLevelSelect({
+					level: sessionThinkingLevel,
+					previousLevel,
+				});
+			}
 		},
 	};
 
@@ -540,11 +663,14 @@ function setup(opts: {
 	(pi as any).__testCompactFn = opts.compactFn;
 
 	const previousSubagentChild = process.env.PI_SUBAGENT_CHILD;
+	const previousArgv = process.argv;
 	if (opts.subagentChild) process.env.PI_SUBAGENT_CHILD = "1";
 	else delete process.env.PI_SUBAGENT_CHILD;
+	process.argv = ["node", "pi", ...(opts.cliArgs ?? [])];
 	try {
 		piMultiAccount(pi);
 	} finally {
+		process.argv = previousArgv;
 		if (previousSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
 		else process.env.PI_SUBAGENT_CHILD = previousSubagentChild;
 	}
@@ -592,6 +718,8 @@ function setup(opts: {
 	const setCurrent = (provider: string, id: string) => {
 		ctx.model = mkModel(provider, id);
 	};
+	const setModel = (provider: string, id: string) =>
+		pi.setModel(mkModel(provider, id));
 	const readState = () => {
 		try {
 			return JSON.parse(readFileSync(STATE, "utf8"));
@@ -619,6 +747,13 @@ function setup(opts: {
 	const userSetsThinking = (level: string) => {
 		sessionThinkingLevel = clampThinking(level);
 	};
+	const settleThinkingLevelSelects = async () => {
+		while (pendingThinkingLevelSelects.length > 0) {
+			const pending = pendingThinkingLevelSelects.splice(0);
+			for (const item of pending) item.release?.();
+			await Promise.all(pending.map((item) => item.delivery));
+		}
+	};
 
 	return {
 		ctx,
@@ -626,12 +761,14 @@ function setup(opts: {
 		fire,
 		setIdle,
 		setCurrent,
+		setModel,
 		readState,
 		beforeReq,
 		command,
 		input,
 		thinkingLevel,
 		userSetsThinking,
+		settleThinkingLevelSelects,
 		providerConfigs,
 	};
 }
@@ -1888,7 +2025,27 @@ test("manual next can override cooldowns without arming an automatic continuatio
 	);
 });
 
-test("a manual account switch immediately drains the message held behind the old account cooldown", async () => {
+test("manual next cancels the old automatic resume chain before it rotates", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedCooldownsMsFromNow: {
+			anthropic: 60 * 60 * 1000,
+			"openai-codex-account-2": 60 * 60 * 1000,
+		},
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 usage limit");
+	assert.ok(t.readState().pendingFrom, "precondition: the failed turn armed a wake");
+
+	await t.command("next");
+	assert.equal(
+		t.readState().pendingFrom,
+		undefined,
+		"the user's new route owns the session; the old wake must not survive",
+	);
+	await t.fire("session_shutdown");
+});
+
+test("a fresh user message is never swallowed into a private cooldown queue", async () => {
 	const t = setup({
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
 		seedCooldownsMsFromNow: {
@@ -1897,20 +2054,16 @@ test("a manual account switch immediately drains the message held behind the old
 		},
 	});
 
-	const held = await t.input("send this after I choose another account");
-	assert.deepEqual(held, { action: "handled" });
-	assert.equal(t.rec.sent.length, 0, "the message is held while every account is cooling");
-
-	await t.command("switch openai-codex-account-2");
-	assert.deepEqual(t.rec.sent, [
-		{
-			prompt: "send this after I choose another account",
-			options: { deliverAs: "followUp" },
-		},
-	]);
+	const result = await t.input("keep this visible in the transcript");
+	assert.deepEqual(
+		result,
+		{ action: "continue" },
+		"Pi must receive the original input so the user's text remains visible and recoverable",
+	);
+	assert.equal(t.rec.sent.length, 0, "the extension must not clone the prompt into its own queue");
 	assert.ok(
-		t.rec.notifies.some((message) => /resumed 1 queued message/i.test(message)),
-		"the switch confirms that the held work was actually submitted",
+		t.rec.notifies.some((message) => /no account is ready|keeps? your message/i.test(message)),
+		"the user must be told why the current request may fail over",
 	);
 });
 
@@ -2922,10 +3075,13 @@ test("session_start restores lastUserModel after Pi falls back to anthropic/clau
 			cursor: { type: "oauth", access: "c", refresh: "cr" },
 		},
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		thinkingLevel: "high",
+		modelSetThinkingLevel: "low",
 		config: { includeCursor: true, fallbacks: ["anthropic", "cursor"] },
 		seedState: {
 			stateVersion: 5,
 			lastUserModel: { provider: "cursor", id: "cursor-grok-4.6" },
+			lastUserThinkingLevel: "high",
 			lastModelByFamily: { cursor: "cursor-grok-4.6" },
 			exhaustedUntilByProvider: {},
 			lastProbeAtByProvider: {},
@@ -2939,7 +3095,472 @@ test("session_start restores lastUserModel after Pi falls back to anthropic/clau
 		{ provider: "cursor", id: "cursor-grok-4.6" },
 		`startup must put the session back on the last live model, not Pi's anthropic default; setModels=${t.rec.setModels.join(",")}`,
 	);
+	assert.equal(t.thinkingLevel(), "high");
 	uninstallCursorProvider();
+});
+
+test("explicit CLI model wins over remembered startup state and is not remembered on shutdown", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		thinkingLevel: "high",
+		config: { enabled: false },
+		cliArgs: ["--model", "openai-codex-account-2/gpt-5.5"],
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+			lastUserThinkingLevel: "low",
+			lastModelByFamily: { anthropic: "claude-opus-4-8" },
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, {
+		provider: "openai-codex-account-2",
+		id: "gpt-5.5",
+	});
+	assert.equal(t.thinkingLevel(), "high");
+	assert.ok(!t.rec.notifies.some((message) => message.includes("restored")));
+	await t.fire("session_shutdown");
+	assert.deepEqual(t.readState().lastUserModel, {
+		provider: "anthropic",
+		id: "claude-opus-4-8",
+	});
+	assert.equal(t.readState().lastUserThinkingLevel, "low");
+});
+
+test("explicit CLI model thinking is catalog-resolved before startup fallback", async (suite) => {
+	const provider = "openai-codex";
+	const base = "acme:model/v1.2+fast@2026-09-01";
+	for (const scenario of [
+		{
+			name: "a complete real model ID ending in :high wins",
+			models: [`${base}:high`],
+			currentId: `${base}:high`,
+			cliArgs: ["--model", `${provider}/${base}:high`],
+			expectedThinking: "low",
+		},
+		{
+			name: "a valid suffix applies when the stripped model resolves",
+			models: [base],
+			currentId: base,
+			cliArgs: ["--model", `${provider}/${base}:high`],
+			expectedThinking: "high",
+		},
+		{
+			name: "a valid suffix applies to a recognized-provider custom model",
+			models: [base],
+			currentId: "future-model",
+			cliArgs: ["--model", `${provider}/future-model:high`],
+			expectedThinking: "high",
+		},
+		{
+			name: "--provider custom model shorthand follows the same resolution",
+			models: [base],
+			currentId: "future-model",
+			cliArgs: ["--provider", provider, "--model", "future-model:high"],
+			expectedThinking: "high",
+		},
+		{
+			name: "an invalid suffix is not a thinking override",
+			models: [base],
+			currentId: `${base}:turbo`,
+			cliArgs: ["--model", `${provider}/${base}:turbo`],
+			expectedThinking: "low",
+		},
+		{
+			name: "standalone --thinking takes precedence",
+			models: [base],
+			currentId: base,
+			cliArgs: ["--thinking", "high", "--model", `${provider}/${base}:low`],
+			expectedThinking: "high",
+		},
+		{
+			name: "invalid standalone --thinking does not suppress model shorthand",
+			models: [base],
+			currentId: base,
+			cliArgs: ["--thinking", "invalid", "--model", `${provider}/${base}:high`],
+			expectedThinking: "high",
+		},
+	]) {
+		await suite.test(scenario.name, async () => {
+			const t = setup({
+				accounts: {
+					[provider]: { type: "api_key" },
+					anthropic: { type: "oauth", access: "a", refresh: "ar" },
+				},
+				hostCodexModels: scenario.models,
+				current: { provider, id: scenario.currentId },
+				thinkingLevel: "medium",
+				modelSetThinkingLevel: "low",
+				config: { fallbacks: ["anthropic"] },
+				cliArgs: scenario.cliArgs,
+			});
+			await t.fire("session_start", { reason: "startup" });
+			assert.equal(
+				t.ctx.model.provider,
+				"anthropic",
+				"the unavailable launch model must fall back before agent_start",
+			);
+			assert.equal(t.thinkingLevel(), scenario.expectedThinking);
+			await t.fire("session_shutdown");
+		});
+	}
+});
+
+test("explicit CLI thinking wins while ordinary model restoration remains enabled", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		thinkingLevel: "high",
+		modelSetThinkingLevel: "low",
+		config: { enabled: false },
+		cliArgs: ["--thinking", "high"],
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: {
+				provider: "openai-codex-account-2",
+				id: "gpt-5.5",
+			},
+			lastUserThinkingLevel: "medium",
+			lastModelByFamily: { "openai-codex": "gpt-5.5" },
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, {
+		provider: "openai-codex-account-2",
+		id: "gpt-5.5",
+	});
+	assert.equal(t.thinkingLevel(), "high");
+	assert.deepEqual(t.rec.thinkingLevels, ["high"]);
+	await t.setModel("anthropic", "claude-opus-4-8");
+	await t.fire("session_shutdown");
+	assert.deepEqual(t.readState().lastUserModel, {
+		provider: "anthropic",
+		id: "claude-opus-4-8",
+	});
+	assert.equal(t.readState().lastUserThinkingLevel, "medium");
+});
+
+test("internal thinking restores do not become explicit CLI intent", async (suite) => {
+	for (const delivery of ["sync", "delayed"] as const) {
+		await suite.test(`${delivery} thinking event delivery`, async () => {
+			const t = setup({
+				accounts: {
+					anthropic: { type: "oauth", access: "a", refresh: "ar" },
+				},
+				current: { provider: "anthropic", id: "claude-opus-4-8" },
+				thinkingLevel: "low",
+				thinkingLevelSelectDelivery: delivery,
+				config: { enabled: false },
+				cliArgs: ["--thinking", "high"],
+				seedState: {
+					stateVersion: 5,
+					lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+					lastUserThinkingLevel: "medium",
+					lastModelByFamily: { anthropic: "claude-opus-4-8" },
+					lastSwitches: [],
+				},
+			});
+			await t.fire("session_start", { reason: "startup" });
+			assert.equal(t.thinkingLevel(), "high");
+			assert.equal(
+				t.readState().lastUserThinkingLevel,
+				"medium",
+				"the extension's own restore must not persist the one-shot CLI level",
+			);
+
+			// For delayed delivery, make the genuine identical low -> high transition arrive first.
+			t.userSetsThinking("low");
+			await t.fire("thinking_level_select", {
+				level: "low",
+				previousLevel: "high",
+			});
+			t.userSetsThinking("high");
+			await t.fire("thinking_level_select", {
+				level: "high",
+				previousLevel: "low",
+			});
+			assert.equal(
+				t.readState().lastUserThinkingLevel,
+				"high",
+				"the genuine identical choice must be recorded before delayed internal delivery",
+			);
+			await t.settleThinkingLevelSelects();
+			await t.fire("session_shutdown");
+			assert.equal(
+				t.readState().lastUserThinkingLevel,
+				"high",
+				"a later genuine identical choice must take ownership of thinking intent",
+			);
+		});
+	}
+});
+
+test("native model thinking resets do not become explicit CLI intent", async (suite) => {
+	for (const delivery of ["before", "after"] as const) {
+		await suite.test(`${delivery} model_select delivery`, async () => {
+			const t = setup({
+				accounts: {
+					anthropic: { type: "oauth", access: "a", refresh: "ar" },
+					"openai-codex-account-2": {
+						type: "oauth",
+						access: "c",
+						refresh: "cr",
+						accountId: "codex-2",
+					},
+				},
+				current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+				thinkingLevel: "high",
+				modelSetThinkingLevel: "low",
+				modelThinkingLevelSelectDelivery: delivery,
+				config: { enabled: false },
+				cliArgs: ["--model", "openai-codex-account-2/gpt-5.5"],
+				seedState: {
+					stateVersion: 5,
+					lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+					lastUserThinkingLevel: "high",
+					lastModelByFamily: { anthropic: "claude-opus-4-8" },
+					lastSwitches: [],
+				},
+			});
+			await t.fire("session_start", { reason: "startup" });
+			await t.setModel("anthropic", "claude-opus-4-8");
+			await t.settleThinkingLevelSelects();
+			assert.equal(t.thinkingLevel(), "low");
+			assert.equal(
+				t.readState().lastUserThinkingLevel,
+				"high",
+				"the model's native reset must not become remembered user intent",
+			);
+
+			// Recreate the same high -> low key after its one-shot evidence was consumed.
+			t.userSetsThinking("high");
+			await t.fire("thinking_level_select", {
+				level: "high",
+				previousLevel: "low",
+			});
+			t.userSetsThinking("low");
+			await t.fire("thinking_level_select", {
+				level: "low",
+				previousLevel: "high",
+			});
+			await t.fire("session_shutdown");
+			assert.deepEqual(t.readState().lastUserModel, {
+				provider: "anthropic",
+				id: "claude-opus-4-8",
+			});
+			assert.equal(
+				t.readState().lastUserThinkingLevel,
+				"low",
+				"a later genuine identical choice must not be hidden",
+			);
+		});
+	}
+});
+
+test("explicit CLI model can be replaced by a genuine thinking selection only", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		thinkingLevel: "high",
+		config: { enabled: false },
+		cliArgs: ["--model", "openai-codex-account-2/gpt-5.5"],
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+			lastUserThinkingLevel: "low",
+			lastModelByFamily: { anthropic: "claude-opus-4-8" },
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	t.userSetsThinking("medium");
+	await t.fire("thinking_level_select", {
+		level: "medium",
+		previousLevel: "high",
+	});
+	await t.fire("session_shutdown");
+	assert.deepEqual(t.readState().lastUserModel, {
+		provider: "anthropic",
+		id: "claude-opus-4-8",
+	});
+	assert.equal(t.readState().lastUserThinkingLevel, "medium");
+});
+
+test("no-session explicit launch neither restores nor overwrites the global preference", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		thinkingLevel: "high",
+		config: { enabled: false },
+		cliArgs: [
+			"--no-session",
+			"--model",
+			"openai-codex-account-2/gpt-5.5",
+			"--thinking",
+			"high",
+		],
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+			lastUserThinkingLevel: "low",
+			lastModelByFamily: { anthropic: "claude-opus-4-8" },
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, {
+		provider: "openai-codex-account-2",
+		id: "gpt-5.5",
+	});
+	await t.fire("session_shutdown");
+	assert.deepEqual(t.readState().lastUserModel, {
+		provider: "anthropic",
+		id: "claude-opus-4-8",
+	});
+	assert.equal(t.readState().lastUserThinkingLevel, "low");
+});
+
+test("explicit CLI preference can be replaced by a genuine user model selection", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		thinkingLevel: "high",
+		config: { enabled: false },
+		cliArgs: ["--model", "openai-codex-account-2/gpt-5.5"],
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+			lastUserThinkingLevel: "low",
+			lastModelByFamily: { anthropic: "claude-opus-4-8" },
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	t.setCurrent("anthropic", "claude-opus-4-8");
+	await t.fire("model_select", {
+		model: { provider: "anthropic", id: "claude-opus-4-8" },
+		previousModel: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		source: "set",
+	});
+	await t.fire("session_shutdown");
+	assert.deepEqual(t.readState().lastUserModel, {
+		provider: "anthropic",
+		id: "claude-opus-4-8",
+	});
+});
+
+test("manual rotation commands own the model preference after an explicit CLI launch", async (suite) => {
+	for (const command of ["next", "switch anthropic", "best"]) {
+		await suite.test(command, async () => {
+			const t = setup({
+				accounts: {
+					anthropic: { type: "oauth", access: "a", refresh: "ar" },
+					"openai-codex-account-2": {
+						type: "oauth",
+						access: "c",
+						refresh: "cr",
+						accountId: "codex-2",
+					},
+				},
+				current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+				thinkingLevel: "high",
+				cliArgs: ["--model", "openai-codex-account-2/gpt-5.5"],
+				seedState: {
+					stateVersion: 5,
+					lastUserModel: { provider: "alibaba", id: "qwen3.7-max" },
+					lastUserThinkingLevel: "low",
+					lastModelByFamily: { qwen: "qwen3.7-max" },
+					lastSwitches: [],
+				},
+			});
+			await t.fire("session_start", { reason: "startup" });
+			await t.command(command);
+			assert.notEqual(t.ctx.model.provider, "openai-codex-account-2");
+			await t.fire("session_shutdown");
+			assert.deepEqual(t.readState().lastUserModel, t.ctx.model);
+			assert.equal(
+				t.readState().lastUserThinkingLevel,
+				"low",
+				"a manual model choice must not take ownership of thinking",
+			);
+		});
+	}
+});
+
+test("manual no-op choices own the model preference after an explicit CLI launch", async (suite) => {
+	for (const command of ["best", "switch openai-codex-account-2/gpt-5.5"]) {
+		await suite.test(command, async () => {
+			const current = { provider: "openai-codex-account-2", id: "gpt-5.5" };
+			const t = setup({
+				accounts: {
+					"openai-codex-account-2": {
+						type: "oauth",
+						access: "c",
+						refresh: "cr",
+						accountId: "codex-2",
+					},
+				},
+				current,
+				thinkingLevel: "high",
+				cliArgs: ["--model", `${current.provider}/${current.id}`],
+				seedState: {
+					stateVersion: 5,
+					lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+					lastUserThinkingLevel: "low",
+					lastModelByFamily: { anthropic: "claude-opus-4-8" },
+					lastSwitches: [],
+				},
+			});
+			await t.fire("session_start", { reason: "startup" });
+			await t.command(command);
+			await t.fire("session_shutdown");
+			assert.deepEqual(t.readState().lastUserModel, current);
+			assert.equal(t.readState().lastUserThinkingLevel, "low");
+		});
+	}
 });
 
 test("pi-subagents child keeps its explicit launch model and delegates fallback to the parent runner", async () => {
@@ -3838,20 +4459,13 @@ test("a genuinely maxed monthly Codex account is benched for its REAL reset, so 
 		"gpt-5.5",
 		"usage limit has been reached",
 	);
-	assert.equal(
-		t.rec.setModels[0],
-		"openai-codex-account-3/gpt-5.5",
-		`first hop must try the other Codex slot, not skip it for Qwen; got ${JSON.stringify(t.rec.setModels)}`,
-	);
-	await finishError(
-		t,
-		"openai-codex-account-3",
-		"gpt-5.5",
-		"usage limit has been reached",
-	);
 	assert.ok(
 		t.rec.setModels.some((m) => m.startsWith("alibaba/")),
-		`after the sibling also refused, failover must reach the healthy Qwen/Alibaba account; got ${JSON.stringify(t.rec.setModels)}`,
+		`a fresh 100% sibling is known dead, so failover must go directly to healthy Qwen/Alibaba; got ${JSON.stringify(t.rec.setModels)}`,
+	);
+	assert.ok(
+		!t.rec.setModels.some((m) => m.startsWith("openai-codex-account-3/")),
+		"automatic routing must not spend a user turn re-proving a fresh provider verdict",
 	);
 	assert.equal(
 		t.rec.setModels.filter((m) => m.startsWith("openai-codex-account-2/")).length,
@@ -4765,9 +5379,10 @@ test("a sibling that already refused yields to another family", async () => {
 	);
 });
 
-test("a 100% usage forecast on a Codex sibling does not skip it for Claude", async () => {
-	// Live 2026-08-20: openai-codex/gpt-5.6-sol plus-limit → anthropic/claude-opus-5 because every
-	// Codex slot's usage snapshot said 100% / blocked, so siblings were dropped from availableNow.
+test("a fresh provider verdict of 100% skips the dead Codex sibling", async () => {
+	// Live 2026-09-03: Sol failed, then automation selected two Codex accounts whose fresh usage
+	// snapshots already said 100% / blocked. The user paid for those redundant refusals with two
+	// broken turns. Only a manual next may override this evidence; automatic routing must not.
 	const now = Date.now();
 	const t = setup({
 		accounts: {
@@ -4820,26 +5435,25 @@ test("a 100% usage forecast on a Codex sibling does not skip it for Claude", asy
 		"gpt-5.5",
 		"You have hit your ChatGPT usage limit (plus plan). Try again in ~1596 min.",
 	);
-	assert.equal(
-		t.rec.setModels[0],
-		"openai-codex-account-2/gpt-5.5",
-		`must try the other Codex slot at the same thinking level, not Claude; got ${t.rec.setModels.join(", ")}`,
+	assert.ok(
+		t.rec.setModels.some((m) => m.startsWith("anthropic/claude-opus-")),
+		`Opus is the compatible live peer after a frontier Codex slot is known spent; got ${t.rec.setModels.join(", ")}`,
 	);
 	assert.ok(
-		!t.rec.setModels.some((m) => m.startsWith("anthropic")),
-		`must not jump to Claude while a Codex sibling has not refused; got ${t.rec.setModels.join(", ")}`,
+		!t.rec.setModels.some((m) => m.startsWith("openai-codex-account-2/")),
+		`the explicitly blocked sibling must not be retried automatically; got ${t.rec.setModels.join(", ")}`,
 	);
 	assert.equal(
 		t.thinkingLevel(),
 		"high",
-		"the session thinking level must survive the Codex sibling switch",
+		"the session thinking level must survive the cross-provider switch",
 	);
 	const afterHop = t.rec.setModels.length;
 	await t.fire("before_agent_start", {});
 	assert.equal(
 		t.rec.setModels.length,
 		afterHop,
-		`the sibling hop must survive last-moment preflight; it bounced to ${t.rec.setModels.slice(afterHop).join(", ")}`,
+		`the compatible live hop must survive last-moment preflight; it bounced to ${t.rec.setModels.slice(afterHop).join(", ")}`,
 	);
 });
 
@@ -5167,6 +5781,80 @@ test("credential-free catalog snapshots preserve account-specific Codex availabi
 	const account5 = snapshot.models.filter((entry: any) => entry.provider === "openai-codex-account-5").map((entry: any) => entry.id);
 	assert.ok(base.includes("gpt-5.6-sol"));
 	assert.deepEqual(account5.sort(), ["gpt-5.5", "gpt-5.6-terra"]);
+});
+
+test("Sol rotation stays frontier: next skips a Terra-only account and preserves effort", async () => {
+	const accounts = {
+		"openai-codex": { type: "oauth", access: "base", refresh: "base-r", accountId: "base" },
+		"openai-codex-account-2": { type: "oauth", access: "two", refresh: "two-r", accountId: "two" },
+		"openai-codex-account-5": { type: "oauth", access: "five", refresh: "five-r", accountId: "five" },
+		anthropic: { type: "oauth", access: "anthropic", refresh: "anthropic-r" },
+	};
+	const model = (id: string) => ({
+		id,
+		name: id,
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 272000,
+		maxTokens: 128000,
+	});
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		thinkingLevel: "xhigh",
+		config: { autoDiscoverModels: true, preferLatestModel: false },
+		seedState: {
+			stateVersion: 5,
+			codexModelCatalogByProvider: {
+				"openai-codex": { fetchedAt: Date.now(), models: [model("gpt-5.6-sol")] },
+				"openai-codex-account-2": { fetchedAt: Date.now(), models: [model("gpt-5.6-sol")] },
+				"openai-codex-account-5": { fetchedAt: Date.now(), models: [model("gpt-5.6-terra")] },
+			},
+		},
+	});
+	await t.fire("agent_start");
+	await t.command("next");
+	assert.equal(t.rec.setModels.at(-1), "openai-codex-account-2/gpt-5.6-sol");
+	assert.equal(t.thinkingLevel(), "xhigh");
+
+	await t.command("next");
+	assert.match(
+		t.rec.setModels.at(-1) ?? "",
+		/^anthropic\/claude-opus-/,
+		"a Terra-only slot must be skipped; Opus is the cross-provider frontier peer",
+	);
+	assert.equal(t.thinkingLevel(), "xhigh", "manual rotation must keep the user's effort");
+	assert.ok(
+		!t.rec.setModels.includes("openai-codex-account-5/gpt-5.6-terra"),
+		"Sol must never silently become Terra",
+	);
+	await t.fire("session_shutdown");
+});
+
+test("automatic failover from Sol never lands on a Terra-only account", async () => {
+	const accounts = {
+		"openai-codex": { type: "oauth", access: "base", refresh: "base-r", accountId: "base" },
+		"openai-codex-account-5": { type: "oauth", access: "five", refresh: "five-r", accountId: "five" },
+		anthropic: { type: "oauth", access: "anthropic", refresh: "anthropic-r" },
+	};
+	const model = (id: string) => ({ id, name: id, reasoning: true, input: ["text"] });
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { autoDiscoverModels: true, preferLatestModel: false },
+		seedState: {
+			stateVersion: 5,
+			codexModelCatalogByProvider: {
+				"openai-codex": { fetchedAt: Date.now(), models: [model("gpt-5.6-sol")] },
+				"openai-codex-account-5": { fetchedAt: Date.now(), models: [model("gpt-5.6-terra")] },
+			},
+		},
+	});
+	await finishError(t, "openai-codex", "gpt-5.6-sol", "429 usage limit");
+	assert.match(t.rec.setModels.at(-1) ?? "", /^anthropic\/claude-opus-/);
+	assert.ok(!t.rec.setModels.some((entry) => entry.endsWith("/gpt-5.6-terra")));
+	await t.fire("session_shutdown");
 });
 
 test(
@@ -5574,6 +6262,85 @@ test("a same-account pending resume auto-continues on a host without pi.continue
 		"followUp",
 		"the injection must queue behind the current turn, never be rejected as 'already processing'",
 	);
+	assert.match(String(t.rec.sent[0].prompt), /retrying .*no account or model switch occurred/i);
+	assert.doesNotMatch(String(t.rec.sent[0].prompt), /switched to .* after .*\/gpt-5\.5/i);
+});
+
+test("one Pi window never resumes another window's pending task", async () => {
+	const provider = "openai-codex-account-2";
+	const t = setup({
+		accounts: {
+			[provider]: {
+				type: "oauth",
+				access: "b",
+				refresh: "br",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider, id: "gpt-5.5" },
+		config: { transientCooldownMs: 500, pendingPollMs: 200 },
+		omitContinueAgent: true,
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			invalidatedByProvider: {},
+			lastProbeAtByProvider: {},
+			pendingFrom: "anthropic/claude-opus-5",
+			pendingReason: "another window's task",
+			pendingSince: Date.now(),
+			pendingOwner: "some-other-live-session",
+		},
+	});
+	await t.fire("session_start");
+	await finishError(t, provider, "gpt-5.5", "500 server error");
+	await wait(1300);
+
+	assert.equal(t.rec.sent.length, 1, "this session's own retry must still run");
+	assert.match(String(t.rec.sent[0].prompt), new RegExp(provider));
+	assert.doesNotMatch(String(t.rec.sent[0].prompt), /another window|anthropic/);
+	assert.equal(
+		t.readState().pendingOwner,
+		"some-other-live-session",
+		"the shared diagnostic marker remains owned by the other window",
+	);
+	await t.fire("session_shutdown");
+});
+
+test("repeated 500s on an automatic same-model retry trip the breaker instead of looping eight times", async () => {
+	const provider = "openai-codex-account-2";
+	const error = "500 server error";
+	const t = setup({
+		accounts: {
+			[provider]: {
+				type: "oauth",
+				access: "b",
+				refresh: "br",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider, id: "gpt-5.5" },
+		config: { transientCooldownMs: 25, pendingPollMs: 25 },
+		omitContinueAgent: true,
+	});
+	await t.fire("session_start");
+	await finishError(t, provider, "gpt-5.5", error);
+
+	for (let attempt = 0; attempt < 3; attempt++) {
+		await wait(1100);
+		assert.equal(t.rec.sent.length, attempt + 1, "one extension retry per recovery attempt");
+		await t.fire("before_agent_start", {});
+		await finishError(t, provider, "gpt-5.5", error);
+	}
+
+	assert.ok(
+		t.rec.notifies.some((message) => /safe mode|pausing auto-continue/i.test(message)),
+		"three failed retries must visibly stop automatic continuation",
+	);
+	assert.equal(t.readState().pendingFrom, undefined, "the breaker must leave no wake armed");
+	await wait(1100);
+	assert.equal(t.rec.sent.length, 3, "no fourth synthetic user prompt may be injected");
+	await t.fire("session_shutdown");
 });
 
 test("a blocked continuation records why, instead of failing silently", async () => {
@@ -8859,8 +9626,9 @@ test("the resume timer only rotates onto an account it could actually resume on"
 		`at most the one sibling that gets a real request may be tried; got: ${chosen.join(", ")}`,
 	);
 	assert.ok(
-		chosen.some((target) => target.startsWith("anthropic/")),
-		`and the session must land somewhere it can actually work; got: ${chosen.join(", ")}`,
+		t.ctx.model.provider === "anthropic" ||
+			chosen.some((target) => target.startsWith("anthropic/")),
+		`and the session must land somewhere it can actually work; got current ${t.ctx.model.provider}/${t.ctx.model.id}, switches: ${chosen.join(", ")}`,
 	);
 	await t.fire("session_shutdown");
 });
@@ -9197,10 +9965,9 @@ test("a session that acts and acts without a single request reaching a provider 
 });
 
 test("stopping never eats the words the user typed", async () => {
-	// The wait queue exists so a message typed during a cooldown is not lost. Every path that
-	// abandons that queue — the governor stopping itself, or the user stopping it by hand — hands
-	// the text back in the same sentence that explains the stop. `/multi-account stop` used to
-	// drop it in silence, which from the outside is the tool eating what you typed.
+	// A fresh prompt belongs in Pi's transcript, not in extension-owned memory. That makes the
+	// message recoverable by the ordinary failed-turn handoff even if the user immediately stops
+	// automation; `/multi-account stop` must not claim it consumed or returned text it never owned.
 	const cooling: Record<string, number> = {};
 	for (const provider of Object.keys(WIDE_FLEET)) cooling[provider] = 10 * 60 * 1000;
 	const t = setup({
@@ -9213,20 +9980,13 @@ test("stopping never eats the words the user typed", async () => {
 	});
 	await t.fire("session_start");
 
-	const held = await t.input("this sentence must come back to me");
-	assert.equal(held?.action, "handled", "with nothing free, the message is held");
-	assert.equal(t.rec.sent.length, 0, "and nothing was sent");
+	const input = await t.input("this sentence stays in Pi's transcript");
+	assert.equal(input?.action, "continue", "Pi, not the extension, must own the message");
+	assert.equal(t.rec.sent.length, 0, "the extension must not make a private copy");
 
 	await t.command("stop");
 	const stop = t.rec.notifies.at(-1) ?? "";
-	assert.ok(
-		stop.includes("this sentence must come back to me"),
-		`stopping must hand the held text back verbatim; got: ${stop}`,
-	);
-	assert.ok(
-		readDebugLog().some((entry) => entry.kind === "held_messages_returned"),
-		"and record that it did",
-	);
+	assert.doesNotMatch(stop, /held .*not sent/i);
 	await t.fire("session_shutdown");
 });
 
