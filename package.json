@@ -1,6 +1,6 @@
 {
   "name": "pi-multi-account",
-  "version": "1.21.1",
+  "version": "1.21.2",
   "description": "Automatic multi-account failover & rotation for Pi Agent across Anthropic (Claude), OpenAI/ChatGPT Codex, Kimi For Coding, Cursor, Qwen/Alibaba, and Ollama. Auto-discovers authenticated accounts, grows the rotation on login, and drops accounts on logout, expiry, or quota/rate-limit errors",
   "type": "module",
   "license": "MIT",
