@@ -310,8 +310,20 @@ export function isOwnLoopbackPublication(
 	);
 }
 
+/** Return the user-authored model override layer from a provider entry, if present. */
+export function preservedModelOverrides(
+	existing: unknown,
+): Record<string, unknown> | undefined {
+	if (!existing || typeof existing !== "object" || Array.isArray(existing)) return undefined;
+	const overrides = (existing as Record<string, unknown>).modelOverrides;
+	if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) return undefined;
+	if (Object.keys(overrides).length === 0) return undefined;
+	return overrides as Record<string, unknown>;
+}
+
 /**
- * Drop loopback publications this proxy wrote. Cursor and user entries stay.
+ * Drop loopback publications this proxy wrote. Cursor and user entries stay. A user's
+ * modelOverrides remain as a valid built-in-provider overlay after the generated route is gone.
  * Pass slot ids to drop only those; omit to drop every own loopback (a dead port left behind).
  */
 export function dropOwnLoopbackPublications(
@@ -322,8 +334,10 @@ export function dropOwnLoopbackPublications(
 	const ids = slotIds ?? Object.keys(next);
 	for (const id of ids) {
 		const family = proxyFamilyFor(id);
-		if (!family) continue;
-		if (isOwnLoopbackPublication(next[id], family)) delete next[id];
+		if (!family || !isOwnLoopbackPublication(next[id], family)) continue;
+		const modelOverrides = preservedModelOverrides(next[id]);
+		if (modelOverrides) next[id] = { modelOverrides };
+		else delete next[id];
 	}
 	return next;
 }

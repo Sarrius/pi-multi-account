@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **A second concurrent Pi session no longer hangs before it can submit prompts.** When another process owns the canonical child-proxy port, the fallback listener now retries on an ephemeral port on the next event-loop turn and resolves from a standalone `listening` handler. This avoids leaving `session_start` pending forever under Pi's compiled Bun runtime after `EADDRINUSE`.
+- **Slot provisioning no longer deletes user-authored model metadata.** Existing `modelOverrides` entries — including per-model `contextWindow` and `maxTokens` — now survive startup publication, `/multi-account rediscover`, catalog replacement, and loopback shutdown cleanup. Generated proxy routes are still removed when their owner exits, so preserving the override layer cannot leave a dead port or credential behind.
 
 ## [1.21.1] - 2026-09-03
 
