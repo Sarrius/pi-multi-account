@@ -200,8 +200,9 @@ test("native transport consumes provider reasoning without widening the text-onl
 		events: [
 			{ type: "start", partial: {} },
 			{ type: "thinking_start", contentIndex: 0, partial: {} },
-			{ type: "thinking_delta", contentIndex: 0, delta: "private", partial: {} },
-			{ type: "thinking_end", contentIndex: 0, content: "private", partial: {} },
+			{ type: "thinking_delta", contentIndex: 0, delta: "private streamed reasoning", partial: {} },
+			// OpenAI Responses may replace streamed reasoning with its final summary at item.done.
+			{ type: "thinking_end", contentIndex: 0, content: "final reasoning summary", partial: {} },
 			{ type: "text_start", contentIndex: 1, partial: {} },
 			{ type: "text_delta", contentIndex: 1, delta: "answer", partial: {} },
 			{ type: "text_end", contentIndex: 1, content: "answer", partial: {} },
@@ -281,6 +282,36 @@ test("native transport forwards tool schemas and Codex compound tool-call ids wi
 		{ type: "usage", payload: { input: 4, output: 3, cacheRead: 0, cacheWrite: 0 } },
 		{ type: "terminal", outcome: "succeeded_terminal", payload: { httpStatus: 200, providerRequestId: "req-1", finishReason: "tool_use" } },
 	]);
+});
+
+test("Cursor Grok forwards its LF-joined compound tool-call id", async () => {
+	const currentModel = model("cursor", "cursor-grok-4.6", "openai-completions");
+	const toolCallId = "call-12345678-1234-1234-1234-123456789abc-1\nfc_12345678-1234-1234-1234-123456789abc_0";
+	const { registry } = makeRegistry([currentModel], {
+		events: [
+			{ type: "start", partial: {} },
+			{ type: "toolcall_start", contentIndex: 0, partial: {} },
+			{ type: "toolcall_delta", contentIndex: 0, delta: '{"path":"README.md"}', partial: {} },
+			{ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: toolCallId, name: "read", arguments: { path: "README.md" } }, partial: {} },
+			{ type: "done", reason: "toolUse", message: { content: [{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: "README.md" } }], usage: { input: 8, output: 4 } } },
+		],
+	});
+	const pair = createControllerProvider({ modelRegistry: registry });
+	const currentLease = lease("lease-cursor-grok-tool", currentModel.provider, currentModel.id);
+	const route = await pair.routeResolver(currentLease);
+	const output = [];
+	for await (const event of pair.providerTransport.stream(snapshot(route, currentLease), {
+		messages: [{ role: "user", content: "read README.md" }],
+		tools: [{ name: "read", description: "read", inputSchema: {} }],
+	})) output.push(event);
+	assert.deepEqual(output.slice(1, 4), [
+		{ type: "block_start", payload: { index: 0, blockType: "tool_call", id: toolCallId, name: "read" } },
+		{ type: "tool_call_delta", payload: { index: 0, delta: '{"path":"README.md"}' } },
+		{ type: "block_end", payload: { index: 0, value: '{"path":"README.md"}' } },
+	]);
+	const finalEvent = output.at(-1);
+	assert.equal(finalEvent?.type, "terminal");
+	if (finalEvent?.type === "terminal") assert.equal(finalEvent.outcome, "succeeded_terminal");
 });
 
 test("routeResolver fails closed when Pi cannot resolve an exact model credential", async () => {
