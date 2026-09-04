@@ -59,6 +59,7 @@ import {
 	dropOwnLoopbackPublications,
 	parseProxyPath,
 	placeholderKeyFor,
+	preservedModelOverrides,
 	proxyFamilyFor,
 	publishedRouteFor,
 	shapeUpstreamRequest,
@@ -968,13 +969,6 @@ function nativeModelEntries(models: unknown[]): NativeModelEntry[] {
 function provisionNativeSlot(provider: string, entry: NativeProviderEntry): void {
 	try {
 		const models = nativeModelEntries(entry.models);
-		const normalized: Record<string, unknown> = {
-			api: entry.api,
-			baseUrl: entry.baseUrl,
-			models,
-		};
-		if (entry.apiKey) normalized.apiKey = entry.apiKey;
-		if (entry.compat) normalized.compat = entry.compat;
 		const raw = existsSync(MODELS_CONFIG_PATH)
 			? readFileSync(MODELS_CONFIG_PATH, "utf8")
 			: "{}";
@@ -984,6 +978,15 @@ function provisionNativeSlot(provider: string, entry: NativeProviderEntry): void
 				? parsed.providers
 				: {};
 		const existing = providers[provider];
+		const normalized: Record<string, unknown> = {
+			api: entry.api,
+			baseUrl: entry.baseUrl,
+			models,
+		};
+		if (entry.apiKey) normalized.apiKey = entry.apiKey;
+		if (entry.compat) normalized.compat = entry.compat;
+		const modelOverrides = preservedModelOverrides(existing);
+		if (modelOverrides) normalized.modelOverrides = modelOverrides;
 		if (
 			existing?.baseUrl === normalized.baseUrl &&
 			existing?.api === normalized.api &&

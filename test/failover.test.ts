@@ -9297,6 +9297,57 @@ test("a slot published against a parent-owned loopback route counts as usable", 
 	}
 });
 
+test("user modelOverrides survive proxy publication, rediscovery, and shutdown cleanup", async () => {
+	rmSync(MODELS, { force: true });
+	const modelOverrides = {
+		"claude-opus-5": { contextWindow: 466_384, maxTokens: 64_000 },
+	};
+	writeFileSync(
+		MODELS,
+		JSON.stringify({
+			providers: {
+				anthropic: {
+					api: "anthropic-messages",
+					baseUrl: "https://stale.example.invalid",
+					models: [{ id: "claude-opus-5", contextWindow: 1_000_000 }],
+					modelOverrides,
+				},
+			},
+		}),
+	);
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-5" },
+		accounts: {
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+		},
+	});
+	try {
+		await t.fire("session_start");
+		let provider = JSON.parse(readFileSync(MODELS, "utf8")).providers.anthropic;
+		assert.match(provider.baseUrl, /^http:\/\/127\.0\.0\.1:/);
+		assert.deepEqual(provider.modelOverrides, modelOverrides);
+
+		// Force rediscovery to replace stale generated routing/catalog data again. The user's
+		// override layer must survive even when provisioning cannot take its no-op fast path.
+		provider.baseUrl = "https://stale-again.example.invalid";
+		provider.models = [{ id: "claude-opus-5", contextWindow: 1_000_000 }];
+		writeFileSync(MODELS, JSON.stringify({ providers: { anthropic: provider } }));
+		await t.command("rediscover");
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		provider = JSON.parse(readFileSync(MODELS, "utf8")).providers.anthropic;
+		assert.match(provider.baseUrl, /^http:\/\/127\.0\.0\.1:/);
+		assert.deepEqual(provider.modelOverrides, modelOverrides);
+	} finally {
+		await t.fire("session_shutdown");
+	}
+	assert.deepEqual(
+		JSON.parse(readFileSync(MODELS, "utf8")).providers.anthropic,
+		{ modelOverrides },
+		"shutdown must remove the dead loopback route without deleting user model metadata",
+	);
+	rmSync(MODELS, { force: true });
+});
+
 test("with the proxy on, the OAuth slots a child could not use become usable", async () => {
 	// The whole point of the parent-owned route: the slot the rotation chose is the slot the
 	// child runs on, instead of Pi's first-available provider on some other vendor.

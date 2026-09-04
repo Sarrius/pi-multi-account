@@ -387,6 +387,22 @@ test("stop drops every own loopback, including numbered slots left on a dead por
 	assert.equal(next.zai, providers.zai);
 });
 
+test("stop removes a dead loopback publication but retains user modelOverrides", () => {
+	const modelOverrides = {
+		"claude-opus-5": { contextWindow: 466_384, maxTokens: 64_000 },
+	};
+	const next = dropOwnLoopbackPublications({
+		anthropic: {
+			api: "anthropic-messages",
+			apiKey: PROXY_PLACEHOLDER_KEY,
+			baseUrl: "http://127.0.0.1:41977/anthropic",
+			models: [{ id: "claude-opus-5", contextWindow: 1_000_000 }],
+			modelOverrides,
+		},
+	});
+	assert.deepEqual(next.anthropic, { modelOverrides });
+});
+
 test("a user's own Anthropic models.json entry is not treated as our loopback", () => {
 	const providers = {
 		anthropic: {
