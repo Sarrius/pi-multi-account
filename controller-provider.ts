@@ -16,9 +16,10 @@ const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PROVIDER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MODEL_ID = /^[A-Za-z0-9~][A-Za-z0-9._/:~-]{0,159}$/;
 const PROVIDER_REASON = /^[a-z_]{1,64}$/;
-// OpenAI Responses composes tool ids as `${call_id}|${item.id}`. Keep the
-// delimiter scoped to tool-call ids; route/snapshot identifiers remain stricter.
-const TOOL_CALL_ID = /^(?=.{1,128}$)[A-Za-z0-9][A-Za-z0-9._:-]*(?:\|[A-Za-z0-9][A-Za-z0-9._:-]*)?$/;
+// Native providers expose compound tool ids in two observed forms: OpenAI Responses joins
+// `${call_id}|${item.id}`, while Cursor's Grok SSE adapter joins the same two bounded components
+// with one LF. Keep both delimiters scoped to tool-call ids; route/snapshot ids stay stricter.
+const TOOL_CALL_ID = /^(?=[\s\S]{1,128}$)[A-Za-z0-9][A-Za-z0-9._:-]*(?:(?:\||\n)[A-Za-z0-9][A-Za-z0-9._:-]*)?$/;
 const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const ROUTE_CACHE_LIMIT = 256;
 const ROUTE_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -27,6 +28,11 @@ const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhi
 
 const FIXED_REASONS = Object.freeze({
 	unsupportedTools: "unsupported_tools",
+	invalidBlockStart: "invalid_block_start",
+	invalidBlockDelta: "invalid_block_delta",
+	invalidBlockEnd: "invalid_block_end",
+	unsupportedStreamEvent: "unsupported_stream_event",
+	truncatedBlock: "truncated_block",
 	invalidModel: "invalid_model",
 	invalidRequest: "invalid_request",
 	contextWindow: "context_window_exceeded",
@@ -540,7 +546,7 @@ export function createControllerProvider({
 						const blockType = blockTypeFor(type);
 						if (!Number.isSafeInteger(index) || index < 0 || !blockType || openBlocks.has(index)) {
 							terminalSeen = true;
-							yield terminal("malformed_provider_frame");
+							yield terminal("malformed_provider_frame", FIXED_REASONS.invalidBlockStart);
 							return;
 						}
 						openBlocks.set(index, { type: blockType, value: "", bytes: 0 });
@@ -554,7 +560,7 @@ export function createControllerProvider({
 						const expected = type === "text_delta" ? "text" : "reasoning";
 						if (!block || block.type !== expected || typeof event.delta !== "string" || event.delta.length === 0) {
 							terminalSeen = true;
-							yield terminal("malformed_provider_frame");
+							yield terminal("malformed_provider_frame", FIXED_REASONS.invalidBlockDelta);
 							return;
 						}
 						const bytes = Buffer.byteLength(event.delta, "utf8");
@@ -574,9 +580,15 @@ export function createControllerProvider({
 						const index = event.contentIndex;
 						const block = openBlocks.get(index);
 						const expected = type === "text_end" ? "text" : "reasoning";
-						if (!block || block.type !== expected || typeof event.content !== "string" || event.content !== block.value) {
+						const contentBytes = typeof event.content === "string" ? Buffer.byteLength(event.content, "utf8") : Infinity;
+						// OpenAI Responses streams one reasoning representation, then may replace it with
+						// a summarized form at output_item.done. Reasoning never crosses this controller
+						// boundary, so validate/bound the final value but do not require byte equality.
+						const contentMatches = expected === "reasoning" || event.content === block?.value;
+						if (!block || block.type !== expected || typeof event.content !== "string"
+							|| contentBytes > snapshot.maxOutputBytes || !contentMatches) {
 							terminalSeen = true;
-							yield terminal("malformed_provider_frame");
+							yield terminal("malformed_provider_frame", FIXED_REASONS.invalidBlockEnd);
 							return;
 						}
 						openBlocks.delete(index);
@@ -666,7 +678,7 @@ export function createControllerProvider({
 					if (type === "done") {
 						if (openBlocks.size > 0) {
 							terminalSeen = true;
-							yield terminal("stream_truncated");
+							yield terminal("stream_truncated", FIXED_REASONS.truncatedBlock);
 							return;
 						}
 						const usage = usageFrom(event.message?.usage);
@@ -694,7 +706,7 @@ export function createControllerProvider({
 						}
 						return;
 					}
-					yield terminal("malformed_provider_frame");
+					yield terminal("malformed_provider_frame", FIXED_REASONS.unsupportedStreamEvent);
 					return;
 				}
 				if (!terminalSeen) {
