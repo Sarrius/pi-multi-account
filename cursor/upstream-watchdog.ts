@@ -40,17 +40,20 @@ export interface UpstreamWatchdog {
 export function startUpstreamWatchdog(onStall: (silentForMs: number) => void, timeoutMs: number): UpstreamWatchdog {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let stopped = timeoutMs <= 0;
-  let lastProgressAt = Date.now();
+  let lastProgressAt = performance.now();
 
-  const arm = () => {
+  const arm = (delayMs = timeoutMs) => {
     if (stopped) return;
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
       if (stopped) return;
+      const silentForMs = performance.now() - lastProgressAt;
+      // Timers may wake early. Recheck a monotonic deadline before ending the stream.
+      if (silentForMs < timeoutMs) { arm(Math.ceil(timeoutMs - silentForMs)); return; }
       stopped = true;
       timer = undefined;
-      onStall(Date.now() - lastProgressAt);
-    }, timeoutMs);
+      onStall(silentForMs);
+    }, delayMs);
     timer.unref?.();
   };
 
@@ -59,7 +62,7 @@ export function startUpstreamWatchdog(onStall: (silentForMs: number) => void, ti
   return {
     touch() {
       if (stopped) return;
-      lastProgressAt = Date.now();
+      lastProgressAt = performance.now();
       arm();
     },
     stop() {
