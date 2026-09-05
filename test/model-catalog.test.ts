@@ -18,6 +18,23 @@ test("a newly released Claude flagship outranks the newest one this extension sh
 	assert.equal(ranked[0], "claude-opus-5");
 });
 
+test("Fable is an apex Anthropic line above Opus and ranks newest-first", () => {
+	assert.deepEqual(
+		rankAnthropicModelIds([
+			"claude-opus-5",
+			"claude-fable-5",
+			"claude-fable-5-1",
+			"claude-sonnet-5",
+		]),
+		[
+			"claude-fable-5-1",
+			"claude-fable-5",
+			"claude-opus-5",
+			"claude-sonnet-5",
+		],
+	);
+});
+
 test("Claude ordering is tier-first, then generation", () => {
 	assert.deepEqual(
 		rankAnthropicModelIds([
@@ -105,6 +122,34 @@ test("live Codex catalog follows server priority: Sol beats Terra and Luna", () 
 	assert.equal(models[0].thinkingLevelMap?.xhigh, "xhigh");
 	assert.equal(models[0].thinkingLevelMap?.minimal, "low");
 	assert.deepEqual(models[0].input, ["text", "image"]);
+});
+
+test("GPT-6 Astra catalog metadata keeps its native limits, modalities, and all advertised effort levels", () => {
+	const models = parseCodexModelCatalog({ models: [{
+		slug: "gpt-6-astra",
+		display_name: "GPT-6 Astra",
+		visibility: "list",
+		priority: 1,
+		supported_reasoning_levels: ["low", "medium", "high", "xhigh", "max"],
+		input_modalities: ["text", "image"],
+		context_window: 272_000,
+		max_output_tokens: 128_000,
+	}] });
+	assert.equal(models.length, 1);
+	assert.deepEqual(models[0], {
+		id: "gpt-6-astra",
+		name: "GPT-6 Astra",
+		reasoning: true,
+		thinkingLevelMap: { minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+		input: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 272_000,
+		maxTokens: 128_000,
+		priority: 1,
+	});
+	const ranked = [{ id: "gpt-5.6-sol" }, { id: "gpt-6-astra" }];
+	ranked.sort(compareCodexModelStrength);
+	assert.deepEqual(ranked.map((model) => model.id), ["gpt-6-astra", "gpt-5.6-sol"]);
 });
 
 test("unknown future Codex generations rank without an extension release", () => {

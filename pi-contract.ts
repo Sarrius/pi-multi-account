@@ -78,11 +78,11 @@ export const PI_ASSUMPTIONS: readonly PiAssumption[] = Object.freeze([
     breaks: "Nothing directly; it is the key the next row writes to.",
   }),
   Object.freeze({
-    id: "settings-default-model-autowritten",
-    fact: "Pi itself writes defaultProvider/defaultModel on every model switch, so they always name the ACTIVE rotation slot.",
-    kind: "observed" as const,
-    surface: "dist/core/agent-session.js — setDefaultModelAndProvider, called from the host's own setModel path. Documentation describes the keys but never promises they are maintained.",
-    breaks: "Any extension-free child picking up the active model: it would run on a stale slot, or fall through to Pi's own first-available provider.",
+    id: "settings-default-model-versioned-persistence",
+    fact: "Pi <=0.84.2 writes defaultProvider/defaultModel on every model switch; Pi >=0.84.3 keeps ordinary model selection session-scoped and writes the global default only for an explicit persistent selection.",
+    kind: "documented" as const,
+    surface: "Pi 0.84.3 changelog and AgentSession.setModel(model, { persist }): ordinary selection no longer rewrites the global default; Ctrl+S remains the explicit persistence action.",
+    breaks: "A bare child launched without an explicit --model inherits only the saved global default, not pi-multi-account's live rotation slot. Explicitly model-pinned broker/subagent children are unaffected.",
   }),
   Object.freeze({
     id: "child-reads-published-files-only",
@@ -119,6 +119,27 @@ export interface ShapeVerdict {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const SESSION_SCOPED_MODEL_SELECTION_SINCE = Object.freeze([0, 84, 3] as const);
+
+/**
+ * Whether an ordinary Pi model switch is expected to rewrite the saved global default.
+ *
+ * Pi 0.84.3 deliberately made model/thinking selection session-scoped unless the caller passes
+ * `{ persist: true }` (the TUI's explicit Ctrl+S action). Unknown/non-semver hosts are treated as
+ * session-scoped: emitting a loud compatibility warning from an assumption we cannot establish is
+ * worse than omitting an optional legacy diagnostic.
+ */
+export function piAutoPersistsSelectedModel(version: string): boolean {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version.trim());
+  if (!match) return false;
+  const actual = match.slice(1, 4).map(Number) as [number, number, number];
+  for (let index = 0; index < SESSION_SCOPED_MODEL_SELECTION_SINCE.length; index++) {
+    const delta = actual[index] - SESSION_SCOPED_MODEL_SELECTION_SINCE[index];
+    if (delta !== 0) return delta < 0;
+  }
+  return false;
 }
 
 /**
@@ -188,10 +209,11 @@ export function checkModelsShape(raw: unknown): ShapeVerdict {
 }
 
 /**
- * `settings.json`: we depend on two keys, and on Pi keeping them current.
+ * `settings.json`: the saved default keys are optional, but must be strings when present.
  *
- * Their absence is the observable symptom of the `settings-default-model-autowritten` assumption
- * failing — which is the one assumption in the ledger that nothing in Pi promises.
+ * Since Pi 0.84.3 their absence is ordinary: a live model selection is session-scoped unless the
+ * user explicitly persists it. Whether a saved value must track the live model is therefore a
+ * versioned behavioural check, not part of the file's shape.
  */
 export function checkSettingsShape(raw: unknown): ShapeVerdict {
   const problems: string[] = [];
@@ -202,10 +224,8 @@ export function checkSettingsShape(raw: unknown): ShapeVerdict {
   const model = raw.defaultModel;
   if (provider !== undefined && typeof provider !== "string") problems.push("`defaultProvider` is not a string");
   if (model !== undefined && typeof model !== "string") problems.push("`defaultModel` is not a string");
-  if (provider === undefined && model === undefined) {
-    problems.push(
-      "neither `defaultProvider` nor `defaultModel` is recorded — Pi normally writes both on every model switch, so their absence means an extension-free child has no way to learn which account is active",
-    );
+  if ((provider === undefined) !== (model === undefined)) {
+    problems.push("`defaultProvider` and `defaultModel` must either both be strings or both be absent");
   }
   return { file: "settings.json", ok: problems.length === 0, problems };
 }
@@ -230,18 +250,12 @@ export function describeContractDrift(verdicts: readonly ShapeVerdict[]): string
 }
 
 /**
- * The sharpest form of the settings check: does `settings.json` actually name the model that is
- * running right now?
+ * Legacy-only behavioural check: on Pi <=0.84.2, does `settings.json` name the model running now?
  *
- * This is where the one unpromised assumption becomes falsifiable. Pi writes
- * `defaultProvider`/`defaultModel` on every model switch, which is the only reason an
- * extension-free child can be pointed at the account the rotation chose. If the file ever stops
- * tracking the live model, nothing fails here — the failure happens later, inside a child that
- * quietly runs on a different vendor's account. So the disagreement has to be caught at the point
- * where it is still explainable.
- *
- * Only meaningful once a switch has happened in this session: before that, the file legitimately
- * holds the previous session's choice.
+ * Pi >=0.84.3 intentionally separates the live session selection from the saved global default,
+ * so callers MUST gate this check with `piAutoPersistsSelectedModel()`. A bare child without an
+ * explicit `--model` then inherits the saved default by design; a broker/subagent child with an
+ * explicit provider/model remains isolated from that global value.
  */
 export function checkSettingsTracksActive(
   raw: unknown,
@@ -255,7 +269,7 @@ export function checkSettingsTracksActive(
   const live = `${active.provider}/${active.id}`;
   if (recorded !== live) {
     problems.push(
-      `records ${recorded} while the session is running ${live}; Pi normally rewrites both keys on every model switch, and any extension-free child reads them — so a child spawned now would run on ${recorded}, not on the account the rotation selected`,
+      `records ${recorded} while the session is running ${live}; Pi <=0.84.2 is expected to rewrite both keys on every model switch, while a bare extension-free child without --model reads the saved value — so that child would run on ${recorded}, not on the account the rotation selected`,
     );
   }
   return { file: "settings.json", ok: problems.length === 0, problems };

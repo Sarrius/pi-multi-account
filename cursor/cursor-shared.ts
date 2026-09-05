@@ -16,6 +16,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { cursorPayloadStream } from "../provider-payload-stream.ts";
 import {
   generateCursorAuthParams,
   getTokenExpiry,
@@ -134,6 +135,7 @@ export function registerCursorProvider(
     name,
     baseUrl: `http://127.0.0.1:${proxyPort}/v1`,
     api: "openai-completions",
+    streamSimple: cursorPayloadStream,
     models,
     oauth: {
       name,
