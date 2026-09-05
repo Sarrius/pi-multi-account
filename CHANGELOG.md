@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cursor streams send headers immediately and keep the client connection open during pauses.** SSE comments arrive every 15 seconds. A five-minute watchdog bounds the wait for decoded upstream progress; heartbeat messages and partial frames do not extend it. Thinking, blob requests, and checkpoints do. Stalled streams end with an explicit timeout error and cancel the bridge. `PI_CURSOR_UPSTREAM_STALL_MS` changes the interval; `0` disables the watchdog.
+
 - Integrate the fixes from community PR #48 (Cursor SSE keepalives and bounded upstream stalls) and PR #49 (completed-turn cancellation and resume-watch ownership), preserving the current lifecycle guards. The protobuf proxy regression uses a portable test loader on Node 24/26.
 - The legacy only-active setting no longer deletes inactive account models from Pi's shared registry. A picker preference must not make independently loaded tools unable to resolve a model.
 
