@@ -279,6 +279,7 @@ function setup(opts: {
 	seedCooldownsMsFromNow?: Record<string, number>;
 	seedState?: Record<string, unknown>;
 	setModelFailures?: string[];
+	setModelBlocks?: () => Promise<void>;
 	forceRefreshResults?: Record<
 		string,
 		| { status: "refreshed" }
@@ -605,6 +606,7 @@ function setup(opts: {
 			const target = `${model.provider}/${model.id}`;
 			rec.setModels.push(target);
 			if (opts.setModelFailures?.includes(target)) return false;
+			if (opts.setModelBlocks) await opts.setModelBlocks();
 			ctx.model = mkModel(model.provider, model.id);
 			// Pi applies a model default/clamp before emitting model_select.
 			const previousThinkingLevel = sessionThinkingLevel;
@@ -4338,6 +4340,152 @@ test("does not re-resume from a successful assistant turn (the 'Cannot continue 
 		1,
 		"must never resume from a completed assistant message",
 	);
+});
+
+test("successful completion cancels a pending same-model retry", async () => {
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { transientCooldownMs: 25, pendingPollMs: 25 },
+		omitContinueAgent: true,
+	});
+	await t.fire("session_start");
+	try {
+		await finishError(t, "anthropic", "claude-opus-4-8", "500 server error");
+		assert.ok(t.readState().pendingFrom, "a retry must be pending before completion");
+		const ok = okAssistant("anthropic", "claude-opus-4-8");
+		await t.fire("message_end", { message: ok });
+		await t.fire("agent_end", { messages: [ok] });
+		assert.equal(t.readState().pendingFrom, undefined, "completion must clear the pending retry");
+		await wait(1100);
+		assert.equal(t.rec.sent.length, 0, "completed work must not receive a synthetic retry prompt");
+		assert.equal(t.rec.continueCalls.length, 0);
+	} finally {
+		await t.fire("session_shutdown");
+	}
+});
+
+test("successful completion cancels a resume already waiting for the host to go idle", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+	});
+	try {
+		await t.fire("before_agent_start", {});
+		const err = assistantError("anthropic", "claude-opus-4-8", "429 rate limit");
+		await t.fire("message_end", { message: err });
+		const pending = t.fire("agent_end", { messages: [err] });
+		await wait(30);
+		await t.fire("agent_end", { messages: [okAssistant(t.ctx.model.provider, t.ctx.model.id)] });
+		t.setIdle(true);
+		await pending;
+		assert.equal(t.rec.continueCalls.length, 0, "an in-flight resume must not restart completed work");
+		assert.equal(t.rec.sent.length, 0);
+	} finally {
+		t.setIdle(true);
+		await t.fire("session_shutdown");
+	}
+});
+
+test("successful completion cancels a retry waiting for its model switch", async () => {
+	let release: () => void = () => {};
+	const blocked = new Promise<void>((resolve) => { release = resolve; });
+	let switchStarted = false;
+	let blockSwitch = false;
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { transientCooldownMs: 25, pendingPollMs: 25 },
+		omitContinueAgent: true,
+		setModelBlocks: async () => {
+			if (blockSwitch) {
+				switchStarted = true;
+				await blocked;
+			}
+		},
+	});
+	await t.fire("session_start");
+	try {
+		await finishError(t, "anthropic", "claude-opus-4-8", "500 server error");
+		t.setCurrent("anthropic", "claude-sonnet-4-6");
+		blockSwitch = true;
+		await wait(1100);
+		assert.ok(switchStarted, "the retry must be waiting for its model switch");
+		await t.fire("agent_end", { messages: [okAssistant(t.ctx.model.provider, t.ctx.model.id)] });
+		release();
+		await wait(30);
+		assert.equal(t.rec.sent.length, 0, "a completed model switch must not inject a stale retry");
+		assert.equal(t.readState().pendingFrom, undefined);
+	} finally {
+		release();
+		await t.fire("session_shutdown");
+	}
+});
+
+test("successful completion cancels prompt injection after a pending continuation rejects", async () => {
+	let release: () => void = () => {};
+	const blocked = new Promise<void>((resolve) => { release = resolve; });
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { transientCooldownMs: 25, pendingPollMs: 25 },
+		continueBlocks: async () => {
+			await blocked;
+			throw new Error("Cannot continue from message role: assistant");
+		},
+	});
+	await t.fire("session_start");
+	try {
+		await finishError(t, "anthropic", "claude-opus-4-8", "500 server error");
+		await wait(1100);
+		assert.equal(t.rec.continueCalls.length, 1, "the retry must be waiting for continueAgent");
+		await t.fire("agent_end", { messages: [okAssistant(t.ctx.model.provider, t.ctx.model.id)] });
+		release();
+		await wait(30);
+		assert.equal(t.rec.sent.length, 0, "a rejected stale continuation must not inject another prompt");
+	} finally {
+		release();
+		await t.fire("session_shutdown");
+	}
+});
+
+test("successful completion cannot let an old continuation suppress a new task retry", async () => {
+	let release: () => void = () => {};
+	let started: () => void = () => {};
+	const blocked = new Promise<void>((resolve) => { release = resolve; });
+	const continuing = new Promise<void>((resolve) => { started = resolve; });
+	let first = true;
+	const t = setup({
+		accounts: {
+			...TWO_ACCOUNTS,
+			"openai-codex-account-3": { type: "oauth", access: "third-access", refresh: "third-refresh" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		continueBlocks: async () => {
+			if (first) {
+				first = false;
+				started();
+				await blocked;
+			}
+		},
+	});
+	try {
+		await t.fire("before_agent_start", {});
+		const err = assistantError("anthropic", "claude-opus-4-8", "429 rate limit");
+		await t.fire("message_end", { message: err });
+		const pending = t.fire("agent_end", { messages: [err] });
+		await continuing;
+		await t.fire("agent_end", { messages: [okAssistant(t.ctx.model.provider, t.ctx.model.id)] });
+		await t.fire("before_agent_start", {});
+		await t.fire("agent_start", {});
+		release();
+		await pending;
+		await finishError(t, t.ctx.model.provider, t.ctx.model.id, "429 rate limit");
+		assert.equal(t.rec.continueCalls.length, 2, "the new task must receive its own retry");
+	} finally {
+		release();
+		await t.fire("session_shutdown");
+	}
 });
 
 test("an un-continuable resume (e.g. tail aborted by the watchdog) recovers by injecting the continuation prompt — never a red error", async () => {

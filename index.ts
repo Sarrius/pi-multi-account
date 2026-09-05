@@ -7636,6 +7636,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// `currentPromptSwitch`. Without it the prompt-injection fallback refuses to fire.
 		resumeFrom?: { from?: ModelRef; reason?: string },
 	): Promise<boolean> {
+		const epoch = chainEpoch;
 		if (userAbortedChain || ctx.signal?.aborted) return false;
 		// One logical action per resume attempt. `injectContinuationPrompt` is only ever reached
 		// from inside this function, so gating here counts the attempt once however it is carried
@@ -7673,7 +7674,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// pending-wake timer) re-arms and tries again, so the session can't wedge here forever.
 		if (!ctx.isIdle()) {
 			const waitUntil = Date.now() + config.resumeIdleTimeoutMs;
-			while (!ctx.isIdle() && !userAbortedChain && !ctx.signal?.aborted) {
+			while (epoch === chainEpoch && !ctx.isIdle() && !userAbortedChain && !ctx.signal?.aborted) {
 				if (Date.now() >= waitUntil) {
 					ctx.ui.notify(
 						`Provider failover [v${VERSION}]: the previous turn did not go idle within ${formatDelay(config.resumeIdleTimeoutMs)}; auto-retrying the resume in the background.`,
@@ -7691,7 +7692,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				await new Promise((resolve) => setTimeout(resolve, 20));
 			}
 		}
-		if (userAbortedChain || ctx.signal?.aborted) return false;
+		if (epoch !== chainEpoch || userAbortedChain || ctx.signal?.aborted) return false;
 		beginResumeWatch(ctx);
 		logEvent("resume_start", {
 			session: sessionInstanceId,
@@ -7700,6 +7701,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		});
 		try {
 			await continueAgent({ stripErrorAssistant: true });
+			if (epoch !== chainEpoch) return false;
 			autoContinuesThisPrompt++;
 			logEvent("resume_ok", {
 				session: sessionInstanceId,
@@ -7712,6 +7714,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// to report — agent_end handles what happens next. Stay silent.
 			if (
 				watchdogAborting ||
+				epoch !== chainEpoch ||
 				userAbortedChain ||
 				ctx.signal?.aborted ||
 				/abort/i.test(text)
@@ -8142,6 +8145,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// Same-account resume: no rotation happened, so there is no currentPromptSwitch.
 				// Pass the context explicitly or the injection fallback declines and the user has
 				// to re-send the prompt by hand.
+				if (epoch !== chainEpoch) return;
 				await resumeWithExistingContext(ctx, {
 					from: same,
 					reason: pendingResume?.reason,
@@ -11209,6 +11213,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// kept currentPromptSwitch set across later agent_end cycles and re-dispatched a resume
 		// on a SUCCESSFUL assistant tail, which threw that cryptic error into the transcript.
 		if (stop !== "error") {
+			chainEpoch++;
+			clearPendingContinuation();
 			currentPromptSwitch = undefined;
 			continuationDispatchedForAgentTurn = false;
 			return;
