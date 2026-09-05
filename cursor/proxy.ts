@@ -15,6 +15,8 @@ import { resolve as pathResolve, dirname, join as pathJoin } from "node:path";
 import { fileURLToPath } from "node:url";
 import { estimatePromptTokens, resolveCursorUsage } from "./prompt-usage.ts";
 import { type BridgeHandle, type BridgeStreams, createBridgeHandle } from "./bridge-handle.ts";
+import { startSSEResponse } from "./sse-keepalive.ts";
+import { formatStallDuration, resolveUpstreamStallTimeoutMs, startUpstreamWatchdog } from "./upstream-watchdog.ts";
 import {
   requestActionText,
   historyForRebuild,
@@ -1521,11 +1523,7 @@ function writeSSEStream(
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-  });
+  const stopKeepalive = startSSEResponse(res);
 
   let closed = false;
   const sendSSE = (data: object) => {
@@ -1539,6 +1537,8 @@ function writeSSEStream(
   const closeResponse = () => {
     if (closed) return;
     closed = true;
+    stopKeepalive();
+    upstreamWatchdog.stop();
     res.end();
   };
 
@@ -1546,6 +1546,20 @@ function writeSSEStream(
     id: completionId, object: "chat.completion.chunk", created, model: modelId,
     choices: [{ index: 0, delta, finish_reason: finishReason }],
   });
+
+  // Keepalives preserve the client connection; decoded progress bounds the upstream wait.
+  const upstreamWatchdog = startUpstreamWatchdog((silentForMs) => {
+    if (closed) return;
+    const message = `Cursor produced no output for ${formatStallDuration(silentForMs)}; stream timed out`;
+    console.error(`[cursor-provider] Upstream stall (${modelId}):`, message);
+    debugLog("stream.upstream_stall", { requestId, bridgeKey, convKey, modelId, silentForMs });
+    cancelled = true;
+    cleanupBridge(bridge, heartbeatTimer, bridgeKey);
+    sendSSE(makeChunk({ content: message }, "error"));
+    sendSSE(makeUsageChunk());
+    sendDone();
+    closeResponse();
+  }, resolveUpstreamStallTimeoutMs());
 
   const makeUsageChunk = () => {
     const { prompt_tokens, completion_tokens, total_tokens } = computeUsage(state);
@@ -1577,6 +1591,12 @@ function writeSSEStream(
     (messageBytes) => {
       try {
         const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
+        if (serverMessage.message.case !== undefined &&
+          (serverMessage.message.case !== "interactionUpdate" ||
+            (serverMessage.message.value.message.case !== undefined &&
+              serverMessage.message.value.message.case !== "heartbeat"))) {
+          upstreamWatchdog.touch();
+        }
         processServerMessage(
           serverMessage, blobStore, mcpTools,
           (data) => bridge.write(data),
@@ -1662,6 +1682,7 @@ function writeSSEStream(
 
   bridge.onClose((code) => {
     debugLog("stream.bridge_close", { requestId, bridgeKey, convKey, code, cancelled, mcpExecReceived, currentTurn, latestCheckpoint });
+    upstreamWatchdog.stop();
     clearInterval(heartbeatTimer);
     req.removeListener("close", onClientClose);
     res.removeListener("close", onClientClose);
