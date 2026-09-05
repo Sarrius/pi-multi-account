@@ -4488,6 +4488,67 @@ test("successful completion cannot let an old continuation suppress a new task r
 	}
 });
 
+for (const outcome of ["resolves", "rejects"] as const) {
+	test(`an old continuation that ${outcome} cannot stop a new retry watchdog`, async (context) => {
+		let releaseOld: () => void = () => {};
+		let releaseNew: () => void = () => {};
+		let oldStarted: () => void = () => {};
+		let newStarted: () => void = () => {};
+		const oldBlocked = new Promise<void>((resolve) => { releaseOld = resolve; });
+		const newBlocked = new Promise<void>((resolve) => { releaseNew = resolve; });
+		const oldReady = new Promise<void>((resolve) => { oldStarted = resolve; });
+		const newReady = new Promise<void>((resolve) => { newStarted = resolve; });
+		let first = true;
+		const t = setup({
+			accounts: {
+				...TWO_ACCOUNTS,
+				"openai-codex-account-3": { type: "oauth", access: "third-access", refresh: "third-refresh" },
+			},
+			current: { provider: "anthropic", id: "claude-opus-4-8" },
+			config: { stuckWatchdogMs: 1000 },
+			continueBlocks: async () => {
+				if (first) {
+					first = false;
+					oldStarted();
+					await oldBlocked;
+					if (outcome === "rejects") throw new Error("Cannot continue from message role: assistant");
+				} else {
+					newStarted();
+					await newBlocked;
+				}
+			},
+		});
+		let oldPending: Promise<unknown> | undefined;
+		let newPending: Promise<unknown> | undefined;
+		try {
+			await t.fire("before_agent_start", {});
+			const oldError = assistantError("anthropic", "claude-opus-4-8", "429 rate limit");
+			await t.fire("message_end", { message: oldError });
+			oldPending = t.fire("agent_end", { messages: [oldError] });
+			await oldReady;
+			await t.fire("agent_end", { messages: [okAssistant(t.ctx.model.provider, t.ctx.model.id)] });
+			await t.fire("before_agent_start", {});
+			await t.fire("agent_start", {});
+			const newError = assistantError(t.ctx.model.provider, t.ctx.model.id, "429 rate limit");
+			await t.fire("message_end", { message: newError });
+			context.mock.timers.enable({ apis: ["setTimeout"] });
+			newPending = t.fire("agent_end", { messages: [newError] });
+			await newReady;
+			releaseOld();
+			await oldPending;
+			assert.equal(t.rec.aborts, 0);
+			assert.equal(t.rec.sent.length, 0, "the old continuation must not inject a stale prompt");
+			context.mock.timers.tick(1000);
+			assert.equal(t.rec.aborts, 1, "the newer stalled retry must retain its watchdog");
+		} finally {
+			releaseOld();
+			releaseNew();
+			await Promise.all([oldPending, newPending]);
+			await t.fire("session_shutdown");
+		}
+	});
+}
+
 test("an un-continuable resume (e.g. tail aborted by the watchdog) recovers by injecting the continuation prompt — never a red error", async () => {
 	const t = setup({
 		current: { provider: "anthropic", id: "claude-opus-4-8" },

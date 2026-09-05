@@ -4121,7 +4121,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// token, tool event, or provider response is "progress" and disarms the stuck timer; total
 	// silence past stuckWatchdogMs means the rotated turn wedged and the user is staring at a
 	// spinner that will never finish — so we surface a concrete, actionable recovery.
-	let resumeInFlight = false;
+	let activeResumeWatch: symbol | undefined;
 	let progressWatchdogTimer: ReturnType<typeof setTimeout> | undefined;
 	let watchdogCtx: any;
 	let lastResumeProgressAt = 0;
@@ -7178,7 +7178,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function armStuckWatchdog() {
 		clearProgressWatchdog();
-		if (!resumeInFlight || !automaticFailoverEnabled()) return;
+		if (!activeResumeWatch || !automaticFailoverEnabled()) return;
 		progressWatchdogTimer = setTimeout(
 			onResumeStuck,
 			Math.max(25, config.stuckWatchdogMs),
@@ -7187,23 +7187,27 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function noteResumeProgress() {
-		if (!resumeInFlight) return;
+		if (!activeResumeWatch) return;
 		lastResumeProgressAt = Date.now();
 		stuckReminders = 0;
 		armStuckWatchdog();
 	}
 
-	function beginResumeWatch(ctx: any) {
-		resumeInFlight = true;
+	function beginResumeWatch(ctx: any): () => void {
+		const owner = Symbol("resume watch");
+		activeResumeWatch = owner;
 		watchdogCtx = ctx;
 		lastResumeProgressAt = Date.now();
 		stuckReminders = 0;
 		toolInFlight = 0;
 		armStuckWatchdog();
+		return () => {
+			if (activeResumeWatch === owner) endResumeWatch();
+		};
 	}
 
 	function endResumeWatch() {
-		resumeInFlight = false;
+		activeResumeWatch = undefined;
 		watchdogCtx = undefined;
 		stuckReminders = 0;
 		toolInFlight = 0;
@@ -7212,7 +7216,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function onResumeStuck() {
 		progressWatchdogTimer = undefined;
-		if (!resumeInFlight) return;
+		if (!activeResumeWatch) return;
 		// A timer callback that throws crashes the whole Pi process — the exact "everything
 		// dies" failure we are trying to eliminate. Never let anything escape here.
 		try {
@@ -7278,7 +7282,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				"warning",
 			);
 			stuckReminders++;
-			if (stuckReminders < 5 && resumeInFlight) {
+			if (stuckReminders < 5 && activeResumeWatch) {
 				progressWatchdogTimer = setTimeout(
 					onResumeStuck,
 					Math.max(25, STUCK_REMINDER_MS),
@@ -7693,7 +7697,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 		}
 		if (epoch !== chainEpoch || userAbortedChain || ctx.signal?.aborted) return false;
-		beginResumeWatch(ctx);
+		const stopResumeWatch = beginResumeWatch(ctx);
 		logEvent("resume_start", {
 			session: sessionInstanceId,
 			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown",
@@ -7742,7 +7746,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			);
 			return false;
 		} finally {
-			endResumeWatch();
+			stopResumeWatch();
 		}
 	}
 
@@ -9347,7 +9351,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Invalidated (need re-login): ${invalids.length ? invalids.join(", ") : "none"}`,
 				`Pending auto-resume: ${hasPendingResume() ? `yes (reason: ${pendingResume?.reason ?? "unknown"})` : "none"}`,
 				`Queued user messages: ${queuedUserInputs.length}`,
-				`Resume watchdog: ${resumeInFlight ? `watching${toolInFlight ? " · tool running" : ""}` : "idle"} · auto-recover ${config.autoRecoverStuck ? "ON" : "OFF"}`,
+				`Resume watchdog: ${activeResumeWatch ? `watching${toolInFlight ? " · tool running" : ""}` : "idle"} · auto-recover ${config.autoRecoverStuck ? "ON" : "OFF"}`,
 				`Compaction routing: ${config.routeCompactionToHealthyAccount ? "to healthy account" : "off"}${compactionRoutedNote ? ` (last: ${compactionRoutedNote})` : ""}${lastContextOverflowAt ? ` · last overflow ${formatUntil(lastContextOverflowAt)}` : ""}`,
 				`Auto-continue breaker: ${isBreakerOpen() ? `OPEN — advisory mode until ${formatUntil(breakerOpenUntil)} (manual switching; /multi-account reset to re-enable)` : `closed${recoveryFailures ? ` (${recoveryFailures}/${BREAKER_FAILURE_THRESHOLD} recent failures)` : ""}`}`,
 				// The one line that answers "is it spinning?" without reading a log. A session that
@@ -11149,7 +11153,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// a turn WE resumed is a failed recovery and must feed the breaker; otherwise the provider's
 			// own four HTTP retries are wrapped in eight extension retries (32 requests and eight
 			// synthetic user prompts), exactly the Kimi 500 loop seen in the incident transcript.
-			if (continuationDispatchedForAgentTurn || resumeInFlight) {
+			if (continuationDispatchedForAgentTurn || activeResumeWatch) {
 				noteRecoveryFailure(ctx);
 				if (isBreakerOpen()) {
 					currentPromptSwitch = undefined;
