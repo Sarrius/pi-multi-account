@@ -77,9 +77,9 @@ test("stall durations read naturally in the error surfaced to the user", () => {
   assert.equal(formatStallDuration(301_400), "5m 1s");
 });
 
-// Generated protobuf enums need Node's transform mode; keep it local to the proxy test.
+// Generated protobuf enums need transpilation; keep the test loader local to this subprocess.
 test("the proxy measures decoded progress rather than heartbeat or partial-frame traffic", () => {
-  execFileSync(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", `
+  execFileSync(process.execPath, ["--import", new URL("./fixtures/typescript-loader.mjs", import.meta.url).href, "--input-type=module", "-e", `
     import assert from "node:assert/strict";
     import { EventEmitter } from "node:events";
     import { mock } from "node:test";
@@ -89,6 +89,7 @@ test("the proxy measures decoded progress rather than heartbeat or partial-frame
 
     process.env.PI_CURSOR_UPSTREAM_STALL_MS = "200";
     mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    mock.method(performance, "now", () => Date.now());
     function frame(message) {
       const payload = toBinary(AgentServerMessageSchema, create(AgentServerMessageSchema, { message }));
       const bytes = Buffer.alloc(5 + payload.length);
@@ -161,4 +162,20 @@ test("the proxy measures decoded progress rather than heartbeat or partial-frame
       mock.timers.reset();
     }
   `], { cwd: new URL("../", import.meta.url), stdio: "pipe" });
+});
+
+// A timer wake-up is advisory; the elapsed deadline remains authoritative.
+test("an early timer wake cannot declare an upstream stall", (t) => {
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const fired: number[] = [];
+  const watchdog = startUpstreamWatchdog(ms => fired.push(ms), 40);
+  now = 39;
+  t.mock.timers.tick(40);
+  assert.deepEqual(fired, []);
+  now = 40;
+  t.mock.timers.tick(1);
+  assert.deepEqual(fired, [40]);
+  watchdog.stop();
 });

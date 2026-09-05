@@ -14,6 +14,7 @@
 
 import rawFallbackModels from "./cursor-models-raw.json" with { type: "json" };
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { cursorPayloadStream } from "../provider-payload-stream.ts";
 import { cursorModelDisplayName } from "../cursor-model-name.ts";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { appendFileSync } from "node:fs";
@@ -512,6 +513,7 @@ export default async function (pi: ExtensionAPI) {
     pi.registerProvider("cursor", {
       baseUrl,
       api: "openai-completions",
+      streamSimple: cursorPayloadStream,
       models: processed.map(modelConfig),
       oauth: {
         name: "Cursor",

@@ -3,11 +3,12 @@
  *
  * ## Why this exists
  *
- * Pi writes `defaultProvider`/`defaultModel` into `settings.json` on every model switch
- * (`setDefaultModelAndProvider`, called from the host's own `setModel` path). Those keys
- * therefore always name whichever rotation slot is active. Anything that later spawns a bare
- * `pi -p --no-extensions` child — a memory extension consolidating its notes, an external CLI,
- * a future brokered worker — reads them and tries to run on that slot.
+ * Pi keeps an optional saved global default in `settings.json`. On Pi <=0.84.2 every model
+ * switch rewrites it; since Pi 0.84.3 ordinary model selection is session-scoped and only an
+ * explicit persistent choice rewrites it. Anything that later spawns a bare
+ * `pi -p --no-extensions` child without `--model` inherits that saved default — which may
+ * intentionally differ from whichever rotation slot is active in this session. Brokered and
+ * subagent children pass an explicit provider/model and do not use this fallback.
  *
  * A child launched that way does not load this extension, so a slot named `openai-codex-account-4`
  * exists for it only if we published it into Pi's own `models.json`. Publishing the *name*,
@@ -196,8 +197,8 @@ export function classifyChildUsability(facts: SlotChildFacts): ChildUsability {
 }
 
 /**
- * The slot a bare child would actually be sent to, given what Pi has recorded as the session
- * default. Returns `undefined` when the default is fine.
+ * The slot a bare unpinned child would actually be sent to, given Pi's saved global default.
+ * Returns `undefined` when that saved route is usable.
  *
  * This is the check that turns a silent, far-away failure into something sayable here: when the
  * active rotation slot is not child-usable, every child spawned without an explicit `--model`
@@ -205,16 +206,17 @@ export function classifyChildUsability(facts: SlotChildFacts): ChildUsability {
  * often a different vendor, and never the one the rotation chose.
  */
 export function defaultRouteWarning(
-  activeSlotId: string | undefined,
+  savedDefaultSlotId: string | undefined,
   classify: (slotId: string) => ChildUsability | undefined,
 ): string | undefined {
-  if (!activeSlotId) return undefined;
-  const verdict = classify(activeSlotId);
+  if (!savedDefaultSlotId) return undefined;
+  const verdict = classify(savedDefaultSlotId);
   if (!verdict || verdict.usable) return undefined;
   return (
-    `Pi records ${activeSlotId} as the session default, but an extension-free child cannot use it: ` +
-    `${verdict.reason} Such a child falls back to Pi's own first-available provider instead of the ` +
-    `account rotation selected. ${verdict.remedy}`
+    `Pi's saved global default is ${savedDefaultSlotId}, but a bare extension-free child launched ` +
+    `without --model cannot use it: ${verdict.reason} Such an unpinned child falls back to Pi's ` +
+    `own first-available provider. The live multi-account session and explicitly pinned ` +
+    `broker/subagent children are unaffected. ${verdict.remedy}`
   );
 }
 

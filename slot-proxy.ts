@@ -3,10 +3,11 @@
  *
  * ## The problem this exists for
  *
- * Pi keeps `settings.json` pointed at the active model, so anything spawned without this
- * extension loaded — a memory extension consolidating its notes, an external CLI, a bare
- * `pi -p --no-extensions` call — reads those two keys and tries to run on the active rotation
- * slot. Publishing that slot's *name* into `models.json` is not enough: measured 2026-08-24, a
+ * A process spawned without this extension — a memory consolidation, external CLI, or bare
+ * `pi -p --no-extensions` call — either receives an explicit model or inherits Pi's saved global
+ * default. Since Pi 0.84.3 that saved value intentionally does not track every live session
+ * switch. In either case, publishing a rotation slot's *name* into `models.json` is not enough:
+ * measured 2026-08-24, a
  * published slot carrying an OAuth credential fails with `No API key found`, because Pi honours
  * an OAuth credential only for a provider definition that declares the flow, and a `models.json`
  * entry declares none. The child then falls through to Pi's own first-available provider — a

@@ -22,6 +22,7 @@ import {
   checkSettingsTracksActive,
   describeContractDrift,
   observedAssumptions,
+  piAutoPersistsSelectedModel,
 } from "../pi-contract.ts";
 
 // ---------------------------------------------------------------------------
@@ -48,13 +49,23 @@ test("every assumption says whether Pi promised it, where, and what breaks", () 
   assert.equal(new Set(ids).size, ids.length, "ids must be unique");
 });
 
-test("the two assumptions nobody promised are marked as such", () => {
+test("only genuinely unpromised assumptions remain on the manual re-check list", () => {
   const observed = observedAssumptions().map((a) => a.id);
-  // These are the re-check list after every Pi upgrade. Losing the mark on either one is how a
-  // guess quietly becomes treated as a contract.
-  assert.ok(observed.includes("settings-default-model-autowritten"));
-  assert.ok(observed.includes("oauth-needs-provider-declared-flow"));
-  assert.ok(observed.length < PI_ASSUMPTIONS.length, "not everything is a guess");
+  assert.deepEqual(observed, ["oauth-needs-provider-declared-flow"]);
+  assert.equal(
+    PI_ASSUMPTIONS.find((assumption) => assumption.id === "settings-default-model-versioned-persistence")?.kind,
+    "documented",
+  );
+});
+
+test("model-default persistence is gated at Pi 0.84.3", () => {
+  assert.equal(piAutoPersistsSelectedModel("0.84.0"), true);
+  assert.equal(piAutoPersistsSelectedModel("v0.84.2"), true);
+  assert.equal(piAutoPersistsSelectedModel("0.84.3"), false);
+  assert.equal(piAutoPersistsSelectedModel("0.84.4"), false);
+  assert.equal(piAutoPersistsSelectedModel("0.85.0"), false);
+  assert.equal(piAutoPersistsSelectedModel("1.0.0"), false);
+  assert.equal(piAutoPersistsSelectedModel("unknown"), false);
 });
 
 // ---------------------------------------------------------------------------
@@ -125,12 +136,16 @@ test("settings.json: both keys present is the healthy case", () => {
   assert.equal(verdict.ok, true);
 });
 
-test("settings.json: both keys missing is the symptom of the unpromised assumption failing", () => {
-  // Pi writes these on every model switch today. If it stops, an extension-free child has no way
-  // to learn which account is active — and it will silently run on something else.
+test("settings.json: both saved-default keys may be absent on session-scoped Pi", () => {
   const verdict = checkSettingsShape({ theme: "dark" });
+  assert.equal(verdict.ok, true);
+  assert.deepEqual(verdict.problems, []);
+});
+
+test("settings.json: a half-written saved default is invalid", () => {
+  const verdict = checkSettingsShape({ defaultProvider: "anthropic" });
   assert.equal(verdict.ok, false);
-  assert.match(verdict.problems[0], /every model switch/);
+  assert.match(verdict.problems[0], /both be strings or both be absent/);
 });
 
 test("settings.json: a wrong type is caught even when the key exists", () => {
@@ -138,7 +153,7 @@ test("settings.json: a wrong type is caught even when the key exists", () => {
 });
 
 // ---------------------------------------------------------------------------
-// settings.json tracking the LIVE model — the falsifiable form of that assumption
+// settings.json tracking the LIVE model — legacy Pi <=0.84.2 only
 // ---------------------------------------------------------------------------
 
 const active = { provider: "openai-codex-account-4", id: "gpt-5.6-sol" };
@@ -172,6 +187,13 @@ test("the model alone differing is still a mismatch", () => {
     active,
   );
   assert.equal(verdict.ok, false);
+});
+
+test("missing saved defaults are a legacy mismatch only when this gated check is requested", () => {
+  const verdict = checkSettingsTracksActive({ theme: "dark" }, active);
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.problems[0], /\(unset\)\/\(unset\)/);
+  assert.match(verdict.problems[0], /Pi <=0\.84\.2/);
 });
 
 test("a broken settings file reports the shape problem rather than a bogus mismatch", () => {

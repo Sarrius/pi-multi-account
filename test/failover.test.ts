@@ -20,6 +20,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { VERSION as PI_HOST_VERSION } from "@earendil-works/pi-coding-agent";
+import { piAutoPersistsSelectedModel } from "../pi-contract.ts";
 
 const AGENT_DIR = mkdtempSync(join(tmpdir(), "pmacct-test-"));
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
@@ -94,6 +96,7 @@ const {
 	mergeRefreshedCredentials,
 	modelIdentityKey,
 	modelQualityBand,
+	removeCredentialFromAuthStorage,
 	persistRefreshedCredentials,
 	sameModelIdentity,
 } = (await import("../index.ts")) as {
@@ -107,7 +110,8 @@ const {
 	) => boolean;
 	mergeRefreshedCredentials: (credentials: any, refreshed: any) => any;
 	modelIdentityKey: (modelId: string) => string;
-	modelQualityBand: (modelId: string) => "frontier" | "balanced" | "fast" | undefined;
+	modelQualityBand: (modelId: string, provider?: string) => "apex" | "frontier" | "balanced" | "fast" | undefined;
+	removeCredentialFromAuthStorage: (authStorage: any, provider: string) => Promise<boolean>;
 	persistRefreshedCredentials: (
 		authStorage: any,
 		provider: string,
@@ -183,7 +187,15 @@ test("model identity folds Cursor effort suffixes and the cursor- prefix", () =>
 	assert.ok(!sameModelIdentity("k3", "k3-256k"));
 });
 
-test("cross-provider quality bands map Sol/Opus, Terra/Sonnet, and Luna/Haiku", () => {
+test("cross-provider quality bands quarantine Astra/Fable above ordinary frontier", () => {
+	assert.equal(modelQualityBand("gpt-6-astra", "openai-codex-account-2"), "apex");
+	assert.equal(modelQualityBand("claude-fable-5-1", "anthropic-account-2"), "apex");
+	assert.equal(modelQualityBand("anthropic/claude-fable-5.1", "openrouter"), "apex");
+	assert.equal(
+		modelQualityBand("claude-fable-5-1-high", "cursor"),
+		undefined,
+		"metadata-divergent Cursor aliases are not calibrated as native Fable peers",
+	);
 	assert.equal(modelQualityBand("gpt-5.6-sol"), "frontier");
 	assert.equal(modelQualityBand("claude-opus-5"), "frontier");
 	assert.equal(modelQualityBand("composer-2.5"), "frontier");
@@ -196,6 +208,7 @@ test("cross-provider quality bands map Sol/Opus, Terra/Sonnet, and Luna/Haiku", 
 });
 
 const AUTH = join(AGENT_DIR, "auth.json");
+const PROXY_OAUTH_SIDECAR = join(AGENT_DIR, "pi-multi-account-proxy-oauth.json");
 const CONFIG = join(AGENT_DIR, "provider-failover.json");
 const STATE = join(AGENT_DIR, "provider-failover-state.json");
 const SETTINGS = join(AGENT_DIR, "settings.json");
@@ -279,6 +292,7 @@ function setup(opts: {
 	seedCooldownsMsFromNow?: Record<string, number>;
 	seedState?: Record<string, unknown>;
 	setModelFailures?: string[];
+	setModelBlocks?: () => Promise<void>;
 	forceRefreshResults?: Record<
 		string,
 		| { status: "refreshed" }
@@ -295,8 +309,8 @@ function setup(opts: {
 	/**
 	 * A host whose `ctx.compact()` answers through NEITHER callback.
 	 *
-	 * Not hypothetical: a compaction cancelled by an extension reports through `compaction_end`,
-	 * and the guard's own `onComplete`/`onError` are never called. If that leaves the guard's
+	 * Not hypothetical: Pi >=0.84.3 reports cancellation through `session_compact_failed`, and
+	 * the guard's own `onComplete`/`onError` may never be called. If that leaves the guard's
 	 * in-flight flag set, it never asks for another summary for the rest of the session.
 	 */
 	compactSilent?: boolean;
@@ -311,6 +325,8 @@ function setup(opts: {
 	omitSendUserMessage?: boolean;
 	/** Models the HOST (Pi) itself publishes for the base Codex provider. */
 	hostCodexModels?: string[];
+	/** Optional exact host catalog by provider, used for cross-family/apex routing tests. */
+	hostModelsByProvider?: Record<string, string[]>;
 	/** Accounts Pi does NOT know any model for — logged in, but unusable until configured. */
 	unknownProviders?: string[];
 	/** The level the SESSION runs at (what `--thinking` / `/thinking` produced). */
@@ -472,6 +488,8 @@ function setup(opts: {
 			getProvider: () => ({ streamSimple: async function* () {} }),
 			getAll: () =>
 				[...known].flatMap((provider) => {
+					const hostModels = opts.hostModelsByProvider?.[provider];
+					if (hostModels) return hostModels.map((id) => mkModel(provider, id));
 					if (opts.hostCodexModels && provider === "openai-codex") {
 						return opts.hostCodexModels.map((id) => mkModel(provider, id));
 					}
@@ -523,12 +541,17 @@ function setup(opts: {
 							reload: () => {
 								rec.authReloads++;
 							},
-							forceRefreshProvider: async (provider: string) =>
-								opts.forceRefreshResults?.[provider] ?? {
-									status: "terminal",
-									error: "refresh_token_invalidated: session has ended",
+								forceRefreshProvider: async (provider: string) =>
+									opts.forceRefreshResults?.[provider] ?? {
+										status: "terminal",
+										error: "refresh_token_invalidated: session has ended",
+									},
+								delete: async (provider: string) => {
+									const data = JSON.parse(readFileSync(AUTH, "utf8"));
+									delete data[provider];
+									writeFileSync(AUTH, JSON.stringify(data, null, 2));
 								},
-							hasAuth: (provider: string) => {
+								hasAuth: (provider: string) => {
 								const entry = JSON.parse(readFileSync(AUTH, "utf8"))[provider];
 								return !!(entry?.key || entry?.access);
 							},
@@ -605,6 +628,7 @@ function setup(opts: {
 			const target = `${model.provider}/${model.id}`;
 			rec.setModels.push(target);
 			if (opts.setModelFailures?.includes(target)) return false;
+			if (opts.setModelBlocks) await opts.setModelBlocks();
 			ctx.model = mkModel(model.provider, model.id);
 			// Pi applies a model default/clamp before emitting model_select.
 			const previousThinkingLevel = sessionThinkingLevel;
@@ -771,6 +795,7 @@ function setup(opts: {
 		userSetsThinking,
 		settleThinkingLevelSelects,
 		providerConfigs,
+		hasHandler: (event: string) => (events[event]?.length ?? 0) > 0,
 	};
 }
 
@@ -2793,6 +2818,42 @@ test("OAuth-marked Anthropic payload gets one billing header", () => {
 	);
 });
 
+test("public Anthropic and Qwen provider streams shape native requests without session hooks", async () => {
+	const t = setup({ accounts: {
+		anthropic: { type: "oauth", access: "sk-ant-oat01-fixture", refresh: "fixture" },
+		"anthropic-account-2": { type: "oauth", access: "sk-ant-oat01-fixture-two", refresh: "fixture-two" },
+		qwen: { type: "api_key", key: "fixture" },
+		"qwen-account-2": { type: "api_key", key: "fixture-two" },
+	}, config: { qwenProvider: "qwen", includeQwen: true } });
+	for (const provider of ["anthropic", "anthropic-account-2", "qwen", "qwen-account-2"]) {
+		const anthropic = provider.startsWith("anthropic");
+		let body: any;
+		const stream = t.providerConfigs.get(provider).streamSimple({ provider,
+			api: anthropic ? "anthropic-messages" : "openai-completions",
+			id: anthropic ? "claude-sonnet-4-6" : "qwen-max", baseUrl: "https://fixture.invalid/v1",
+			reasoning: true, input: ["text"], contextWindow: 10000, maxTokens: 100,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: { supportsDeveloperRole: true },
+		}, { systemPrompt: "fixture instructions", messages: [{ role: "user", content: "fixture task", timestamp: 0 }] }, {
+			apiKey: anthropic ? "sk-ant-oat01-fixture" : "fixture", maxRetries: 0,
+			onPayload: async (payload: any) => ({ ...payload, callerMarker: true }),
+			fetch: async (_url: any, init: any) => {
+				body = JSON.parse(init.body);
+				return new Response(JSON.stringify({ error: { message: "fixture finished" } }), { status: 400 });
+			},
+		});
+		await stream.result();
+		assert.ok(body, `${provider} must reach the native request boundary`);
+		assert.equal(body.callerMarker, true);
+		if (anthropic) assert.equal(body.system.filter((b: any) => b.text.startsWith("x-anthropic-billing-header:")).length, 1);
+		else {
+			assert.ok(body.messages.some((m: any) => m.role === "system"));
+			assert.ok(body.messages.every((m: any) => m.role !== "developer"));
+		}
+		// Rejection is intentional; this is a payload canary, with no live provider call.
+		assert.equal((await stream.result()).stopReason, "error");
+	}
+});
+
 test("non-OAuth Anthropic payload is unchanged", () => {
 	const t = setup({
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
@@ -3877,7 +3938,7 @@ test("add kimi points at the interactive subscription login, not a manual api ke
 	);
 });
 
-test("only-active narrows /model to the active account and persists", async () => {
+test("only-active preference persists without removing models from Pi", async () => {
 	const t = setup({
 		accounts: TWO_ACCOUNTS,
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
@@ -3887,7 +3948,7 @@ test("only-active narrows /model to the active account and persists", async () =
 	const codex = [...t.rec.registrations]
 		.reverse()
 		.find((r) => r.provider === "openai-codex-account-2");
-	assert.equal(codex?.models, 0, "the inactive codex slot must be hidden");
+	assert.ok((codex?.models ?? 0) > 0, "inactive authenticated slots remain available through Pi");
 	const anthropic = [...t.rec.registrations]
 		.reverse()
 		.find((r) => r.provider === "anthropic");
@@ -3897,7 +3958,7 @@ test("only-active narrows /model to the active account and persists", async () =
 	assert.ok(t.rec.notifies.at(-1)?.includes("only-active ON"));
 });
 
-test("failover under only-active unhides the target before switching and re-narrows after", async () => {
+test("failover under only-active preserves all registered routes", async () => {
 	const t = setup({
 		accounts: TWO_ACCOUNTS,
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
@@ -3926,10 +3987,10 @@ test("failover under only-active unhides the target before switching and re-narr
 		"a provider Pi knows on its own is never emptied to narrow /model",
 	);
 	assert.ok(
-		[...t.rec.registrations].some(
+		![...t.rec.registrations].some(
 			(r) => r.provider === "openai-codex-account-2" && r.models === 0,
 		),
-		"the extension's own spare slot IS narrowed while another account is active",
+		"independent Pi clients can still resolve every authenticated slot",
 	);
 });
 
@@ -4170,6 +4231,78 @@ test("remove anthropic with only the base slot removes that credential", async (
 	assert.ok(!auth.anthropic);
 });
 
+test("credential deletion uses the host lock and preserves a concurrent unrelated update", async () => {
+	const initial = {
+		"openai-codex-account-2": { type: "oauth", access: "old", refresh: "old-refresh" },
+		unrelated: { type: "api_key", key: "keep-me" },
+	};
+	writeFileSync(AUTH, JSON.stringify(initial));
+	const storage = {
+		delete: async (provider: string) => {
+			// Model the host's locked operation observing the latest file, after another process added
+			// a credential. A whole-file read/overwrite in the extension would erase this entry.
+			const latest = JSON.parse(readFileSync(AUTH, "utf8"));
+			latest.concurrentLogin = { type: "oauth", access: "new", refresh: "new-refresh" };
+			delete latest[provider];
+			writeFileSync(AUTH, JSON.stringify(latest));
+		},
+	};
+
+	assert.equal(await removeCredentialFromAuthStorage(storage, "openai-codex-account-2"), true);
+	const auth = JSON.parse(readFileSync(AUTH, "utf8"));
+	assert.equal(auth["openai-codex-account-2"], undefined);
+	assert.equal(auth.unrelated.key, "keep-me");
+	assert.equal(auth.concurrentLogin.access, "new");
+});
+
+test("credential deletion refuses modify-only hosts because undefined means no change in Pi", async () => {
+	let modified = "";
+	const storage = {
+		modify: async (provider: string, fn: (current: unknown) => unknown) => {
+			modified = provider;
+			assert.equal(await fn({ type: "oauth" }), undefined);
+		},
+	};
+	assert.equal(await removeCredentialFromAuthStorage(storage, "anthropic"), false);
+	assert.equal(modified, "");
+});
+
+test("real Pi AuthStorage deletes against latest disk state and preserves another storage instance's login", async () => {
+	const { AuthStorage } = await import(new URL(
+		"../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js", import.meta.url).href);
+	const root = mkdtempSync(join(tmpdir(), "real-auth-delete-"));
+	const path = join(root, "auth.json");
+	try {
+		writeFileSync(path, JSON.stringify({ obsolete: { type: "api_key", key: "fixture-old" } }));
+		const first = AuthStorage.create(path);
+		const second = AuthStorage.create(path);
+		await second.modify("new-login", () => ({ type: "api_key", key: "fixture-new" }));
+		assert.equal(await removeCredentialFromAuthStorage(first, "obsolete"), true);
+		const result = JSON.parse(readFileSync(path, "utf8"));
+		assert.equal(result.obsolete, undefined);
+		assert.equal(result["new-login"].key, "fixture-new");
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("removing a shadow-backed slot also removes its parent-only OAuth sidecar", async () => {
+	const slot = "openai-codex-account-2";
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			[slot]: { type: "oauth", access: "c", refresh: "cr", accountId: "codex-2" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))[slot]?.type, "api_key");
+	assert.ok(JSON.parse(readFileSync(PROXY_OAUTH_SIDECAR, "utf8"))[slot]);
+
+	await t.command(`remove ${slot}`);
+	assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))[slot], undefined);
+	assert.equal(JSON.parse(readFileSync(PROXY_OAUTH_SIDECAR, "utf8"))[slot], undefined);
+	await t.fire("session_shutdown");
+});
+
 test("remove without args prints usage", async () => {
 	const t = setup({ accounts: ONE_ACCOUNT });
 	await t.command("remove");
@@ -4225,6 +4358,111 @@ test("transient overload retries the same account instead of rotating siblings",
 		"resume must fire after cooldown",
 	);
 	assert.equal(t.rec.sent.length, 0);
+});
+
+test("a successful Pi-native retry cancels the extension's same-route wake", async () => {
+	const provider = "kimi-coding";
+	const t = setup({
+		accounts: {
+			[provider]: { type: "oauth", access: "k1", refresh: "kr1" },
+		},
+		current: { provider, id: "k3" },
+		config: { transientCooldownMs: 25, pendingPollMs: 25 },
+	});
+	await t.fire("session_start");
+	await t.fire("agent_start");
+
+	const error = assistantError(provider, "k3", "500 server_error");
+	await t.fire("message_end", { message: error });
+	assert.equal(t.readState().pendingFrom, "kimi-coding/k3");
+
+	// Pi retries inside the same session run. A successful response makes the extension-owned
+	// wake obsolete immediately; otherwise it fires after the successful turn and duplicates work.
+	await t.fire("after_provider_response", { status: 200, headers: {} });
+	assert.equal(t.readState().pendingFrom, undefined, "success must retire pending recovery");
+	await wait(1100);
+	assert.equal(t.rec.continueCalls.length, 0, "no stale continuation may follow success");
+	assert.equal(t.rec.sent.length, 0, "no synthetic retry prompt may follow success");
+});
+
+test("a second consecutive transient error escapes the failing route instead of starting another same-route wave", async () => {
+	// Pi has its own agent-level retry loop (`retry.maxRetries`, default 3). The first Kimi 500
+	// may therefore be retried in-place by Pi, but when that retry also returns 500 the extension
+	// must use the remaining native retry/continuation on another healthy route. The v1.21.2
+	// behaviour armed another same-Kimi wake here, multiplying Pi's retries by extension retries.
+	const t = setup({
+		accounts: {
+			"kimi-coding": { type: "oauth", access: "k1", refresh: "kr1" },
+			"kimi-coding-account-2": { type: "oauth", access: "k2", refresh: "kr2" },
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		},
+		current: { provider: "kimi-coding", id: "k3" },
+		config: { providerOrder: ["anthropic", "kimi-coding"] },
+	});
+	await t.fire("session_start");
+	await t.fire("agent_start");
+
+	const first = assistantError("kimi-coding", "k3", "500 server_error");
+	await t.fire("message_end", { message: first });
+	assert.equal(t.rec.setModels.length, 0, "one same-route retry is allowed");
+	assert.equal(t.readState().pendingFrom, "kimi-coding/k3");
+
+	// This is the failed Pi-native retry in the same chain: no new before_agent_start/agent_start.
+	const second = assistantError("kimi-coding", "k3", "500 server_error");
+	await t.fire("message_end", { message: second });
+
+	assert.equal(
+		t.rec.setModels[0],
+		"kimi-coding-account-2/k3",
+		`the repeated 500 must escape to the same-model sibling first; got ${t.rec.setModels.join(", ")}`,
+	);
+	assert.equal(
+		t.readState().pendingFrom,
+		"kimi-coding-account-2/k3",
+		"the fallback may own a bounded wake, but the stale failed-Kimi wake must be gone",
+	);
+	assert.ok(
+		!t.rec.setModels.some((model) => model.startsWith("anthropic/")),
+		`same-model Kimi capacity outranks another frontier family; got ${t.rec.setModels.join(", ")}`,
+	);
+
+	// If Pi still has a native retry in its own budget, it now runs on the fallback. Success must
+	// win the race against our fallback-owned wake and retire it without another synthetic prompt.
+	await t.fire("after_provider_response", { status: 200, headers: {} });
+	assert.equal(t.readState().pendingFrom, undefined);
+	await wait(1100);
+	assert.equal(t.rec.continueCalls.length, 0);
+	assert.equal(t.rec.sent.length, 0);
+});
+
+test("transient escalation still resumes on the fallback when Pi has no native retry left", async () => {
+	const t = setup({
+		accounts: {
+			"kimi-coding": { type: "oauth", access: "k1", refresh: "kr1" },
+			"kimi-coding-account-2": { type: "oauth", access: "k2", refresh: "kr2" },
+		},
+		current: { provider: "kimi-coding", id: "k3" },
+		config: { transientCooldownMs: 25, pendingPollMs: 25 },
+		omitContinueAgent: true,
+	});
+	await t.fire("session_start");
+	await t.fire("agent_start");
+	await finishError(t, "kimi-coding", "k3", "500 server_error");
+
+	await wait(1100);
+	assert.equal(t.rec.sent.length, 1, "the first failure gets its one same-route retry");
+	await t.fire("before_agent_start", {});
+	await finishError(t, "kimi-coding", "k3", "500 server_error");
+	assert.equal(t.rec.setModels[0], "kimi-coding-account-2/k3");
+	assert.equal(t.readState().pendingFrom, "kimi-coding-account-2/k3");
+
+	await wait(1100);
+	assert.equal(
+		t.rec.sent.length,
+		2,
+		"if Pi does not retry natively, the fallback wake must continue the interrupted task",
+	);
+	assert.match(String(t.rec.sent[1].prompt), /kimi-coding-account-2\/k3/);
 });
 
 test("hyphenated Invalid API-key immediately invalidates Alibaba and fails over", async () => {
@@ -4339,6 +4577,213 @@ test("does not re-resume from a successful assistant turn (the 'Cannot continue 
 		"must never resume from a completed assistant message",
 	);
 });
+
+test("successful completion cancels a pending same-model retry", async () => {
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { transientCooldownMs: 25, pendingPollMs: 25 },
+		omitContinueAgent: true,
+	});
+	await t.fire("session_start");
+	try {
+		await finishError(t, "anthropic", "claude-opus-4-8", "500 server error");
+		assert.ok(t.readState().pendingFrom, "a retry must be pending before completion");
+		const ok = okAssistant("anthropic", "claude-opus-4-8");
+		await t.fire("message_end", { message: ok });
+		await t.fire("agent_end", { messages: [ok] });
+		assert.equal(t.readState().pendingFrom, undefined, "completion must clear the pending retry");
+		await wait(1100);
+		assert.equal(t.rec.sent.length, 0, "completed work must not receive a synthetic retry prompt");
+		assert.equal(t.rec.continueCalls.length, 0);
+	} finally {
+		await t.fire("session_shutdown");
+	}
+});
+
+test("successful completion cancels a resume already waiting for the host to go idle", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+	});
+	try {
+		await t.fire("before_agent_start", {});
+		const err = assistantError("anthropic", "claude-opus-4-8", "429 rate limit");
+		await t.fire("message_end", { message: err });
+		const pending = t.fire("agent_end", { messages: [err] });
+		await wait(30);
+		await t.fire("agent_end", { messages: [okAssistant(t.ctx.model.provider, t.ctx.model.id)] });
+		t.setIdle(true);
+		await pending;
+		assert.equal(t.rec.continueCalls.length, 0, "an in-flight resume must not restart completed work");
+		assert.equal(t.rec.sent.length, 0);
+	} finally {
+		t.setIdle(true);
+		await t.fire("session_shutdown");
+	}
+});
+
+test("successful completion cancels a retry waiting for its model switch", async () => {
+	let release: () => void = () => {};
+	const blocked = new Promise<void>((resolve) => { release = resolve; });
+	let switchStarted = false;
+	let blockSwitch = false;
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { transientCooldownMs: 25, pendingPollMs: 25 },
+		omitContinueAgent: true,
+		setModelBlocks: async () => {
+			if (blockSwitch) {
+				switchStarted = true;
+				await blocked;
+			}
+		},
+	});
+	await t.fire("session_start");
+	try {
+		await finishError(t, "anthropic", "claude-opus-4-8", "500 server error");
+		t.setCurrent("anthropic", "claude-sonnet-4-6");
+		blockSwitch = true;
+		await wait(1100);
+		assert.ok(switchStarted, "the retry must be waiting for its model switch");
+		await t.fire("agent_end", { messages: [okAssistant(t.ctx.model.provider, t.ctx.model.id)] });
+		release();
+		await wait(30);
+		assert.equal(t.rec.sent.length, 0, "a completed model switch must not inject a stale retry");
+		assert.equal(t.readState().pendingFrom, undefined);
+	} finally {
+		release();
+		await t.fire("session_shutdown");
+	}
+});
+
+test("successful completion cancels prompt injection after a pending continuation rejects", async () => {
+	let release: () => void = () => {};
+	const blocked = new Promise<void>((resolve) => { release = resolve; });
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { transientCooldownMs: 25, pendingPollMs: 25 },
+		continueBlocks: async () => {
+			await blocked;
+			throw new Error("Cannot continue from message role: assistant");
+		},
+	});
+	await t.fire("session_start");
+	try {
+		await finishError(t, "anthropic", "claude-opus-4-8", "500 server error");
+		await wait(1100);
+		assert.equal(t.rec.continueCalls.length, 1, "the retry must be waiting for continueAgent");
+		await t.fire("agent_end", { messages: [okAssistant(t.ctx.model.provider, t.ctx.model.id)] });
+		release();
+		await wait(30);
+		assert.equal(t.rec.sent.length, 0, "a rejected stale continuation must not inject another prompt");
+	} finally {
+		release();
+		await t.fire("session_shutdown");
+	}
+});
+
+test("successful completion cannot let an old continuation suppress a new task retry", async () => {
+	let release: () => void = () => {};
+	let started: () => void = () => {};
+	const blocked = new Promise<void>((resolve) => { release = resolve; });
+	const continuing = new Promise<void>((resolve) => { started = resolve; });
+	let first = true;
+	const t = setup({
+		accounts: {
+			...TWO_ACCOUNTS,
+			"openai-codex-account-3": { type: "oauth", access: "third-access", refresh: "third-refresh" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		continueBlocks: async () => {
+			if (first) {
+				first = false;
+				started();
+				await blocked;
+			}
+		},
+	});
+	try {
+		await t.fire("before_agent_start", {});
+		const err = assistantError("anthropic", "claude-opus-4-8", "429 rate limit");
+		await t.fire("message_end", { message: err });
+		const pending = t.fire("agent_end", { messages: [err] });
+		await continuing;
+		await t.fire("agent_end", { messages: [okAssistant(t.ctx.model.provider, t.ctx.model.id)] });
+		await t.fire("before_agent_start", {});
+		await t.fire("agent_start", {});
+		release();
+		await pending;
+		await finishError(t, t.ctx.model.provider, t.ctx.model.id, "429 rate limit");
+		assert.equal(t.rec.continueCalls.length, 2, "the new task must receive its own retry");
+	} finally {
+		release();
+		await t.fire("session_shutdown");
+	}
+});
+
+for (const outcome of ["resolves", "rejects"] as const) {
+	test(`an old continuation that ${outcome} cannot stop a new retry watchdog`, async (context) => {
+		let releaseOld: () => void = () => {};
+		let releaseNew: () => void = () => {};
+		let oldStarted: () => void = () => {};
+		let newStarted: () => void = () => {};
+		const oldBlocked = new Promise<void>((resolve) => { releaseOld = resolve; });
+		const newBlocked = new Promise<void>((resolve) => { releaseNew = resolve; });
+		const oldReady = new Promise<void>((resolve) => { oldStarted = resolve; });
+		const newReady = new Promise<void>((resolve) => { newStarted = resolve; });
+		let first = true;
+		const t = setup({
+			accounts: {
+				...TWO_ACCOUNTS,
+				"openai-codex-account-3": { type: "oauth", access: "third-access", refresh: "third-refresh" },
+			},
+			current: { provider: "anthropic", id: "claude-opus-4-8" },
+			config: { stuckWatchdogMs: 1000 },
+			continueBlocks: async () => {
+				if (first) {
+					first = false;
+					oldStarted();
+					await oldBlocked;
+					if (outcome === "rejects") throw new Error("Cannot continue from message role: assistant");
+				} else {
+					newStarted();
+					await newBlocked;
+				}
+			},
+		});
+		let oldPending: Promise<unknown> | undefined;
+		let newPending: Promise<unknown> | undefined;
+		try {
+			await t.fire("before_agent_start", {});
+			const oldError = assistantError("anthropic", "claude-opus-4-8", "429 rate limit");
+			await t.fire("message_end", { message: oldError });
+			oldPending = t.fire("agent_end", { messages: [oldError] });
+			await oldReady;
+			await t.fire("agent_end", { messages: [okAssistant(t.ctx.model.provider, t.ctx.model.id)] });
+			await t.fire("before_agent_start", {});
+			await t.fire("agent_start", {});
+			const newError = assistantError(t.ctx.model.provider, t.ctx.model.id, "429 rate limit");
+			await t.fire("message_end", { message: newError });
+			context.mock.timers.enable({ apis: ["setTimeout"] });
+			newPending = t.fire("agent_end", { messages: [newError] });
+			await newReady;
+			releaseOld();
+			await oldPending;
+			assert.equal(t.rec.aborts, 0);
+			assert.equal(t.rec.sent.length, 0, "the old continuation must not inject a stale prompt");
+			context.mock.timers.tick(1000);
+			assert.equal(t.rec.aborts, 1, "the newer stalled retry must retain its watchdog");
+		} finally {
+			releaseOld();
+			releaseNew();
+			await Promise.all([oldPending, newPending]);
+			await t.fire("session_shutdown");
+		}
+	});
+}
 
 test("an un-continuable resume (e.g. tail aborted by the watchdog) recovers by injecting the continuation prompt — never a red error", async () => {
 	const t = setup({
@@ -5553,6 +5998,115 @@ test("a Codex generation only the HOST knows about (gpt-5.6) wins without a rele
 	await t.fire("session_shutdown");
 });
 
+test("ordinary Opus/Sol failover cannot promote itself into Astra or Fable", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": { type: "oauth", access: "c", refresh: "cr", accountId: "codex-2" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-5" },
+		hostCodexModels: ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.5"],
+		hostModelsByProvider: { anthropic: ["claude-fable-5-1", "claude-opus-5"] },
+	});
+	await t.fire("session_start");
+	await finishError(t, "anthropic", "claude-opus-5", "429 rate_limit_error");
+	assert.equal(t.rec.setModels.at(-1), "openai-codex-account-2/gpt-5.6-sol");
+	assert.ok(!t.rec.setModels.some((model) => /astra|fable/i.test(model)));
+	await t.fire("session_shutdown");
+});
+
+test("manually selected Astra stays apex: exact sibling first, then native Fable", async () => {
+	const t = setup({
+		accounts: {
+			"openai-codex": { type: "oauth", access: "c1", refresh: "cr1", accountId: "codex-1" },
+			"openai-codex-account-2": { type: "oauth", access: "c2", refresh: "cr2", accountId: "codex-2" },
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		},
+		current: { provider: "openai-codex", id: "gpt-6-astra" },
+		hostCodexModels: ["gpt-6-astra", "gpt-5.6-sol"],
+		hostModelsByProvider: { anthropic: ["claude-fable-5-1", "claude-fable-5", "claude-opus-5"] },
+	});
+	await t.fire("session_start");
+	await t.fire("model_select", { model: { provider: "openai-codex", id: "gpt-6-astra" } });
+	await finishError(t, "openai-codex", "gpt-6-astra", "429 rate_limit_error");
+	assert.equal(t.rec.setModels.at(-1), "openai-codex-account-2/gpt-6-astra");
+	await finishError(t, "openai-codex-account-2", "gpt-6-astra", "429 rate_limit_error");
+	assert.equal(t.rec.setModels.at(-1), "anthropic/claude-fable-5-1");
+	assert.ok(!t.rec.setModels.some((model) => /(?:sol|opus)/i.test(model)), "apex must not silently downgrade");
+	await t.fire("session_shutdown");
+});
+
+test("Fable model unavailability tries the same-family apex version before Astra", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": { type: "oauth", access: "c", refresh: "cr", accountId: "codex-2" },
+		},
+		current: { provider: "anthropic", id: "claude-fable-5-1" },
+		hostCodexModels: ["gpt-6-astra", "gpt-5.6-sol"],
+		hostModelsByProvider: { anthropic: ["claude-fable-5-1", "claude-fable-5", "claude-opus-5"] },
+	});
+	await t.fire("session_start");
+	await finishError(t, "anthropic", "claude-fable-5-1", "model not found");
+	assert.equal(t.rec.setModels.at(-1), "anthropic/claude-fable-5");
+	await finishError(t, "anthropic", "claude-fable-5", "model not found");
+	assert.equal(t.rec.setModels.at(-1), "openai-codex-account-2/gpt-6-astra");
+	await t.fire("session_shutdown");
+});
+
+test("numbered Anthropic slots inherit native Fable metadata from the host catalog", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a1", refresh: "ar1" },
+			"anthropic-account-2": { type: "oauth", access: "a2", refresh: "ar2" },
+		},
+		current: { provider: "anthropic", id: "claude-fable-5-1" },
+		hostModelsByProvider: { anthropic: ["claude-fable-5-1", "claude-fable-5", "claude-opus-5"] },
+	});
+	await t.fire("session_start");
+	const fable = t.ctx.modelRegistry.find("anthropic-account-2", "claude-fable-5-1");
+	assert.equal(fable?.api, "anthropic-messages");
+	assert.deepEqual(fable?.input, ["text", "image"]);
+	assert.equal(fable?.contextWindow, 1_000_000);
+	assert.equal(fable?.maxTokens, 128_000);
+	assert.deepEqual(fable?.thinkingLevelMap, { off: null, xhigh: "xhigh", max: "max" });
+	await t.fire("session_shutdown");
+});
+
+test("native apex sessions do not activate paid OpenAI/OpenRouter fallback without an explicit target", async () => {
+	const accounts: Account = {
+		"openai-codex": { type: "oauth", access: "c", refresh: "cr", accountId: "codex" },
+		openai: { type: "api_key", key: "paid-openai" },
+		openrouter: { type: "api_key", key: "paid-router" },
+	};
+	const hostModelsByProvider = {
+		openai: ["gpt-6-astra"],
+		openrouter: ["anthropic/claude-fable-5.1"],
+	};
+	const closed = setup({
+		accounts,
+		current: { provider: "openai-codex", id: "gpt-6-astra" },
+		hostCodexModels: ["gpt-6-astra", "gpt-5.6-sol"],
+		hostModelsByProvider,
+	});
+	await closed.fire("session_start");
+	await finishError(closed, "openai-codex", "gpt-6-astra", "429 rate_limit_error");
+	assert.deepEqual(closed.rec.setModels, [], "auto-discovery alone is not permission to spend a paid apex route");
+	await closed.fire("session_shutdown");
+
+	const optedIn = setup({
+		accounts,
+		current: { provider: "openai-codex", id: "gpt-6-astra" },
+		config: { fallbacks: ["openai/gpt-6-astra"] },
+		hostCodexModels: ["gpt-6-astra", "gpt-5.6-sol"],
+		hostModelsByProvider,
+	});
+	await optedIn.fire("session_start");
+	await finishError(optedIn, "openai-codex", "gpt-6-astra", "429 rate_limit_error");
+	assert.equal(optedIn.rec.setModels.at(-1), "openai/gpt-6-astra");
+	await optedIn.fire("session_shutdown");
+});
+
 test("an unreleased Codex generation is also selectable on a numbered account alias, not just the base provider", async () => {
 	const accounts: Account = {
 		"openai-codex-account-2": {
@@ -5758,7 +6312,7 @@ test("reload disabling Codex discovery replaces cached alias models with host mo
 	await t.fire("session_shutdown");
 });
 
-test("credential-free catalog snapshots preserve account-specific Codex availability", async () => {
+test("the public Pi model registry preserves account-specific Codex availability", async () => {
 	const accounts = {
 		"openai-codex": { type: "oauth", access: "base", refresh: "base-r", accountId: "base" },
 		"openai-codex-account-5": { type: "oauth", access: "five", refresh: "five-r", accountId: "five" },
@@ -5777,7 +6331,7 @@ test("credential-free catalog snapshots preserve account-specific Codex availabi
 		},
 	});
 	await t.fire("session_start");
-	const snapshot = t.rec.catalogSnapshots.at(-1);
+	const snapshot = { models: t.ctx.modelRegistry.getAll() };
 	const base = snapshot.models.filter((entry: any) => entry.provider === "openai-codex").map((entry: any) => entry.id);
 	const account5 = snapshot.models.filter((entry: any) => entry.provider === "openai-codex-account-5").map((entry: any) => entry.id);
 	assert.ok(base.includes("gpt-5.6-sol"));
@@ -7112,11 +7666,11 @@ test("registering the Ollama base provider must not narrow the user's own model 
 	}
 });
 
-test("a catalog sync refreshes the only-active hidden copy, so an immediate switch shows fresh models", async () => {
+test("a catalog sync remains public with only-active enabled, so an immediate switch shows fresh models", async () => {
 	// Real-world miss (2026-08-21): Ollama was hidden by only-active holding the pre-sync list;
 	// the catalog sync then replaced the live registration with kimi-k3 et al, but a manual
 	// switch BEFORE the next message_start re-hidden the provider from the STALE stored copy —
-	// /model showed the old six. The sync now re-applies the filter in the same tick.
+	// /model showed the old six. The registry now stays public throughout sync and switch.
 	writeFileSync(
 		join(AGENT_DIR, "models.json"),
 		JSON.stringify({
@@ -7156,8 +7710,7 @@ test("a catalog sync refreshes the only-active hidden copy, so an immediate swit
 			config: { includeOllama: true, autoDiscoverModels: true, onlyActive: true },
 		});
 		await t.fire("session_start");
-		// ollama must be hidden now (inactive), then the user switches immediately — no message_start
-		// in between. The restored list must already contain the synced kimi-k3.
+		// Switch immediately, without message_start. The public list must contain the synced kimi-k3.
 		await t.command("switch ollama");
 		const ids = t.ctx.modelRegistry
 			.getAll()
@@ -7165,7 +7718,7 @@ test("a catalog sync refreshes the only-active hidden copy, so an immediate swit
 			.map((model: any) => model.id);
 		assert.ok(
 			ids.includes("kimi-k3"),
-			`the synced catalog must survive the hide→switch round-trip; got ${JSON.stringify(ids)}`,
+			`the synced catalog must survive the immediate switch; got ${JSON.stringify(ids)}`,
 		);
 		assert.ok(
 			ids.includes("glm-5.2:cloud"),
@@ -8328,16 +8881,13 @@ test("only-active never makes a model Pi knows on its own unresolvable", async (
 		"and so must Pi's own anthropic provider, even though it is not the active one",
 	);
 	assert.ok(
-		!resolvable("openai-codex-account-2"),
-		"this extension's own spare slot is what only-active narrows",
+		resolvable("openai-codex-account-2"),
+		"account aliases also remain in the public Pi catalog",
 	);
 });
 
-test("only-active empties this extension's own slots and nothing else, ever", async () => {
-	// The blast radius, stated as a rule rather than per provider: a name with an
-	// `-account-N` suffix exists only because this extension registered it, so narrowing
-	// it takes nothing away from Pi. Every other name in the registry came from
-	// somewhere else and is not ours to unregister.
+test("only-active never empties a public provider, including account aliases", async () => {
+	// A picker preference cannot remove routes from any independent Pi client.
 	const t = setup({
 		accounts: {
 			anthropic: { type: "oauth", access: "a", refresh: "ar" },
@@ -8363,9 +8913,9 @@ test("only-active empties this extension's own slots and nothing else, ever", as
 		),
 	];
 	assert.deepEqual(
-		emptied.filter((provider) => !/-account-\d+$/.test(provider)),
+		emptied,
 		[],
-		`only-active emptied a provider it did not invent: ${emptied.join(", ")}`,
+		`only-active emptied registered providers: ${emptied.join(", ")}`,
 	);
 });
 
@@ -9065,10 +9615,7 @@ test("settings.json is NOT judged before a switch has happened", async () => {
 	await t.fire("session_shutdown");
 });
 
-test("after a switch, settings.json failing to name the live model is called out", async () => {
-	// This is the live failure that started all of this: the rotation was on Codex, settings.json
-	// said Anthropic, and a bare `--no-extensions` child ran on Anthropic and was billing-refused.
-	// Nothing in Pi promises those keys are maintained, so the only defence is to look.
+test("after a switch, settings drift is diagnosed only on Pi versions that auto-persist it", async () => {
 	const t = setup({
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
 		settings: { defaultProvider: "anthropic", defaultModel: "claude-opus-4-8" },
@@ -9077,24 +9624,30 @@ test("after a switch, settings.json failing to name the live model is called out
 	await t.fire("session_start");
 	assert.equal(contractWarning(t), undefined, "nothing to judge yet");
 
-	// The session moves to another account and Pi does NOT rewrite settings.json — the exact
-	// failure being guarded against.
 	t.setCurrent("openai-codex-account-2", "gpt-5.5");
 	await t.fire("model_select", { model: { provider: "openai-codex-account-2", id: "gpt-5.5" } });
 	await t.fire("agent_start");
 
 	const warning = contractWarning(t);
-	assert.ok(warning, `expected a stale-default warning; notifies=${t.rec.notifies.join(" | ")}`);
-	assert.match(warning, /anthropic\/claude-opus-4-8/);
-	assert.match(warning, /openai-codex-account-2\/gpt-5\.5/);
-	// The consequence is the whole reason this matters — a child, not a cosmetic file.
-	assert.match(warning, /child/);
+	if (piAutoPersistsSelectedModel(PI_HOST_VERSION)) {
+		assert.ok(warning, `expected a legacy stale-default warning; notifies=${t.rec.notifies.join(" | ")}`);
+		assert.match(warning, /anthropic\/claude-opus-4-8/);
+		assert.match(warning, /openai-codex-account-2\/gpt-5\.5/);
+		assert.match(warning, /child/);
+	} else {
+		assert.equal(
+			warning,
+			undefined,
+			`Pi ${PI_HOST_VERSION} intentionally keeps model selection session-scoped`,
+		);
+	}
 
 	const logged = readDebugLog().filter((entry) => entry.kind === "pi_contract_checked");
-	assert.ok(logged.length > 0, "the black box must record the check");
-	assert.ok(
+	assert.ok(logged.length > 0, "the black box must record the session-start check");
+	assert.equal(
 		logged.at(-1)?.unpromised?.includes("settings-default-model-autowritten"),
-		"the log must name the unpromised assumption this check exists for",
+		false,
+		"documented versioned persistence must not remain on the unpromised list",
 	);
 	await t.fire("session_shutdown");
 });
@@ -9146,10 +9699,10 @@ test("with the proxy off, status says which slots an extension-free child cannot
 	await t.fire("session_shutdown");
 });
 
-test("with the proxy off, status warns that the account a bare child picks up is unusable", async () => {
-	// settings.json is how anything spawned without this extension finds the active account. When
-	// that account is unusable the child does not fail — it silently runs on another vendor. This
-	// is the shape of the real incident: rotation on Codex, consolidation child on Anthropic.
+test("with the proxy off, status warns that the saved default a bare unpinned child inherits is unusable", async () => {
+	// A child without --model inherits settings.json. Since Pi 0.84.3 this saved global choice is
+	// deliberately independent of the current session's live route; if it is unusable, the child
+	// silently falls back to another provider. Explicitly pinned broker/subagent children bypass it.
 	rmSync(MODELS, { force: true });
 	const t = setup({
 		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
@@ -9915,9 +10468,15 @@ test("an account with no balance is not asked to summarize again five seconds la
 	await t.fire("session_shutdown");
 });
 
+test("compaction recovery subscribes to Pi's public failure event, not its internal event", () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	assert.equal(t.hasHandler("session_compact_failed"), true);
+	assert.equal(t.hasHandler("compaction_end"), false);
+});
+
 test("a compaction that answers through neither callback does not switch the guard off", async () => {
-	// A cancelled compaction reports through `compaction_end`; `onComplete`/`onError` may never
-	// fire. The in-flight flag is the only thing gating the next request, so leaving it set costs
+	// A cancelled compaction reports through `session_compact_failed`; `onComplete`/`onError` may
+	// never fire. The in-flight flag is the only thing gating the next request, so leaving it set costs
 	// the session every remaining summary — the context then grows until nothing can be sent.
 	const t = setup({
 		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
@@ -9937,6 +10496,11 @@ test("a compaction that answers through neither callback does not switch the gua
 		readDebugLog().some((entry) => entry.kind === "context_guard_compaction_unanswered"),
 		"an unanswered compaction must be written off rather than blocking every later one",
 	);
+	assert.equal(
+		t.rec.sent.length,
+		1,
+		"an unanswered compaction must still resume the interrupted task",
+	);
 	await t.fire("session_shutdown");
 });
 
@@ -9954,20 +10518,53 @@ test("a failed guard compaction clears demand and backs off before retrying", as
 	await t.fire("agent_settled", {});
 	assert.equal(t.rec.compacts.length, 1, "the guard asks once");
 
-	// A real cancelled host compaction emits compaction_end with no result and may
-	// never invoke either callback supplied to ctx.compact().
-	await t.fire("compaction_end", {
+	// Pi >=0.84.3 emits this public extension event on cancellation even when the callbacks
+	// supplied to ctx.compact() never fire.
+	await t.fire("session_compact_failed", {
 		reason: "manual",
-		result: undefined,
 		aborted: true,
 		willRetry: false,
+		fromExtension: false,
 	});
+	await wait(0);
+	assert.equal(
+		t.rec.sent.length,
+		1,
+		"a cancelled guard compaction must still resume the interrupted task",
+	);
 	await t.fire("context", { messages: bigConversation(50) });
 	await t.fire("agent_settled", {});
 	assert.equal(
 		t.rec.compacts.length,
 		1,
 		"the next settled boundary must not immediately repeat a failed compaction",
+	);
+	await t.fire("session_shutdown");
+});
+
+test("an unanswered guard compaction still resumes the interrupted task", async () => {
+	const t = setup({
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { compactionWatchdogMs: 30 },
+		compactSilent: true,
+	});
+	t.ctx.model.contextWindow = 272_000;
+	t.ctx.getSystemPrompt = () => "";
+
+	await t.fire("context", { messages: bigConversation(50) });
+	t.setIdle(true);
+	await t.fire("agent_settled", {});
+	assert.equal(t.rec.compacts.length, 1, "the guard asked for a summary");
+
+	await wait(200);
+	assert.ok(
+		readDebugLog().some((entry) => entry.kind === "context_guard_compaction_unanswered"),
+		"an unanswered compaction must be written off rather than blocking every later one",
+	);
+	assert.equal(
+		t.rec.sent.length,
+		1,
+		"a hung summarizer must not leave the session parked in Working",
 	);
 	await t.fire("session_shutdown");
 });
@@ -10180,12 +10777,110 @@ test("a user message re-enables everything the governor stopped", async () => {
 	await t.fire("session_shutdown");
 });
 
-test("session_start installs the parent-owned controller provider pair", async () => {
-	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
-	await t.fire("session_start");
-	assert.deepEqual(Object.keys(t.ctx.controllerProvider).sort(), ["providerTransport", "routePreflight", "routeResolver"]);
-	assert.equal(typeof t.ctx.controllerProvider.providerTransport.stream, "function");
-	assert.equal(typeof t.ctx.controllerProvider.routePreflight, "function");
-	assert.equal(typeof t.ctx.controllerProvider.routeResolver, "function");
-	await t.fire("session_shutdown");
+test("session_start does not inject a private controller contract into Pi context", async () => {
+ const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+ await t.fire("session_start");
+ assert.equal(t.ctx.controllerProvider, undefined);
+ assert.equal(t.rec.catalogSnapshots.length, 0, "no private catalog channel to another extension");
+ await t.fire("session_shutdown");
+});
+
+test("an OAuth failure resolving after manual selection cannot revive the old continuation", async () => {
+ const t=setup({current:{provider:'anthropic',id:'claude-opus-4-8'}});
+ let release!: (value:any)=>void;
+ let entered!: ()=>void;
+ const started=new Promise<void>(resolve=>entered=resolve);
+ t.ctx.modelRegistry.authStorage.forceRefreshProvider=async()=>{entered();return new Promise(resolve=>release=resolve);};
+ const message=assistantError('anthropic','claude-opus-4-8','401 authentication token has been invalidated');
+ const pending=t.fire('message_end',{message});
+ await started;
+ await t.command('next');
+ const manual=t.ctx.model.provider+'/'+t.ctx.model.id;
+ release({status:'refreshed'});
+ await pending;
+ t.setIdle(true);await t.fire('agent_end',{messages:[message]});
+ assert.equal(t.ctx.model.provider+'/'+t.ctx.model.id,manual);
+ assert.equal(t.rec.continueCalls.length,0,'a refresh from the old chain cannot resume work under a new manual selection');
+ assert.equal(t.readState().pendingFrom,undefined);
+ await t.fire('session_shutdown');
+});
+
+test("OAuth recovery cannot restart a session after shutdown",async()=>{
+ const t=setup({current:{provider:'anthropic',id:'claude-opus-4-8'}});
+ let release!:(value:any)=>void;let entered!:()=>void;
+ const started=new Promise<void>(r=>entered=r);
+ t.ctx.modelRegistry.authStorage.forceRefreshProvider=async()=>{entered();return new Promise(r=>release=r)};
+ const message=assistantError('anthropic','claude-opus-4-8','401 authentication token has been invalidated');
+ const pending=t.fire('message_end',{message});await started;await t.fire('session_shutdown');
+ release({status:'refreshed'});await pending;t.setIdle(true);await t.fire('agent_end',{messages:[message]});
+ assert.equal(t.rec.continueCalls.length,0);assert.equal(t.rec.sent.length,0);
+});
+
+test("late failure from a previously selected managed provider cannot move the user's current route",async()=>{
+ const t=setup({current:{provider:'anthropic',id:'claude-opus-4-8'}});
+ await t.command('next');const chosen=t.ctx.model.provider+'/'+t.ctx.model.id;const count=t.rec.setModels.length;
+ await finishError(t,'anthropic','claude-opus-4-8','429 usage limit');
+ assert.equal(t.ctx.model.provider+'/'+t.ctx.model.id,chosen);assert.equal(t.rec.setModels.length,count);assert.equal(t.rec.continueCalls.length,0);
+ await t.fire('session_shutdown');
+});
+
+test("a delayed quota response cannot bench a replacement login", async () => {
+ const t = setup({ accounts: ONE_ACCOUNT, current: { provider: "anthropic", id: "claude-opus-4-8" }, config: { showUsage: true } });
+ const originalFetch = globalThis.fetch;
+ let release!: (value: Response) => void;
+ let entered!: () => void;
+ const started = new Promise<void>(resolve => entered = resolve);
+ globalThis.fetch = (async () => { entered(); return new Promise<Response>(resolve => release = resolve); }) as typeof fetch;
+ try {
+  const pending = t.command("usage refresh");
+  await started;
+  writeFileSync(AUTH, JSON.stringify({ anthropic: { type: "oauth", access: "replacement-access", refresh: "replacement-refresh" } }));
+  release(new Response(JSON.stringify({ five_hour: { utilization: 100, resets_at: new Date(Date.now() + 3600000).toISOString() } }), { status: 200 }));
+  await pending;
+  assert.equal(t.readState().exhaustedUntilByProvider?.anthropic, undefined, "quota from the old login cannot exhaust the replacement");
+  assert.equal(t.readState().usageByProvider?.anthropic, undefined);
+ } finally { globalThis.fetch = originalFetch; await t.fire("session_shutdown"); }
+});
+
+test("a new session in the same host can recover after the previous session shut down", async () => {
+ const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+ await t.fire("session_shutdown");
+ await t.fire("session_start");
+ const model = t.ctx.model;
+ const before = t.rec.setModels.length;
+ await finishError(t, model.provider, model.id, "429 usage limit");
+ assert.ok(t.rec.setModels.length > before);
+ await t.fire("session_shutdown");
+});
+
+test("concurrent OAuth recovery requests share one forced refresh", async () => {
+ const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+ let release!: (value: any) => void;
+ let entered!: () => void;
+ let calls = 0;
+ const started = new Promise<void>(resolve => entered = resolve);
+ t.ctx.modelRegistry.authStorage.forceRefreshProvider = async () => { calls++; entered(); return new Promise(resolve => release = resolve); };
+ const first = t.fire("message_end", { message: assistantError("anthropic", "claude-opus-4-8", "401 authentication token has been invalidated") });
+ await started;
+ const second = t.fire("message_end", { message: assistantError("anthropic", "claude-opus-4-8", "401 authentication token has been invalidated") });
+ await t.fire("session_shutdown");
+ assert.equal(calls, 1);
+ release({ status: "refreshed" });
+ await Promise.all([first, second]);
+ assert.equal(t.rec.continueCalls.length, 0);
+});
+
+
+test("two extension instances retain each other's newly observed account failures", async () => {
+ const a = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, config: { autoContinue: false } });
+ const b = setup({ current: { provider: "openai-codex-account-2", id: "gpt-5.5" }, config: { autoContinue: false } });
+ await finishError(a, "anthropic", "claude-opus-4-8", "429 usage limit");
+ const first = a.readState().exhaustedUntilByProvider.anthropic;
+ await finishError(b, "openai-codex-account-2", "gpt-5.5", "429 usage limit");
+ const state = b.readState();
+ assert.equal(state.exhaustedUntilByProvider.anthropic, first);
+ assert.ok(state.exhaustedUntilByProvider["openai-codex-account-2"] > Date.now());
+ await a.fire("session_shutdown");
+ assert.ok(a.readState().exhaustedUntilByProvider["openai-codex-account-2"] > Date.now());
+ await b.fire("session_shutdown");
 });

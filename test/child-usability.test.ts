@@ -178,25 +178,25 @@ test("no credential at all is reported as such, not as an auth-flow problem", ()
 // The warning that connects this to the symptom people actually hit
 // ---------------------------------------------------------------------------
 
-test("an unusable active slot is called out, because every bare child silently reroutes", () => {
-  // Pi writes the active slot into settings.json on every switch, so this is the slot a child
-  // reads. When it is unusable the child does not fail — it quietly runs on another vendor.
+test("an unusable saved global default warns only about bare unpinned children", () => {
   const warning = defaultRouteWarning("openai-codex-account-4", () =>
     classifyChildUsability(facts()),
   );
-  assert.ok(warning, "an unusable default must produce a warning");
-  assert.match(warning, /openai-codex-account-4/);
+  assert.ok(warning, "an unusable saved default must produce a warning");
+  assert.match(warning, /saved global default/);
+  assert.match(warning, /without --model/);
   assert.match(warning, /first-available provider/);
+  assert.match(warning, /broker\/subagent children are unaffected/);
 });
 
-test("a usable active slot produces no noise", () => {
+test("a usable saved default produces no noise", () => {
   const warning = defaultRouteWarning("openai-codex", () =>
     classifyChildUsability(facts({ slotId: "openai-codex", builtin: true })),
   );
   assert.equal(warning, undefined);
 });
 
-test("no active slot, or an unknown one, is silence rather than a guess", () => {
+test("no saved default, or an unknown one, is silence rather than a guess", () => {
   assert.equal(defaultRouteWarning(undefined, () => undefined), undefined);
   assert.equal(defaultRouteWarning("mystery", () => undefined), undefined);
 });

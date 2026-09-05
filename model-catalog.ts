@@ -80,7 +80,7 @@ function versionParts(id: string): number[] {
 
 function variantPower(id: string): number {
 	const lower = id.toLowerCase();
-	if (/(?:^|[-_])sol(?:$|[-_])/.test(lower)) return 100;
+	if (/(?:^|[-_])(?:astra|sol)(?:$|[-_])/.test(lower)) return 100;
 	if (/(?:^|[-_])max(?:$|[-_])/.test(lower)) return 95;
 	if (/(?:^|[-_])terra(?:$|[-_])/.test(lower)) return 75;
 	if (/(?:^|[-_])luna(?:$|[-_])/.test(lower)) return 50;
@@ -119,6 +119,9 @@ function isDatedAnthropicAlias(id: string): boolean {
 
 function anthropicTierRank(id: string): number {
 	const lower = id.toLowerCase();
+	// Fable is Anthropic's exceptional/apex line. Keep this separate from generation parsing:
+	// claude-fable-5-1 must outrank every Opus 5 variant, not merely sort as another Claude 5.
+	if (lower.includes("fable")) return 4;
 	if (lower.includes("opus")) return 3;
 	if (lower.includes("sonnet")) return 2;
 	if (lower.includes("haiku")) return 1;

@@ -5,14 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.21.3] — 2026-09-05
+
+- Provider-level payload shaping now covers independent Pi callers: Anthropic base/alias OAuth, Qwen base/alias role compatibility and Cursor session isolation. Native-wire fixtures and clean installed-Pi activation verify the boundary.
+- Keep the extensions independent through public Agent Pi APIs. No private sibling catalog/health channel or injected sibling transport is required. README links describe the optional companion and invite focused community contributions.
+
+
+- Awaited OAuth/failover recovery now respects manual selection, cancellation, shutdown and session replacement. Simultaneous recovery requests share one forced OAuth refresh within the extension instance.
+- Shared cooldown and quota state uses cross-process locking, local-change merging and unique atomic publication, preserving another window's updates and deliberate local clearing.
+- Late quota responses cannot mark a replacement login exhausted or update a closed session.
+
+- Credential removal uses Pi's locked deletion API. A modify-only host fails explicitly because `modify(() => undefined)` means no change. Clearing slots avoids intermediate rediscovery and account switching.
+- OAuth shadow/restore and last-resort refresh persistence now use Pi-compatible cross-process file locking. Shadow publication saves the real OAuth recovery copy before publishing a placeholder; restoration writes the real credential before removing its recovery copy. Interrupted-write and actual Pi AuthStorage tests cover preservation.
+- `/multi-account status` and host-capability diagnostics include the loaded source fingerprint so changed source files cannot be mistaken for code already loaded by the running process.
 
 ### Fixed
 
+- Cursor stall detection rechecks a monotonic deadline when Node wakes its timer early, preventing premature stream termination.
+
 - **Cursor streams send headers immediately and keep the client connection open during pauses.** SSE comments arrive every 15 seconds. A five-minute watchdog bounds the wait for decoded upstream progress; heartbeat messages and partial frames do not extend it. Thinking, blob requests, and checkpoints do. Stalled streams end with an explicit timeout error and cancel the bridge. `PI_CURSOR_UPSTREAM_STALL_MS` changes the interval; `0` disables the watchdog.
-- **A Cursor Grok child no longer fails before its first tool runs.** Cursor's OpenAI-compatible adapter composes tool-call identity as `${call_id}\n${item_id}`, joined by one LF rather than the `|` that OpenAI Responses uses. The native controller boundary accepted only the `|` form, so a healthy provider frame was terminated as `malformed_provider_frame (unsupported_tools)` on every attempt and no failover could recover it. Tool-call ids now accept exactly one optional `|`- or LF-joined pair, each half constrained as before and the whole still bounded to 128 characters; tool names, namespaces and route identifiers keep the stricter pattern.
-- **A reasoning-capable Codex child no longer fails on its own reasoning block.** OpenAI Responses streams one reasoning representation and may replace it with a summarized form at `output_item.done`, so requiring the final `thinking_end` content to equal the concatenated deltas rejected a well-formed stream. Reasoning still never crosses the controller boundary and remains bounded by the output cap, but its final value is no longer required to be byte-identical to the streamed deltas.
-- **Malformed-frame terminals now say which frame was rejected.** Block start/delta/end, unsupported stream events and truncated blocks carry distinct fixed reasons instead of one undifferentiated `malformed_provider_frame`, so a live failure names its own cause.
+
+- Integrate the fixes from community PR #48 (Cursor SSE keepalives and bounded upstream stalls) and PR #49 (completed-turn cancellation and resume-watch ownership), preserving the current lifecycle guards. The protobuf proxy regression uses a portable test loader on Node 24/26.
+- The legacy only-active setting no longer deletes inactive account models from Pi's shared registry. A picker preference must not make independently loaded tools unable to resolve a model.
+
+- **Pi 0.84.3+ session-scoped model selection is no longer misreported as contract drift.** Pi <=0.84.2 rewrote `settings.json` on every `setModel`; Pi 0.84.3 deliberately changed ordinary selection to session-only and persists a global default only when explicitly requested. The compatibility check is now version-gated, absent saved defaults are valid, and status describes the exact remaining risk: only a bare child launched without `--model` inherits the saved global default. Broker and subagent children are explicitly model-pinned and remain unaffected; multi-account never rewrites the global default to imitate the removed behaviour. Host-version detection reads nearby package metadata or the real CLI entrypoint without importing Pi at runtime, so isolated/degraded installs still load and an unknown host simply omits the optional legacy diagnostic.
+- **Cancelled compaction recovery now listens to Pi's public lifecycle event instead of an internal event extensions never receive.** `compaction_end` belongs to AgentSession's internal stream, so the previous handler could pass a synthetic unit test while never running in a real extension. Pi 0.84.3+ exposes `session_compact_failed`; the guard now subscribes to that event, while its own callback/watchdog remains the compatibility path on older hosts.
+- **Repeated transient failures now escape the failing route instead of parking on it.** The first 5xx/overload may retry the same provider/model once, but a second consecutive failure immediately enters the normal same-model-first, same-quality failover ladder. This coordinates with Pi's separate agent-level retry loop instead of multiplying its attempts into several extension-owned same-Kimi continuation waves. If Pi's own retry succeeds, the obsolete extension wake is cancelled so completed work cannot be replayed after the session idles.
+- **A failed or cancelled context-guard compaction no longer parks the session in Working.** The guard still backs off before asking for another summary, but it resumes the interrupted task (or flushes held input even if the host is not yet idle) instead of dropping continuation when the summarizer aborts with `This operation was aborted`.
 
 ## [1.21.2] - 2026-09-04
 
