@@ -556,7 +556,8 @@ type ProviderFailoverConfig = {
 	 */
 	onlyActive?: boolean;
 	/**
-	 * Provider ids this extension must never fail away from, even on an actionable error.
+	 * Provider ids whose foreground route this extension must not automatically change,
+	 * including preflight with stale cooldowns and actionable response errors.
 	 *
 	 * For providers we do not manage (no cooldown/refresh lifecycle of ours) that run their own
 	 * retry logic — typically a companion extension that owns retries for that provider. Failing
@@ -6914,6 +6915,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		);
 	}
 
+	function isFailoverExempt(provider: string | undefined): boolean {
+		return !!provider &&
+			!classifyProvider(provider, config.qwenProvider) &&
+			config.neverFailoverProviders.includes(provider);
+	}
+
 	async function activateFallback(
 		ctx: any,
 		sourceModel: any,
@@ -6921,6 +6928,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		reason: string,
 		options: { armContinuation?: boolean; manual?: boolean } = {},
 	) {
+		// All automatic foreground switches share this boundary. Explicit user switches
+		// remain allowed; an opted-out route belongs to Pi/the provider, not this router.
+		if (!options.manual && (isFailoverExempt(sourceModel?.provider) || isFailoverExempt(ctx.model?.provider))) return false;
 		const activationEpoch = chainEpoch;
 		const stale = () => sessionClosed || activationEpoch !== chainEpoch || (!options.manual && (userAbortedChain || ctx.signal?.aborted));
 		// A switch the user asked for is not an automatic step: it is never refused, and it clears
@@ -7032,6 +7042,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			allowFailedRouteResume?: boolean;
 		} = {},
 	) {
+		if (!options.manual && (isFailoverExempt(failedModel?.provider) || isFailoverExempt(ctx.model?.provider))) return false;
 		const switchEpoch = chainEpoch;
 		if (!automaticFailoverEnabled() || !failedModel?.provider || !failedModel?.id)
 			return false;
@@ -7287,7 +7298,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// The launch candidate is authoritative in a pi-subagents child. Let the
 		// request produce its real error so the parent runner can advance its own
 		// fallbackModels chain instead of starting a competing router here.
-		if (subagentChild) return true;
+		if (subagentChild || isFailoverExempt(ctx.model?.provider)) return true;
 		refreshDiscovery(false, ctx);
 		pruneCooldowns();
 		const intended = intendedStartupModel();
@@ -7301,7 +7312,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (!hostOwnsSessionModel && intended && !onIntended) {
 			await restoreRememberedModel(ctx);
 		}
-		if (isCurrentModelReady(ctx)) return true;
+		// Restoration can change the provider on legacy hosts. Opt-out means pass the
+		// request to Pi even when our cached cooldown/auth forecast says unavailable.
+		if (isFailoverExempt(ctx.model?.provider) || isCurrentModelReady(ctx)) return true;
 		// The user chose this account by hand and has not spent the attempt yet. Let the request
 		// through: our reason for believing it unusable is a forecast, and this is the only way
 		// anyone finds out the forecast was stale. Merely being asked about it never spends it —
@@ -8439,7 +8452,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					id: parsedFrom.modelId ?? ctx.model?.id,
 				}
 			: ctx.model;
-		if (!sourceModel?.provider || !sourceModel?.id) {
+		if (!sourceModel?.provider || !sourceModel?.id ||
+			isFailoverExempt(sourceModel.provider) || isFailoverExempt(ctx.model?.provider)) {
 			clearPendingContinuation();
 			return;
 		}
@@ -8568,7 +8582,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		else growPendingWakeBackoff();
 	}
 
-	function setPendingContinuation(ctx: any, failedModel: any, reason: string) {
+	function setPendingContinuation(
+		ctx: any,
+		failedModel: any,
+		reason: string,
+		retryDelayMs = config.transientCooldownMs,
+	) {
 		// A stop that leaves an armed resume behind in the state file is not a stop: the next
 		// session reads it, `status` reports work pending, and the user is told something is
 		// waiting to continue when nothing is.
@@ -8580,7 +8599,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			reason,
 			since: pendingResume?.since ?? Date.now(),
 			// Backoff belongs to this attempt, never shared account/quota health.
-			retryAt: isTransientPendingReason(reason) ? Date.now() + config.transientCooldownMs : undefined,
+			retryAt: isTransientPendingReason(reason) ? Date.now() + retryDelayMs : undefined,
 		};
 		logEvent("pending_resume_set", {
 			session: sessionInstanceId,
@@ -8624,7 +8643,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	// A failed Run is not a failed subscription. Retry the exact route; neither
 	// repeated 5xx nor a watchdog proves that another provider is authorized.
-	function retryTemporaryFailure(ctx: any, failedModel: { provider: string; id: string }, errorText: string) {
+	function retryTemporaryFailure(
+		ctx: any,
+		failedModel: { provider: string; id: string },
+		errorText: string,
+		retryDelayMs = config.transientCooldownMs,
+	) {
 		const cursorStall = isCursorProviderId(failedModel.provider) && isCursorUpstreamStall(errorText);
 		const failures = cursorStall ? noteCursorStallFailure(failedModel) : noteTransientFailure(failedModel);
 		if (continuationDispatchedForAgentTurn || activeResumeWatch) noteRecoveryFailure(ctx);
@@ -8648,7 +8672,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			ctx.ui.notify(`Provider retry: temporary error on ${failedModel.provider}/${failedModel.id}; automatic retry is disabled. Provider and model were NOT changed.`, "warning");
 			return;
 		}
-		setPendingContinuation(ctx, failedModel, `${TRANSIENT_PENDING_PREFIX} ${errorText.slice(0, 120)}`);
+		setPendingContinuation(
+			ctx,
+			failedModel,
+			`${TRANSIENT_PENDING_PREFIX} ${errorText.slice(0, 120)}`,
+			retryDelayMs,
+		);
 	}
 
 	// ----- cold-start input hold -------------------------------------------
@@ -11140,7 +11169,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// the summary on a healthy account instead. If that cannot finish, we CANCEL — never return
 	// undefined onto a spent account, because Pi's default has no timeout of its own.
 	safeOn("session_before_compact", async (event: any, ctx: any) => {
-		if (!automaticFailoverEnabled()) return undefined;
+		if (!automaticFailoverEnabled() || isFailoverExempt(ctx.model?.provider)) return undefined;
 		if (event?.reason === "overflow") lastContextOverflowAt = Date.now();
 		const result = await runHealthyCompaction(event, ctx);
 		if (result !== undefined) return result;
@@ -11543,9 +11572,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		if ((status === 429 || status === 402 || status === 403) && ctx.model) {
-			// Only set cooldown hints for providers this extension manages.
-			// Without this guard, a 429 on any provider pollutes cooldown state.
-			if (!classifyProvider(ctx.model.provider, config.qwenProvider)) return;
+			// Managed providers use these hints for every limit response. For unmanaged
+			// providers retain only 429 hints: they let a bodyless rate limit use the
+			// server's Retry-After instead of the six-hour quota cooldown.
+			if (
+				status !== 429 &&
+				!classifyProvider(ctx.model.provider, config.qwenProvider)
+			) return;
 			const cooldownMs = cooldownFromHeaders((event as any).headers ?? {});
 			if (cooldownMs !== undefined) {
 				responseCooldownHints.set(
@@ -11631,7 +11664,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// Opt-out for unmanaged providers that run their own retry logic (usually a companion
 			// extension owning retries for that provider). Switching accounts underneath it would
 			// fight those retries, so leave the turn alone entirely.
-			if (config.neverFailoverProviders.includes(provider)) {
+			if (isFailoverExempt(provider)) {
 				logEvent("failover_suppressed", {
 					provider,
 					model: modelId,
@@ -11641,6 +11674,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 			if (failureKind === "transient" || failureKind === "cursor_stall") {
 				retryTemporaryFailure(ctx, failedModel, errorText);
+				return;
+			}
+			// A bodyless 429 proves throttling, not account-level credit exhaustion.
+			// Retry the same route after Retry-After (or the normal transient minute)
+			// instead of poisoning the whole provider for six hours.
+			if (/^429 status code \(no body\)$/i.test(errorText.trim())) {
+				const retryDelayMs =
+					responseCooldownHints.get(provider) ?? config.transientCooldownMs;
+				responseCooldownHints.delete(provider);
+				retryTemporaryFailure(ctx, failedModel, errorText, retryDelayMs);
 				return;
 			}
 			// A quota or authorization refusal is about the ACCOUNT, not the model, and it does not
