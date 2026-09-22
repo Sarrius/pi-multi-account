@@ -429,7 +429,11 @@ function setup(opts: {
 		customMessages: [] as Array<{ message: any; options?: any }>,
 		compactionAuthFor: [] as string[],
 		thinkingLevels: [] as string[],
-		registrations: [] as Array<{ provider: string; models: number | undefined }>,
+		registrations: [] as Array<{
+			provider: string;
+			models: number | undefined;
+			baseUrl: string | undefined;
+		}>,
 		catalogSnapshots: [] as any[],
 		completionRouters: [] as Array<{
 			select: (request: any) => any;
@@ -616,12 +620,16 @@ function setup(opts: {
 				for (const handler of busEvents.get(name) ?? []) handler(payload);
 			},
 		},
-		registerProvider: (name: string, providerConfig?: { models?: any[] }) => {
+		registerProvider: (
+			name: string,
+			providerConfig?: { models?: any[]; baseUrl?: string },
+		) => {
 			known.add(name);
 			providerConfigs.set(name, providerConfig);
 			rec.registrations.push({
 				provider: name,
 				models: providerConfig?.models?.length,
+				baseUrl: providerConfig?.baseUrl,
 			});
 			if (providerConfig?.models) {
 				registeredModels.set(
@@ -7517,7 +7525,66 @@ test(
 			config: { autoDiscoverModels: true, reasoningLevel: "high" },
 		});
 
+		const registrationsBeforeStart = t.rec.registrations.length;
 		await t.fire("session_start");
+		const refreshedAliasRoutes = t.rec.registrations
+			.slice(registrationsBeforeStart)
+			.filter(
+				(registration) =>
+					registration.provider === "openai-codex-account-2" &&
+					typeof registration.baseUrl === "string",
+			);
+		assert.ok(
+			refreshedAliasRoutes.length > 0,
+			"session startup must re-register the numbered alias after catalog refresh",
+		);
+		assert.ok(
+			refreshedAliasRoutes.every((registration) =>
+				/^http:\/\/127\.0\.0\.1:\d+\/openai-codex-account-2$/.test(
+					registration.baseUrl!,
+				),
+			),
+			"every catalog-driven alias registration must preserve the loopback route",
+		);
+
+		const alias = t.providerConfigs.get("openai-codex-account-2");
+		assert.match(
+			String(alias?.baseUrl),
+			/^http:\/\/127\.0\.0\.1:\d+\/openai-codex-account-2$/,
+			"catalog refresh must preserve the account-specific loopback route",
+		);
+		assert.doesNotMatch(
+			String(alias?.baseUrl),
+			/^https:\/\/chatgpt\.com\//,
+			"the child-facing placeholder must never be sent directly to ChatGPT",
+		);
+
+		const childAuth = JSON.parse(readFileSync(AUTH, "utf8"));
+		assert.equal(
+			childAuth["openai-codex-account-2"]?.type,
+			"api_key",
+			"child-facing auth must keep the non-secret placeholder after catalog refresh",
+		);
+		const parentAuth = JSON.parse(readFileSync(PROXY_OAUTH_SIDECAR, "utf8"));
+		assert.equal(
+			parentAuth["openai-codex-account-2"]?.type,
+			"oauth",
+			"the parent-only sidecar must retain the real OAuth credential",
+		);
+
+		const published = [readFileSync(AUTH, "utf8"), readFileSync(MODELS, "utf8")].join(
+			"\n",
+		);
+		assert.equal(
+			published.includes("codex-access"),
+			false,
+			"child-facing files must not contain the OAuth access token",
+		);
+		assert.equal(
+			published.includes("codex-refresh"),
+			false,
+			"child-facing files must not contain the OAuth refresh token",
+		);
 		await t.fire("agent_start");
 		await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
 
@@ -7529,6 +7596,46 @@ test(
 		assert.ok(
 			!t.rec.thinkingLevels.includes("xhigh"),
 			"xhigh is an extreme opt-in level and must never be selected by default",
+		);
+		await t.fire("session_shutdown");
+	},
+);
+
+test(
+
+	"numbered Codex alias never receives a public route before its loopback proxy is ready",
+	{ concurrency: false },
+	async () => {
+		const t = setup({
+			accounts: {
+				anthropic: { type: "oauth", access: "anthropic-access", refresh: "anthropic-refresh" },
+				"openai-codex-account-2": {
+					type: "oauth",
+					access: "codex-access",
+					refresh: "codex-refresh",
+					accountId: "codex-account",
+				},
+			},
+			current: { provider: "anthropic", id: "claude-opus-4-8" },
+		});
+
+		const unsafeAliasRoutes = t.rec.registrations.filter(
+			(registration) =>
+				registration.provider === "openai-codex-account-2" &&
+				/^https:\/\/chatgpt\.com\//.test(registration.baseUrl ?? ""),
+		);
+		assert.deepEqual(
+			unsafeAliasRoutes,
+			[],
+			"a placeholder-backed numbered alias must not be registered to the public upstream before the proxy is ready",
+		);
+
+		await t.fire("session_start");
+		const alias = t.providerConfigs.get("openai-codex-account-2");
+		assert.match(
+			String(alias?.baseUrl),
+			/^http:\/\/127\.0\.0\.1:\d+\/openai-codex-account-2$/,
+			"proxy startup must make the numbered alias available through its loopback route",
 		);
 		await t.fire("session_shutdown");
 	},
