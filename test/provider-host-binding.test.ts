@@ -3,12 +3,15 @@ import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { DefaultResourceLoader, SettingsManager, VERSION } from "@earendil-works/pi-coding-agent";
+import * as NativeHost from "@earendil-works/pi-coding-agent";
 
 // Exercise Pi's REAL loader rather than importing the wrapper in this test process.
 // A deliberately incompatible nested package must never supply the transport.
-for (const api of ["anthropic-messages", "openai-completions"]) {
-	test(`host-bound ${api} preserves system and tools despite a stale nested pi-ai`, async () => {
+for (const bundled of [false, true]) for (const api of ["anthropic-messages", "openai-completions"]) {
+	test(`${bundled ? "bundled" : "node"} host-bound ${api} preserves system and tools despite a stale nested pi-ai`, async () => {
+		const { DefaultResourceLoader, SettingsManager, VERSION } = bundled
+			? await import(new URL("./bundle/index.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href) as typeof NativeHost
+			: NativeHost;
 		const dir = mkdtempSync(join(tmpdir(), "pmacct-host-binding-"));
 		try {
 			cpSync(new URL("../provider-payload-stream.ts", import.meta.url), join(dir, "provider-payload-stream.ts"));
