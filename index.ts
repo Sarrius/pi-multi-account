@@ -3933,10 +3933,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let subagentChild = isSubagentChildProcess();
 	let hostOwnsSessionModel = false;
 	let startupModel: { provider: string; id: string } | undefined;
-	// A live activation lease, not a permanent first-factory flag: /reload and /new
-	// must be able to acquire root ownership after the previous root shuts down.
+	// Pi-web can rehydrate the SAME session without shutting down the previous
+	// extension instance. Keep the host session ID with this process-wide lease so
+	// its replacement may take ownership; distinct in-process children stay passive.
 	const activationKey = Symbol.for("pi-multi-account:active-root-session");
-	const activations = globalThis as typeof globalThis & { [activationKey]?: object };
+	const activations = globalThis as typeof globalThis & {
+		[activationKey]?: {
+			owner: object;
+			sessionId?: string;
+			relinquish: () => void;
+			releaseProxy: () => void;
+		};
+	};
 	const activationOwner = {};
 	const explicitCliArgs = parseExplicitCliArgs();
 	const explicitCli = {
@@ -3952,6 +3960,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	const sessionInstanceId = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
 	let config = loadConfig();
 	let sessionClosed = false;
+	let proxyOwnershipTransferred = false;
 	let manualRouteOwnsErrors = false;
 	const automaticFailoverEnabled = () => config.enabled && !subagentChild && !sessionClosed;
 	debugLogEnabled = config.debugLog;
@@ -11237,10 +11246,38 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		sessionClosed = false;
 		hostOwnsSessionModel = typeof ctx?.sessionManager?.getBranch === "function";
 		if (hostOwnsSessionModel && !subagentChild) {
-			if (activations[activationKey] && activations[activationKey] !== activationOwner) {
-				subagentChild = true;
-			} else {
-				activations[activationKey] = activationOwner;
+			const sessionId = ctx.sessionManager.getSessionId?.();
+			const previous = activations[activationKey];
+			let previousProxyRelease: (() => void) | undefined;
+			if (previous && previous.owner !== activationOwner) {
+				if (typeof sessionId === "string" && sessionId.length > 0 && previous.sessionId === sessionId) {
+					previous.relinquish();
+					previousProxyRelease = previous.releaseProxy;
+				} else {
+					subagentChild = true;
+				}
+			}
+			if (!subagentChild) {
+				activations[activationKey] = {
+					owner: activationOwner,
+					sessionId: typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined,
+					relinquish: () => {
+						subagentChild = true;
+						proxyOwnershipTransferred = true;
+						sessionClosed = true;
+						chainEpoch++;
+						completionRouterContext = undefined;
+						if (pendingWakeTimer) clearTimeout(pendingWakeTimer);
+						pendingWakeTimer = undefined;
+						clearUsageStatusTimer();
+						endResumeWatch();
+						clearQueuedInputs();
+					},
+					releaseProxy: () => {
+						stopSlotProxy();
+						previousProxyRelease?.();
+					},
+				};
 			}
 		}
 		// Pi's branch and SDK launch model belong to THIS session. Shared account
@@ -11358,10 +11395,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// Kill every timer and drop the pending continuation so nothing survives the session.
 	safeOn("session_shutdown", async (_event, ctx) => {
 		chainEpoch++;
-		if (activations[activationKey] === activationOwner) delete activations[activationKey];
+		const lease = activations[activationKey];
+		const ownsLease = lease?.owner === activationOwner;
+		if (ownsLease) delete activations[activationKey];
 		sessionClosed = true;
 		completionRouterContext = undefined;
-		rememberUserModel(ctx?.model);
+		if (!proxyOwnershipTransferred) rememberUserModel(ctx?.model);
 		if (pendingWakeTimer) {
 			clearTimeout(pendingWakeTimer);
 			pendingWakeTimer = undefined;
@@ -11373,8 +11412,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		contextGuardCompactionRetryAfter = 0;
 		settleContextGuardCompaction();
 		endResumeWatch();
-		// The published routes point at this process; nothing must be left listening after it.
-		stopSlotProxy();
+		// A superseded instance leaves its canonical listener serving the new root.
+		// The final owner closes the whole chain and only then restores published auth.
+		if (ownsLease) lease.releaseProxy();
+		else if (!proxyOwnershipTransferred) stopSlotProxy();
 		watchdogAborting = false;
 		expectingInjectedContinuation = false;
 		userAbortedChain = false;

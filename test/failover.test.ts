@@ -3831,6 +3831,61 @@ test("in-process child activations are passive and root reload reacquires owners
 	} finally { await reloaded.fire("session_shutdown"); }
 });
 
+test("pi-web rehydration reacquires failover ownership for the same session", async () => {
+	const accounts: Account = {
+		"openai-codex": { type: "oauth", access: "base-fixture", refresh: "base-refresh", accountId: "base" },
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const createSession = (sessionId: string, reuseSlotProxyPort = false) => {
+		const t = setup({
+			reuseSlotProxyPort,
+			accounts,
+			current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+			hostCodexModels: ["gpt-5.6-sol"],
+			config: { autoContinue: false, preferLatestModel: false },
+		});
+		t.ctx.sessionManager = { getBranch: () => [], getSessionId: () => sessionId };
+		return t;
+	};
+	rmSync(MODELS, { force: true });
+	const original = createSession("pi-web-session-1");
+	await original.fire("session_start");
+	const publishedAuth = readFileSync(AUTH, "utf8");
+	const publishedRoute = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+	assert.equal(JSON.parse(publishedAuth)["openai-codex-account-2"].type, "api_key");
+	const resumed = createSession("pi-web-session-1", true);
+	// setup() rewrites the fixture auth file; a real pi-web rehydrate preserves it.
+	writeFileSync(AUTH, publishedAuth);
+	let originalClosed = false;
+	let different: ReturnType<typeof setup> | undefined;
+	try {
+		await resumed.fire("session_start");
+		await finishError(resumed, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.ok(
+			resumed.rec.setModels.includes("openai-codex-account-2/gpt-5.6-sol"),
+			"the rehydrated root must handle the Codex limit rather than become a passive child",
+		);
+		await finishError(original, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.deepEqual(original.rec.setModels, [], "the superseded root must not race the new owner");
+		await original.fire("session_shutdown");
+		originalClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key",
+			"the old root must not restore real OAuth into a child-facing file");
+		assert.equal(JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl, publishedRoute);
+		const response = await callProxy(publishedRoute, "/codex/responses", {});
+		assert.equal(response.status, 401, "the published loopback proxy must remain listening and reject missing auth");
+		different = createSession("pi-web-session-2", true);
+		await different.fire("session_start");
+		await finishError(different, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.deepEqual(different.rec.setModels, [], "another session remains passive while the new owner is live");
+	} finally {
+		if (different) await different.fire("session_shutdown");
+		if (!originalClosed) await original.fire("session_shutdown");
+		await resumed.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
 test("manual model selection adopts host per-model thinking defaults in auto mode", async () => {
 	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, thinkingLevel: "low" });
 	await t.fire("session_start");
