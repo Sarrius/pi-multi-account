@@ -181,6 +181,16 @@ Background attempts share the same cooldown and invalidation state as foreground
 
 `pi-subagents` marks native child processes with `PI_SUBAGENT_CHILD=1` and owns their explicit model plus `fallbackModels` chain. Concurrent in-process SDK sessions also stay passive while a root session activation is live. The root lease is released at session shutdown, so `/reload`, `/new` and replacement root sessions do not permanently lose routing ownership. This is process-local ownership, not detection based on model names or a permanent first-factory flag. In those children this extension stays loaded only for provider/account registration, OAuth request shaping, and catalog support. It deliberately does **not** restore the interactive process's remembered model, persist the child's model as a user preference, switch models, queue work, or auto-continue after errors. The original provider error is returned unchanged so the parent runner can advance its verified fallback chain without a second router competing for model identity.
 
+### Multi-session hosts (pi-web and other in-process SDK hosts)
+
+Some hosts run many independent sessions in a single long-lived process — pi-web's session daemon, or in-process SDK hosts such as Enso (one session per chat thread). Terminal Pi's in-process root-activation lease would incorrectly demote every session but the first to passive in those hosts.
+
+- Under pi-web (`PI_WEB_SESSION=1`, set by the daemon itself) every session activates as an independent root automatically.
+- Any other multi-session host opts in by exporting `PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS=1` in the host process. Set this only when each session truly owns its model; sessions that share one model identity must keep the default single-root behavior.
+- Genuine `pi-subagents` children are unaffected either way: they run in a runner process marked `PI_SUBAGENT_CHILD=1`, which always takes precedence and stays passive.
+
+Hosts should not set `PI_WEB_SESSION` themselves — other extensions read it to detect pi-web specifically.
+
 [`pi-delegation-broker`](https://github.com/Sarrius/pi-delegation-broker) is an optional companion for splitting work among isolated child agents, with task budgets, reports and verification. Each extension works independently and depends on Agent Pi, not on the other extension. Together, Multi Account manages your interactive account rotation while the broker delegates through Pi's registered providers and models. Neither installs or initializes the other.
 
 ## Staying unstuck (resilience)

@@ -354,6 +354,10 @@ function setup(opts: {
 	settings?: { defaultProvider: string; defaultModel: string };
 	/** Simulate a child process launched by pi-subagents. */
 	subagentChild?: boolean;
+	/** Simulate pi-web's session daemon, which hosts many independent root sessions in one process. */
+	piWebHost?: boolean;
+	/** Simulate any other multi-session SDK host opting in via the host-neutral switch. */
+	independentRoots?: boolean;
 	/** Simulate Pi CLI arguments before the extension is loaded. */
 	cliArgs?: string[];
 	/**
@@ -723,9 +727,17 @@ function setup(opts: {
 	(pi as any).__testCompactFn = opts.compactFn;
 
 	const previousSubagentChild = process.env.PI_SUBAGENT_CHILD;
+	const previousPiWebHost = process.env.PI_WEB_SESSION;
+	const previousIndependentRoots = process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS;
 	const previousArgv = process.argv;
 	if (opts.subagentChild) process.env.PI_SUBAGENT_CHILD = "1";
 	else delete process.env.PI_SUBAGENT_CHILD;
+	// Tests run inside whatever process launched the test runner — which may itself be a
+	// pi-web session — so the host markers must be scrubbed unless the test opts in.
+	if (opts.piWebHost) process.env.PI_WEB_SESSION = "1";
+	else delete process.env.PI_WEB_SESSION;
+	if (opts.independentRoots) process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS = "1";
+	else delete process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS;
 	process.argv = ["node", "pi", ...(opts.cliArgs ?? [])];
 	try {
 		piMultiAccount(pi);
@@ -733,6 +745,10 @@ function setup(opts: {
 		process.argv = previousArgv;
 		if (previousSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
 		else process.env.PI_SUBAGENT_CHILD = previousSubagentChild;
+		if (previousPiWebHost === undefined) delete process.env.PI_WEB_SESSION;
+		else process.env.PI_WEB_SESSION = previousPiWebHost;
+		if (previousIndependentRoots === undefined) delete process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS;
+		else process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS = previousIndependentRoots;
 	}
 
 	const fire = async (event: string, payload: any = {}) => {
@@ -3829,6 +3845,58 @@ test("in-process child activations are passive and root reload reacquires owners
 		await finishError(reloaded, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
 		assert.ok(reloaded.rec.setModels.length > 0, "reload cannot permanently disable root failover");
 	} finally { await reloaded.fire("session_shutdown"); }
+});
+
+test("pi-web hosted sibling sessions each activate: the in-process lease does not demote them", async () => {
+	// pi-web's session daemon (PI_WEB_SESSION=1) hosts many independent root sessions in one
+	// process. The terminal-Pi lease heuristic would demote every session but the first to
+	// subagent-child-passive, silently disabling failover in all of them.
+	const first = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, piWebHost: true });
+	first.ctx.sessionManager = { getBranch: () => [] };
+	await first.fire("session_start");
+	const second = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		piWebHost: true,
+		seedState: { lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" } } });
+	second.ctx.sessionManager = { getBranch: () => [] };
+	try {
+		await second.fire("session_start");
+		await finishError(second, "openai-codex", "gpt-5.6-sol", "429 rate_limit_error");
+		assert.ok(second.rec.setModels.length > 0,
+			"a pi-web sibling session is a root session: it must own its failover");
+	} finally { await second.fire("session_shutdown"); await first.fire("session_shutdown"); }
+});
+
+test("PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS lets any multi-session host opt in", async () => {
+	// Enso and other in-process SDK hosts are not pi-web: they opt in with the host-neutral
+	// switch instead of borrowing pi-web's marker (which other extensions also read).
+	const first = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, independentRoots: true });
+	first.ctx.sessionManager = { getBranch: () => [] };
+	await first.fire("session_start");
+	const second = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		independentRoots: true,
+		seedState: { lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" } } });
+	second.ctx.sessionManager = { getBranch: () => [] };
+	try {
+		await second.fire("session_start");
+		await finishError(second, "openai-codex", "gpt-5.6-sol", "429 rate_limit_error");
+		assert.ok(second.rec.setModels.length > 0,
+			"an independent-roots host session must own its failover");
+	} finally { await second.fire("session_shutdown"); await first.fire("session_shutdown"); }
+});
+
+test("a pi-subagents child process stays passive even under pi-web", async () => {
+	// The runner process inherits PI_WEB_SESSION=1 from the daemon AND sets PI_SUBAGENT_CHILD=1;
+	// the child marker must win over the pi-web lease exemption.
+	const child = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		subagentChild: true, piWebHost: true,
+		seedState: { lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" } } });
+	child.ctx.sessionManager = { getBranch: () => [] };
+	try {
+		await child.fire("session_start");
+		await finishError(child, "openai-codex", "gpt-5.6-sol", "429 rate_limit_error");
+		assert.deepEqual(child.rec.setModels, [], "parent runner alone owns child fallback");
+		assert.equal(child.rec.continueCalls.length, 0);
+	} finally { await child.fire("session_shutdown"); }
 });
 
 test("manual model selection adopts host per-model thinking defaults in auto mode", async () => {

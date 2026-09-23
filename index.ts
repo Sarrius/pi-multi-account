@@ -3938,6 +3938,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	const activationKey = Symbol.for("pi-multi-account:active-root-session");
 	const activations = globalThis as typeof globalThis & { [activationKey]?: object };
 	const activationOwner = {};
+	// pi-web's session daemon hosts many independent root sessions in ONE process. The
+	// terminal-Pi lease heuristic would demote every session but the first to passive,
+	// silently disabling failover there. Genuine subagent children under pi-web run in a
+	// runner process marked PI_SUBAGENT_CHILD, which is checked above and still wins.
+	// Any other multi-session SDK host (e.g. Enso) opts in with the host-neutral switch
+	// PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS=1 instead of borrowing pi-web's marker.
+	const multiSessionHost =
+		process.env.PI_WEB_SESSION === "1" ||
+		process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS === "1";
 	const explicitCliArgs = parseExplicitCliArgs();
 	const explicitCli = {
 		model: explicitCliArgs.model !== undefined,
@@ -11236,7 +11245,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const startEpoch = ++chainEpoch;
 		sessionClosed = false;
 		hostOwnsSessionModel = typeof ctx?.sessionManager?.getBranch === "function";
-		if (hostOwnsSessionModel && !subagentChild) {
+		if (hostOwnsSessionModel && !subagentChild && !multiSessionHost) {
 			if (activations[activationKey] && activations[activationKey] !== activationOwner) {
 				subagentChild = true;
 			} else {

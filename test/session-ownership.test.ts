@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+
+// This file pins TERMINAL-Pi semantics: a second concurrent in-process session goes passive.
+// When the test runner itself is hosted by pi-web (PI_WEB_SESSION=1) the extension would
+// correctly treat every session as an independent root, breaking these expectations — so the
+// host markers are scrubbed here, exactly like the harness in failover.test.ts does per setup().
+delete process.env.PI_WEB_SESSION;
+delete process.env.PI_SUBAGENT_CHILD;
+delete process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS;
 
 // A fresh node:test process, real Pi SDK and real event ordering; no personal auth/config.
 const dir = mkdtempSync(join(tmpdir(), "multi-account-session-sdk-"));
@@ -90,4 +98,33 @@ test("real Pi sessions keep launch models, per-model thinking and ownership thro
       ["interactive", "subagent-child-passive", "interactive"]);
     assert.deepEqual(JSON.parse(readFileSync(statePath, "utf8")).lastUserModel, remembered);
   } finally { await close(reloaded); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("pi-web hosted sibling sessions are independent roots (real SDK)", async () => {
+  // pi-web's session daemon sets PI_WEB_SESSION=1 and hosts many root sessions in one
+  // process. Every one of them must activate: the terminal-Pi in-process lease must not
+  // demote siblings to subagent-child-passive.
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "auth.json"), JSON.stringify({ "session-fixture": { type: "api_key", key: "fixture-only" } }));
+  writeFileSync(join(dir, "provider-failover.json"), JSON.stringify({
+    includeCursor: false, childProxy: false, autoDiscover: false, autoDiscoverModels: false, showUsage: false,
+  }));
+  const previousPiWebHost = process.env.PI_WEB_SESSION;
+  process.env.PI_WEB_SESSION = "1";
+  const first = await open();
+  try {
+    const second = await open(models[1]);
+    try {
+      await second.prompt("Return SESSION_OK");
+      const log = readFileSync(join(dir, "provider-failover-debug.log"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      assert.deepEqual(log.filter((event) => event.kind === "session_start").map((event) => event.mode),
+        ["interactive", "interactive"],
+        "pi-web sibling sessions are independent roots, never subagent-child-passive");
+    } finally { await close(second); }
+  } finally {
+    await close(first);
+    if (previousPiWebHost === undefined) delete process.env.PI_WEB_SESSION;
+    else process.env.PI_WEB_SESSION = previousPiWebHost;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
