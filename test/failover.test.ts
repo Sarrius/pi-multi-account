@@ -827,6 +827,58 @@ function setup(opts: {
 	};
 }
 
+test("account picker filters only its UI and uses the model's native thinking default", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, modelSetThinkingLevel: "low", thinkingLevel: "high" });
+	t.ctx.hasUI = true;
+	t.ctx.modelRegistry.getAvailable = () => t.ctx.modelRegistry.getAll();
+	const before = t.ctx.modelRegistry.getAvailable().map((m: any) => `${m.provider}/${m.id}`);
+	const provider = t.ctx.model.provider;
+	let offered: string[] = [];
+	t.ctx.ui.select = async (_title: string, choices: string[]) => { offered = choices; return choices[0]; };
+	await t.command("pick");
+	assert.deepEqual(offered, [...new Set<string>(before.filter((r: string) => r.startsWith(`${provider}/`)).map((r: string) => r.slice(provider.length + 1)))].sort());
+	assert.equal(t.ctx.model.provider, provider);
+	assert.equal(t.thinkingLevel(), "low");
+	assert.deepEqual(t.ctx.modelRegistry.getAvailable().map((m: any) => `${m.provider}/${m.id}`), before);
+});
+
+test("cancelled or stale account picker never changes the model", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, thinkingLevel: "high" });
+	t.ctx.hasUI = true;
+	t.ctx.modelRegistry.getAvailable = () => t.ctx.modelRegistry.getAll();
+	const original = t.ctx.model;
+	t.ctx.ui.select = async () => undefined;
+	await t.command("pick");
+	assert.equal(t.ctx.model, original);
+	t.ctx.ui.select = async (_title: string, choices: string[]) => { t.setIdle(false); return choices[0]; };
+	await t.command("pick");
+	assert.equal(t.ctx.model, original);
+});
+
+test("save-default persists the actual model and effort without changing other preferences", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, thinkingLevel: "low" });
+	t.ctx.cwd = AGENT_DIR;
+	writeFileSync(SETTINGS, JSON.stringify({ defaultThinkingLevel: "max", theme: "dark", modelThinkingLevels: { "other/model": "high" } }));
+	await t.command("save-default");
+	const saved = JSON.parse(readFileSync(SETTINGS, "utf8"));
+	assert.equal(saved.defaultProvider, t.ctx.model.provider);
+	assert.equal(saved.defaultModel, t.ctx.model.id);
+	assert.equal(saved.modelThinkingLevels[`${t.ctx.model.provider}/${t.ctx.model.id}`], "low");
+	assert.equal(saved.modelThinkingLevels["other/model"], "high");
+	assert.equal(saved.defaultThinkingLevel, "max");
+	assert.equal(saved.theme, "dark");
+	const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
+	const fresh = SettingsManager.create(AGENT_DIR, AGENT_DIR);
+	assert.equal(fresh.getModelThinkingLevel(fresh.getDefaultProvider()!, fresh.getDefaultModel()!), "low");
+});
+
+test("save-default refuses a busy session", async () => {
+	const t = setup({ idle: false });
+	writeFileSync(SETTINGS, "{}");
+	await t.command("save-default");
+	assert.equal(readFileSync(SETTINGS, "utf8"), "{}");
+});
+
 function wait(ms: number) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -4447,11 +4499,33 @@ test("a state-version migration still remembers the last live model", async () =
 	uninstallCursorProvider();
 });
 
-test("a logged-in kimi slot is provisioned into models.json so bare children resolve it natively", async () => {
+test("Kimi OAuth and empty spare slots never pollute the static registry", async () => {
+	for (const childProxy of [false, true]) {
+		for (const accounts of [ONE_ACCOUNT, {
+			"kimi-coding": { type: "oauth", access: "fixture-k", refresh: "fixture-r" },
+			"kimi-coding-account-2": { type: "oauth", access: "fixture-k2", refresh: "fixture-r2" },
+		}] as Account[]) {
+			writeFileSync(MODELS, JSON.stringify({ providers: { custom: { modelOverrides: { mine: { contextWindow: 1234 } } } } }));
+			const t = setup({ accounts, config: { childProxy } });
+			try {
+				for (const event of ["session_start", "rediscover", "reload"]) {
+					if (event === "session_start") await t.fire(event);
+					else await t.command(event);
+					const providers = JSON.parse(readFileSync(MODELS, "utf8")).providers;
+					assert.deepEqual(Object.keys(providers).filter(id => id.startsWith("kimi-coding")), []);
+					assert.equal(providers.custom.modelOverrides.mine.contextWindow, 1234);
+					assert.ok(t.providerConfigs.has("kimi-coding-account-2"), "login registration remains available");
+				}
+			} finally { await t.fire("session_shutdown"); }
+		}
+	}
+});
+
+test("a keyed Kimi slot is published for bare children without publishing its OAuth spare", async () => {
 	const t = setup({
 		accounts: {
-			"kimi-coding": { type: "oauth", access: "k", refresh: "kr" },
-			"kimi-coding-account-2": { type: "oauth", access: "k2", refresh: "kr2" },
+			"kimi-coding": { type: "api_key", key: "fixture-kimi-base" },
+			"kimi-coding-account-2": { type: "api_key", key: "fixture-kimi-slot" },
 		},
 	});
 	await t.fire("session_start");
@@ -4471,6 +4545,7 @@ test("a logged-in kimi slot is provisioned into models.json so bare children res
 		"Pi's models.json schema requires model objects, not string ids",
 	);
 	assert.ok(slot.models.some((model: { id: string }) => model.id === "k3"));
+	assert.equal(modelsJson.providers?.["kimi-coding-account-3"], undefined);
 	// settings.json untouched — Pi owns defaults; we only provision resolution data.
 	assert.equal(existsSync(SETTINGS), false);
 });
@@ -4490,7 +4565,7 @@ test("string model ids already in models.json are rewritten as objects", async (
 	);
 	const t = setup({
 		accounts: {
-			"kimi-coding-account-2": { type: "oauth", access: "k2", refresh: "kr2" },
+			"kimi-coding-account-2": { type: "api_key", key: "fixture-kimi-slot" },
 		},
 	});
 	await t.fire("session_start");
@@ -9044,6 +9119,28 @@ test("a month-long 'believed spent' notice admits it is a forecast, not a month-
 		/forecast|re-?check|re-?tr(y|ied)/i,
 		`and must not present a quota forecast as a settled lockout; said: ${said}`,
 	);
+});
+
+test("header quota refresh preserves identity without reviving an old availability verdict", async () => {
+	const now = Date.now();
+	const provider = "openai-codex-account-2";
+	const hash = createHash("sha256").update("c-tok-2").digest("hex").slice(0, 12);
+	const t = setup({ config: { showUsage: false, childProxy: false }, seedState: {
+		stateVersion: 5, usageByProvider: { [provider]: {
+			provider, family: "codex", credentialHash: hash, fetchedAt: now - 3600000,
+			account: "fixture@example.com", plan: "pro", serviceable: true,
+			primary: { usedPercent: 10, resetAt: now + 3600000 },
+		} },
+	} });
+	await t.fire("after_provider_response", { request: { kind: "background", model: { provider, id: "gpt-5.5" } }, status: 429,
+		headers: { "x-codex-primary-used-percent": "100", "x-codex-primary-reset-at": String((now + 3600000) / 1000) } });
+	const snapshot = t.readState().usageByProvider[provider];
+	assert.equal(snapshot.account, "fixture@example.com");
+	assert.equal(snapshot.serviceable, undefined);
+	assert.equal(snapshot.primary.usedPercent, 100);
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 usage limit reached");
+	assert.ok(!t.rec.setModels.some(target => target.startsWith(`${provider}/`)), "100% account must not be selected");
+	await t.fire("session_shutdown");
 });
 
 test("an account the provider says is usable right now is used, whatever our bookkeeping predicted", async () => {

@@ -474,6 +474,7 @@ import {
 	formatUsageCompact,
 	formatUsageDetails,
 	parseCodexUsageHeaders,
+	mergeUsageSnapshot,
 	providerUsageLabel,
 	remainingPercent,
 	usageColor,
@@ -3547,7 +3548,7 @@ const MINIMAL_ANTHROPIC_OAUTH_PROMPT = [
 ].join("\n");
 const CLAUDE_CODE_IDENTITY_PREFIX =
 	"You are Claude Code, Anthropic's official CLI";
-const CLAUDE_CODE_VERSION = "2.1.274";
+const CLAUDE_CODE_VERSION = "2.1.280";
 const BILLING_HEADER_SALT = "59cf53e54c78";
 const BILLING_HEADER_POSITIONS = [4, 7, 20] as const;
 const CLAUDE_CODE_ENTRYPOINT = "sdk-cli";
@@ -5392,6 +5393,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function storeUsage(ctx: any, snapshot: UsageSnapshot): boolean {
 		if (!usageSnapshotIsCurrent(snapshot)) return false;
+		snapshot = mergeUsageSnapshot(usageByProvider.get(snapshot.provider), snapshot);
 		usageByProvider.set(snapshot.provider, snapshot);
 		usageErrors.delete(snapshot.provider);
 		// AUTHORITATIVE PROACTIVE BENCH. If the account's own usage endpoint reports a hard block (a
@@ -6442,14 +6444,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						...new Set([...DEFAULT_KIMI_MODELS, ...hostModelIdsFor(ctx, KIMI_BASE)]),
 					];
 					registerKimiSlot(pi, id, kimiModels);
-					// Provision into Pi's native registry so an extension-free child can RESOLVE the
-					// slot by name. That is all this buys: measured 2026-08-24, such a child then
-					// fails with "No API key found", because Pi honours an OAuth credential only
-					// for a provider definition that declares the flow and a models.json entry
-					// declares none. Making the slot genuinely usable needs the Cursor pattern — a
-					// parent-owned loopback route with a non-secret placeholder — which Kimi does
-					// not have yet. See child-usability.ts.
-					if (ownsSharedChildPublication()) {
+					// An in-memory OAuth spare belongs in /login, not in models.json. Kimi has
+					// no child OAuth proxy, so only a real API-key slot is usable by a bare child.
+					if (ownsSharedChildPublication() && auth[id]?.type === "api_key" && isEntryUsable(auth[id])) {
 						provisionNativeSlot(id, {
 							api: "anthropic-messages",
 							baseUrl: KIMI_BASE_URL,
@@ -6474,8 +6471,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 */
 	function publishOwnedNativeAliases(ctx?: any): void {
 		if (!ownsSharedChildPublication()) return;
+		const auth = readAuthFile();
 		for (const id of registeredSlots) {
 			if (classifyProvider(id, config.qwenProvider) !== "kimi-coding") continue;
+			if (auth[id]?.type !== "api_key" || !isEntryUsable(auth[id])) continue;
 			const kimiModels = [
 				...new Set([...DEFAULT_KIMI_MODELS, ...hostModelIdsFor(ctx, KIMI_BASE)]),
 			];
@@ -9095,6 +9094,63 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 
+		if (command === "pick") {
+			if (!ctx.hasUI || !ctx.model || !ctx.isIdle() || subagentChild || sessionClosed) {
+				ctx.ui.notify("pi-multi-account: model picker needs an idle interactive session with an active model", "warning");
+				return;
+			}
+			const provider = ctx.model.provider;
+			const epoch = chainEpoch;
+			const models = ctx.modelRegistry.getAvailable().filter((model: any) => model.provider === provider);
+			const choices = [...new Set<string>(models.map((model: any) => model.id))].sort();
+			if (!choices.length) {
+				ctx.ui.notify(`pi-multi-account: no available models for ${provider}`, "warning");
+				return;
+			}
+			const choice = await ctx.ui.select(`Models — ${provider}`, choices);
+			if (!choice || sessionClosed || epoch !== chainEpoch || !ctx.isIdle() || ctx.model?.provider !== provider) return;
+			const model = models.find((candidate: any) => candidate.id === choice);
+			if (!model) return;
+			// Use the native manual-selection path: it applies this model's thinking default
+			// and emits model_select. Do not restore the previous model's effort as failover does.
+			if (await setModelEnsuringVisible(model, ctx)) {
+				ctx.ui.notify(`pi-multi-account: selected ${provider}/${choice}; use /multi-account save-default to keep this model and thinking for new sessions`, "info");
+			}
+			return;
+		}
+
+		if (command === "save-default") {
+			if (!ctx.model || !ctx.isIdle() || subagentChild || sessionClosed) {
+				ctx.ui.notify("pi-multi-account: save defaults from an idle parent session with an active model", "warning");
+				return;
+			}
+			const { provider, id } = ctx.model;
+			const epoch = chainEpoch;
+			const level = readThinkingLevel();
+			if (!level) {
+				ctx.ui.notify("pi-multi-account: host cannot report the active thinking level; defaults were not changed", "warning");
+				return;
+			}
+			// Public, lock-backed settings API merges only changed fields. Never persist on
+			// automatic failover or shutdown, where another session may own the defaults.
+			const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
+			if (sessionClosed || epoch !== chainEpoch || !ctx.isIdle() ||
+				ctx.model?.provider !== provider || ctx.model?.id !== id || readThinkingLevel() !== level) return;
+			const settings = SettingsManager.create(ctx.cwd, AGENT_DIR, {
+				projectTrusted: ctx.isProjectTrusted?.() ?? false,
+			});
+			settings.setDefaultModelAndProvider(provider, id);
+			settings.setModelThinkingLevel(provider, id, level);
+			await settings.flush();
+			if (settings.drainErrors().length) {
+				ctx.ui.notify("pi-multi-account: could not save all startup settings; check settings.json permissions and syntax", "error");
+				return;
+			}
+			const overridden = settings.getDefaultProvider() !== provider || settings.getDefaultModel() !== id || settings.getModelThinkingLevel(provider, id) !== level;
+			ctx.ui.notify(`pi-multi-account: saved global startup default ${provider}/${id} • ${level}.${overridden ? " Project settings override this choice in this workspace." : " Applies to new sessions; explicit CLI options and resumed sessions keep their own settings."}`, overridden ? "warning" : "info");
+			return;
+		}
+
 		if (command === "models" || command === "model") {
 			// Show, per account in the rotation, the model order this extension would use
 			// (★ = the one that would be selected). Lets you SEE whether the latest model is
@@ -9676,7 +9732,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			else clearOnlyActiveFilter();
 			ctx.ui.notify(
 				next2
-					? "pi-multi-account: only-active ON preference saved; Pi has no separate picker filter, so all registered models remain available"
+					? "pi-multi-account: only-active ON preference saved; use /multi-account pick for current-account models. The built-in /model and shared registry remain complete"
 					: "pi-multi-account: only-active OFF — every provider's models restored",
 				"info",
 			);
@@ -9910,7 +9966,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// list below, `switch` was effectively undiscoverable and `next` pressed repeatedly
 				// was the only way anyone found to reach a chosen account.
 				`Switch accounts: /multi-account best — jump straight to an account that can work now · /multi-account switch <provider> — e.g. /multi-account switch ${rotation.find((p) => p !== ctx.model?.provider) ?? rotation[0] ?? "<provider>"} · /multi-account next steps through the rotation in order`,
-				`Other commands: status | accounts [refresh] | best | priority [...] | limits [refresh] | models | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
+				`Other commands: status | accounts [refresh] | best | priority [...] | limits [refresh] | models | pick | save-default | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
 			].join("\n"),
 			"info",
 		);

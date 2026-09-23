@@ -98,7 +98,9 @@ All three names are aliases for the same command: `/multi-account`, `/provider-f
 | `add [anthropic\|codex\|kimi\|cursor\|ollama\|qwen]` | Print the next free account slot to select from the interactive `/login` picker. Subscription families (Anthropic, Codex, Kimi, Cursor) are logged in through `/login`; API-key families are filled in `auth.json`. |
 | `remove [anthropic\|codex\|kimi\|cursor\|ollama\|qwen\|<provider-id>]` | Remove an account from `auth.json` and rotation. Family name drops the highest numbered alias slot; a full provider id removes that exact slot. Aliases: `rm`, `delete`. |
 | `next` | Manually switch to the next compatible-quality fallback, deliberately overriding recorded cooldowns for one attempt. Use explicit `switch` to select a different tier. |
-| `only-active [on\|off]` | Legacy picker preference; the complete Pi model registry remains available to all clients. Pi currently has no separate picker-only filter. Alias: `focus`. |
+| `pick` | Open a model picker for the current account only. Uses native model selection and its thinking default; never removes models from the shared registry. Requires an idle interactive session. Built-in `/model` remains unchanged. |
+| `save-default` | Save the current model and effective thinking level together as global startup defaults for new sessions. Preserves other models' thinking preferences. Project overrides, explicit CLI options, and resumed-session settings still take precedence. Automatic rotation never invokes this. |
+| `only-active [on\|off]` | Legacy picker preference; use `pick` for a current-account-only menu. The complete Pi model registry remains available to all clients. Alias: `focus`. |
 | `stop` | Abort and cancel automatic failover/resume for the current task. |
 | `reset` | Clear all cooldowns, invalidations and any pending auto-resume. |
 | `reload` | Reload config from disk and re-discover accounts. |

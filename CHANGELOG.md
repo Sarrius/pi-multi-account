@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `/multi-account pick` offers only the current account's models without filtering the shared registry or changing Pi core. `/multi-account save-default` saves the current model and effective thinking level together for new sessions, without making automatic failover overwrite startup preferences.
 - Added `resumeAfterAllAccountsRecover` (default `true`) as a separate live-session liveness control. A real quota/rate-limit wall across every compatible account remains armed even when immediate `autoContinue` is disabled, polls recovery independently of footer visibility, and resumes on the first account that is genuinely usable.
 
 ### Fixed

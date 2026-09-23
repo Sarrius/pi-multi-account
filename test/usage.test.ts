@@ -13,6 +13,7 @@ import {
 	xaiUserIdFromAccessToken,
 	XAI_SUBSCRIPTION_USAGE_URL,
 	parseCodexUsageHeaders,
+	mergeUsageSnapshot,
 	parseCursorCurrentPeriodUsage,
 	parseCursorSandUsage,
 	parseOllamaMeBody,
@@ -183,6 +184,124 @@ test("parses case-insensitive Codex response headers", () => {
 	assert.equal(snapshot.primary?.windowSeconds, 18_000);
 	assert.equal(snapshot.secondary?.windowSeconds, 604_800);
 	assert.equal(formatUsageCompact(snapshot, NOW), "Codex A4 | 5h 27% left/30m | 7d 91% left/1d");
+});
+
+test("preserves Codex identity metadata when headers refresh quota windows", () => {
+	const body = parseCodexUsageBody(
+		"openai-codex-account-2",
+		{
+			plan_type: "pro",
+			email: "second@example.com",
+			rate_limit: {
+				primary_window: { used_percent: 10, reset_at: NOW / 1000 + 3600 },
+				secondary_window: { used_percent: 20, reset_at: NOW / 1000 + 86_400 },
+			},
+			credits: { has_credits: false, unlimited: false, balance: "0" },
+		},
+		NOW,
+		"same-credential",
+	);
+	const headers = parseCodexUsageHeaders(
+		"openai-codex-account-2",
+		{
+			"x-codex-primary-used-percent": "25",
+			"x-codex-primary-reset-at": String(NOW / 1000 + 7200),
+		},
+		NOW + 1_000,
+		"same-credential",
+	);
+	assert.ok(body);
+	assert.ok(headers);
+	const merged = mergeUsageSnapshot(body, headers);
+	assert.equal(merged.account, "second@example.com");
+	assert.equal(merged.plan, "pro");
+	assert.equal(merged.primary?.usedPercent, 25);
+	assert.equal(merged.secondary, undefined);
+	assert.equal(merged.credits?.hasCredits, undefined);
+	assert.equal(merged.credits?.unlimited, undefined);
+	assert.equal(merged.credits?.balance, undefined);
+	assert.deepEqual(mergeUsageSnapshot(undefined, headers), headers);
+});
+
+test("does not renew old credit evidence when headers omit it", () => {
+	const previous = parseCodexUsageBody(
+		"openai-codex-account-2",
+		{
+			plan_type: "pro",
+			rate_limit: {
+				primary_window: { used_percent: 10, reset_at: NOW / 1000 + 3600 },
+			},
+			credits: { has_credits: true, unlimited: true, balance: "0" },
+		},
+		NOW,
+		"same-credential",
+	);
+	const next = parseCodexUsageHeaders(
+		"openai-codex-account-2",
+		{
+			"x-codex-primary-used-percent": "25",
+			"x-codex-primary-reset-at": String(NOW / 1000 + 7200),
+		},
+		NOW + 1_000,
+		"same-credential",
+	);
+	assert.ok(previous);
+	assert.ok(next);
+	const merged = mergeUsageSnapshot(previous, next);
+	assert.equal(merged.credits?.hasCredits, undefined);
+	assert.equal(merged.credits?.unlimited, undefined);
+	assert.equal(merged.credits?.balance, undefined);
+});
+
+test("does not carry identity across credential changes", () => {
+	const previous = parseCodexUsageBody(
+		"openai-codex-account-2",
+		{
+			plan_type: "pro",
+			email: "old@example.com",
+			rate_limit: {
+				primary_window: { used_percent: 10, reset_at: NOW / 1000 + 3600 },
+			},
+		},
+		NOW,
+		"old-credential",
+	);
+	const next = parseCodexUsageHeaders(
+		"openai-codex-account-2",
+		{
+			"x-codex-primary-used-percent": "25",
+			"x-codex-primary-reset-at": String(NOW / 1000 + 7200),
+		},
+		NOW + 1_000,
+		"new-credential",
+	);
+	assert.ok(previous);
+	assert.ok(next);
+	assert.equal(mergeUsageSnapshot(previous, next).account, undefined);
+});
+
+test("partial usage never refreshes stale serviceability or missing quota windows", () => {
+	const provider = "openai-codex-account-2";
+	for (const allowed of [true, false]) {
+		const old = parseCodexUsageBody(provider, {
+			email: "fixture@example.com", plan_type: "pro",
+			rate_limit: { allowed, primary_window: { used_percent: 10, reset_at: NOW / 1000 + 3600 },
+				secondary_window: { used_percent: 100, reset_at: NOW / 1000 + 86400 } },
+		}, NOW - 3600000, "same");
+		const next = parseCodexUsageHeaders(provider, {
+			"x-codex-primary-used-percent": "100",
+			"x-codex-primary-reset-at": String(NOW / 1000 + 3600),
+			"x-codex-credits-has-credits": "malformed",
+		}, NOW, "same")!;
+		const merged = mergeUsageSnapshot(old, next);
+		assert.equal(merged.serviceable, undefined, "old verdict is not fresh provider evidence");
+		assert.equal(merged.secondary, undefined);
+		assert.equal(merged.primary?.usedPercent, 100);
+		assert.equal(merged.credits?.hasCredits, undefined);
+		assert.equal(merged.account, "fixture@example.com");
+		assert.equal(merged.fetchedAt, NOW);
+		assert.equal(mergeUsageSnapshot(old, { ...next, credentialHash: undefined }).account, undefined);
+	}
 });
 
 test("parses Anthropic OAuth usage windows", () => {
