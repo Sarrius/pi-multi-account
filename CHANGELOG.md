@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Asynchronous rejection of Pi's injected follow-up no longer loses the interrupted task; the selected fallback remains armed for a bounded retry.
 - `neverFailoverProviders` now also bypasses foreground startup/input preflights for unmanaged providers. Stale cooldowns, invalidations, or unknown auth no longer silently replace an opted-out route before its request. Automatic switch and pending-resume boundaries enforce the same exemption; explicit manual switches remain available.
 - A bodyless `429 status code (no body)` from an unmanaged provider now retries the same route instead of being treated as provider-wide credit exhaustion. The retry honors `Retry-After` when available and otherwise uses the transient delay, avoiding both an unrelated-provider failover and a false six-hour bench for providers such as Cerebras.
+- Numbered Codex OAuth slots no longer fall back to the public ChatGPT endpoint while the child proxy is enabled. A numbered alias is always registered against the loopback route that swaps in the real credential, from extension load onward, so the child-facing placeholder can never be sent to a provider that cannot read it (`Could not parse your authentication token`). Registration now requires an explicit route, so a future call site cannot silently reintroduce the public fallback.
 
 ## [1.22.0] — 2026-09-17
 

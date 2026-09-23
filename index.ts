@@ -3044,7 +3044,7 @@ function registerCodexSlot(
 	pi: ExtensionAPI,
 	id: string,
 	models: Array<Record<string, unknown>> = DEFAULT_CODEX_MODELS.map(codexModelDef),
-	baseUrl = "https://chatgpt.com/backend-api",
+	baseUrl: string,
 ) {
 	if (id === CODEX_BASE) return; // base provider is native until live catalog sync enriches it
 	pi.registerProvider(id, {
@@ -3061,7 +3061,7 @@ function registerCodexCatalog(
 	pi: ExtensionAPI,
 	id: string,
 	models: Array<Record<string, unknown>>,
-	baseUrl = "https://chatgpt.com/backend-api",
+	baseUrl: string,
 ) {
 	const name =
 		id === CODEX_BASE
@@ -5045,7 +5045,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				pi,
 				provider,
 				ranked,
-				numberedSlotBaseUrl(provider, "anthropic"),
+				numberedAnthropicBaseUrl(provider),
 			);
 		}
 	}
@@ -5072,7 +5072,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				pi,
 				provider,
 				merged as Array<Record<string, unknown>>,
-				numberedSlotBaseUrl(provider, "codex"),
+				numberedCodexBaseUrl(provider),
 			);
 		}
 	}
@@ -5168,7 +5168,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				models as Array<Record<string, unknown>>,
 				provider === CODEX_BASE
 					? "https://chatgpt.com/backend-api"
-					: numberedSlotBaseUrl(provider, "codex"),
+					: numberedCodexBaseUrl(provider),
 			);
 		}
 		// Also keep unauthenticated spare login slots current so a newly logged-in account can select
@@ -5180,7 +5180,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				pi,
 				provider,
 				allKnown as Array<Record<string, unknown>>,
-				numberedSlotBaseUrl(provider, "codex"),
+				numberedCodexBaseUrl(provider),
 			);
 		}
 		if (changed) persist();
@@ -6427,7 +6427,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						pi,
 						id,
 						DEFAULT_ANTHROPIC_MODELS,
-						numberedSlotBaseUrl(id, "anthropic"),
+						numberedAnthropicBaseUrl(id),
 					);
 				} else if (family === "openai-codex") {
 					const cached = codexModelCatalogByProvider.get(id)?.models;
@@ -6437,7 +6437,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						config.autoDiscoverModels && cached?.length
 							? (cached as Array<Record<string, unknown>>)
 							: undefined,
-						numberedSlotBaseUrl(id, "codex"),
+						numberedCodexBaseUrl(id),
 					);
 				} else if (family === "kimi-coding") {
 					const kimiModels = [
@@ -10683,11 +10683,37 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return proxyFamilyFor(slotId);
 	}
 
-	function numberedSlotBaseUrl(id: string, family: ProxyFamily): string {
+	//
+	// Behavior is unchanged from the single helper this replaced: a numbered Anthropic alias
+	// falls back to the public API when this process has no loopback route yet.
+	//
+	function numberedAnthropicBaseUrl(id: string): string {
 		if (typeof slotProxyPort === "number") return publishedRouteFor(slotProxyPort, id);
-		return family === "anthropic"
-			? "https://api.anthropic.com"
-			: "https://chatgpt.com/backend-api";
+		return "https://api.anthropic.com";
+	}
+
+	/**
+	 * Route for a numbered Codex alias.
+	 *
+	 * With `config.childProxy` enabled this extension publishes a child-facing placeholder into
+	 * auth.json. That placeholder is meaningless to ChatGPT: it is only ever valid against the
+	 * loopback route this extension serves, which swaps in the real OAuth credential. Sending
+	 * it to the public upstream is what produces "Could not parse your authentication token".
+	 *
+	 * So a numbered alias NEVER gets the public upstream while the proxy is enabled — not even
+	 * before the listener exists. The published route is deterministic (the canonical port is
+	 * the ownership token for it), so pointing there keeps the alias registered and resolvable
+	 * from the moment the extension loads, and whoever ends up owning that port serves the
+	 * slot. If the port is never served the request fails to connect, which is loud and
+	 * harmless — unlike a credential that reaches a provider that cannot read it.
+	 *
+	 * With the proxy disabled no placeholder is ever published: the real credential is what Pi
+	 * presents, so the public upstream is the correct destination.
+	 */
+	function numberedCodexBaseUrl(id: string): string {
+		if (typeof slotProxyPort === "number") return publishedRouteFor(slotProxyPort, id);
+		if (!config.childProxy) return "https://chatgpt.com/backend-api";
+		return publishedRouteFor(SLOT_PROXY_PORT, id);
 	}
 
 	function restoreChildFacingAuth(): void {
