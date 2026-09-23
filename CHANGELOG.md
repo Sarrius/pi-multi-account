@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- Restore `pi-ai` as an installed runtime dependency for the OAuth/catalog bridge (#75). Pi-managed npm, bun and pnpm extension installs deliberately omit peer dependencies; v1.23.0 made pi-ai peer-only, so a fresh install could not log into a numbered subscription account. Native provider transports remain bound to the running Pi host, not this bridge copy. The package check now rejects future peer-only regressions.
+
 ## [1.23.0] — 2026-09-23
 
 ### Added
