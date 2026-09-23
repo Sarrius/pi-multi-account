@@ -9,10 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `/multi-account pick` offers only the current account's models without filtering the shared registry or changing Pi core. `/multi-account save-default` saves the current model and effective thinking level together for new sessions, without making automatic failover overwrite startup preferences.
 - Added `resumeAfterAllAccountsRecover` (default `true`) as a separate live-session liveness control. A real quota/rate-limit wall across every compatible account remains armed even when immediate `autoContinue` is disabled, polls recovery independently of footer visibility, and resumes on the first account that is genuinely usable.
+
+### Compatibility
+
+- Pi and pi-ai are peer dependencies in the tested range >=0.85.1, <0.88.0. Transport imports bind to the running host rather than an extension-local 0.85 copy. CI covers Pi 0.85.1, 0.86.1 and 0.87.1; standalone SDK callers must use their installed pi-ai context format.
 
 ### Fixed
 
+- Native provider wrappers preserve system instructions and tool definitions on Pi's transcript-based context, avoiding tool-free Anthropic requests and old token-estimator crashes (#65, #66).
+- Partial Codex usage headers preserve account/plan display metadata for the same credential without refreshing old serviceability, credits or missing quota windows. Includes a routing regression for stale `serviceable: true` plus fresh 100% quota (adapted from #67, thanks @HerbertGao).
+- Kimi OAuth and unauthenticated spare slots remain in the login picker but are no longer published as unusable static aliases. Only authenticated API-key aliases are published; existing user models.json entries remain untouched (#68).
+- Updated the Anthropic billing-header Claude Code version to 2.1.280 (#64).
 - A continuation that exhausted its newly selected fallback no longer stops after one hop: the next quota-driven switch receives its own continuation.
 - Asynchronous rejection of Pi's injected follow-up no longer loses the interrupted task; the selected fallback remains armed for a bounded retry.
 - `neverFailoverProviders` now also bypasses foreground startup/input preflights for unmanaged providers. Stale cooldowns, invalidations, or unknown auth no longer silently replace an opted-out route before its request. Automatic switch and pending-resume boundaries enforce the same exemption; explicit manual switches remain available.

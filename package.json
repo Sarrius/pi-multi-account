@@ -78,10 +78,12 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.85.1"
+    "@earendil-works/pi-coding-agent": ">=0.85.1 <0.88.0",
+    "@earendil-works/pi-ai": ">=0.85.1 <0.88.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-ai": "0.85.1",
     "@types/node": "^22.20.1",
     "typescript": "^6.0.3"
   },
@@ -92,7 +94,6 @@
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.14.0",
-    "@earendil-works/pi-ai": "^0.85.1",
     "proper-lockfile": "4.1.2"
   },
   "overrides": {

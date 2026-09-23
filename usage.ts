@@ -192,6 +192,11 @@ function headerValue(headers: unknown, name: string): string | undefined {
 	return undefined;
 }
 
+function headerBoolean(headers: unknown, name: string): boolean | undefined {
+	const value = headerValue(headers, name)?.toLowerCase();
+	return value === "true" ? true : value === "false" ? false : undefined;
+}
+
 function headerWindow(headers: unknown, prefix: "primary" | "secondary"): UsageWindow | undefined {
 	const usedPercent = percent(headerValue(headers, `x-codex-${prefix}-used-percent`));
 	const resetAt = epochMs(headerValue(headers, `x-codex-${prefix}-reset-at`));
@@ -222,8 +227,8 @@ export function parseCodexUsageHeaders(
 		primary,
 		secondary,
 		credits: {
-			hasCredits: headerValue(headers, "x-codex-credits-has-credits")?.toLowerCase() === "true",
-			unlimited: headerValue(headers, "x-codex-credits-unlimited")?.toLowerCase() === "true",
+			hasCredits: headerBoolean(headers, "x-codex-credits-has-credits"),
+			unlimited: headerBoolean(headers, "x-codex-credits-unlimited"),
 			balance: headerValue(headers, "x-codex-credits-balance"),
 		},
 	};
@@ -1007,6 +1012,30 @@ export function windowLabel(
 	if (seconds >= 6 * 86_400) return "7d";
 	if (seconds >= 20 * 3_600) return "24h";
 	return `${Math.max(1, Math.round(seconds / 3_600))}h`;
+}
+
+/**
+ * Preserve display identity across partial updates for the same credential only.
+ * Never carry quota windows, credits or serviceability forward under next.fetchedAt:
+ * those fields control routing and an old verdict must not acquire a new lease merely
+ * because response headers refreshed a different field.
+ */
+export function mergeUsageSnapshot(
+	previous: UsageSnapshot | undefined,
+	next: UsageSnapshot,
+): UsageSnapshot {
+	if (
+		!previous ||
+		previous.provider !== next.provider ||
+		!next.credentialHash ||
+		previous.credentialHash !== next.credentialHash
+	)
+		return next;
+	return {
+		...next,
+		account: next.account ?? previous.account,
+		plan: next.plan ?? previous.plan,
+	};
 }
 
 export function formatUsageCompact(snapshot: UsageSnapshot, now = Date.now()): string {
