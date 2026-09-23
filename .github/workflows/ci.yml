@@ -23,3 +23,21 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm run pack:check
+
+  host-compatibility:
+    name: Pi ${{ matrix.pi }} compatibility
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pi: ["0.86.1", "0.87.1"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm install --ignore-scripts --no-save --package-lock=false @earendil-works/pi-coding-agent@${{ matrix.pi }} @earendil-works/pi-ai@${{ matrix.pi }}
+      - run: npm run check
+      - run: npm test

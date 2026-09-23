@@ -26,11 +26,17 @@ pi install npm:pi-multi-account
 
 Restart Pi or run `/reload` after installation.
 
-Requires Node 22+ and `@earendil-works/pi-ai` 0.78 or newer — it is installed automatically as a
-dependency. Both the pre-0.80 OAuth API and the 0.80+ provider-factory API are supported, so the
-extension keeps working across pi-ai upgrades. If a pi-ai it cannot adapt is ever encountered, the
-extension still loads and API-key accounts keep rotating; only subscription login is unavailable,
-and it says so at session start.
+Requires Node 22+ and Agent Pi / pi-ai **>=0.85.1, <0.88.0** (CI covers 0.85.1, 0.86.1 and 0.87.1).
+Pi core packages are peers, not a private pinned transport dependency. Provider wrappers use Pi's
+host-bound imports, so the request adapter and host context format stay together; a stale nested
+pi-ai cannot silently remove tools or system instructions. Standalone SDK callers must pair their
+context with the installed pi-ai version. The OAuth/catalog bridge remains a separate, best-effort
+compatibility layer: unavailable subscription login does not prevent API-key account discovery.
+
+Kimi OAuth spares remain available in `/login`, but are not written to `models.json`: without a
+Kimi child OAuth proxy those aliases would be resolvable but unauthenticated. Only real API-key
+Kimi slots are published for extension-free children. Existing user entries are not deleted;
+a previously generated unused Kimi alias can be removed from `models.json` and will not reappear.
 
 > **Anthropic (Claude Pro/Max) works out of the box.** OAuth login and request
 > shaping for the base `anthropic` provider and every `anthropic-account-*` alias
@@ -162,7 +168,7 @@ State (cooldowns, invalidations, recent switches, credential-free Codex model ca
 
 ### Session model ownership
 
-Requires Agent Pi **0.85.1 or newer**. Pi's session branch and explicit SDK/CLI launch model are authoritative. Shared account telemetry and legacy `lastUserModel` / `lastUserThinkingLevel` state cannot replace another pane's live selection, and shutdown does not publish that selection as a global default. Cold-catalog repair uses this session's model history once at startup. Configure Pi's saved default explicitly for new sessions.
+Requires the supported Agent Pi versions listed above. Pi's session branch and explicit SDK/CLI launch model are authoritative. Shared account telemetry and legacy `lastUserModel` / `lastUserThinkingLevel` state cannot replace another pane's live selection, and shutdown does not publish that selection as a global default. Cold-catalog repair uses this session's model history once at startup. Configure Pi's saved default explicitly for new sessions.
 
 ### Host-owned background completions
 
@@ -189,6 +195,24 @@ A failover is only useful if the agent actually keeps working afterward. These g
 ## Privacy & security
 
 `pi-multi-account` reads credentials through Pi and its account store. Account removal, OAuth refresh and parent-owned proxy publication can update the credential files under Pi-compatible locks. Proxy publication keeps a private recovery copy before replacing a credential with a loopback placeholder, and restores the real credential before deleting that copy. Credentials are never stored in rotation state. Account/token values are reduced to a short irreversible SHA-256 fingerprint for re-login detection and deduplication. Credentials are sent only to their own provider endpoints: usage/account probes (`chatgpt.com/backend-api/wham/usage`, `api.anthropic.com/api/oauth/usage`, `cli-chat-proxy.grok.com/v1/billing`, `open.bigmodel.cn/api/monitor/usage/quota/limit` (CN Coding Plan keys only), Ollama Cloud's `/api/me` and `/api/usage`, or Ollama's loopback-only `http://127.0.0.1:11434/api/me` fallback), OpenAI's authenticated `chatgpt.com/backend-api/codex/models` catalog, and provider OAuth token endpoints when Pi's authentication implementation refreshes a login (for xAI, `auth.x.ai/oauth2/token`). Cached state contains percentages, reset times, plan/credit metadata, model metadata, provider-reported account email/alias, and the fingerprint, never the token. Config, state, and the debug log are written with `0600` permissions. The debug log records only provider/model ids, decisions, and truncated reasons — token-shaped material is redacted defensively — Review logs for private project details before sharing an issue. Disable it with `"debugLog": false` or `/multi-account log off`.
+
+## Compatibility validation
+
+`npm run release:check` runs TypeScript, the full suite, and package/privacy checks. CI also runs
+the suite on the supported newer Pi versions. Host-binding tests load the real extension wrapper
+through Pi with a deliberately incompatible nested pi-ai, inspect native request bodies, and
+complete a streamed tool-call/result cycle without real credentials or provider traffic.
+
+The optional companion Goal integration is selected explicitly; it never assumes a personal path:
+
+```bash
+PI_GOAL_TEST_ENTRY=/path/to/pi-goal/dist/index.ts node --test test/goal-quota-recovery.integration.test.ts
+PI_GOAL_TEST_ENTRY=/path/to/pi-goal/dist/index.ts PI_GOAL_EXHAUST_ALL=1 node --test test/goal-quota-recovery.integration.test.ts
+PI_GOAL_TEST_ENTRY=/path/to/pi-goal/dist/index.ts PI_GOAL_EXHAUST_ALL=1 PI_GOAL_RECOVER_ALL=1 node --test test/goal-quota-recovery.integration.test.ts
+```
+
+These exercise successful multi-hop continuation, quiet all-account waiting with explicit pause,
+and resumption after quota recovery. The test is explicitly skipped when no companion path is supplied.
 
 ## License
 

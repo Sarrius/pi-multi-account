@@ -880,6 +880,38 @@ test("save-default persists the actual model and effort without changing other p
 	assert.equal(fresh.getModelThinkingLevel(fresh.getDefaultProvider()!, fresh.getDefaultModel()!), "low");
 });
 
+test("account controls cannot change a child-owned route or defaults", async () => {
+	const t = setup({ subagentChild: true });
+	t.ctx.hasUI = true;
+	t.ctx.ui.select = async () => { assert.fail("a child must not open the picker"); };
+	writeFileSync(SETTINGS, "{}");
+	await t.command("pick");
+	await t.command("save-default");
+	assert.deepEqual(t.rec.setModels, []);
+	assert.equal(readFileSync(SETTINGS, "utf8"), "{}");
+});
+
+test("save-default rechecks session ownership after loading the host settings API", async () => {
+	const t = setup({ thinkingLevel: "high" });
+	writeFileSync(SETTINGS, "{}");
+	const saving = t.command("save-default");
+	t.setIdle(false);
+	await saving;
+	assert.equal(readFileSync(SETTINGS, "utf8"), "{}");
+});
+
+test("account picker ignores a selection after another account takes ownership", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	t.ctx.hasUI = true;
+	t.ctx.modelRegistry.getAvailable = () => t.ctx.modelRegistry.getAll();
+	t.ctx.ui.select = async (_title: string, choices: string[]) => {
+		t.ctx.model = { provider: "openai-codex-account-2", id: "gpt-5.5" };
+		return choices[0];
+	};
+	await t.command("pick");
+	assert.deepEqual(t.rec.setModels, []);
+});
+
 test("save-default refuses a busy session", async () => {
 	const t = setup({ idle: false });
 	writeFileSync(SETTINGS, "{}");
@@ -3458,7 +3490,9 @@ test("public Anthropic and Qwen provider streams shape native requests without s
 			id: anthropic ? "claude-sonnet-4-6" : "qwen-max", baseUrl: "https://fixture.invalid/v1",
 			reasoning: true, input: ["text"], contextWindow: 10000, maxTokens: 100,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: { supportsDeveloperRole: true },
-		}, { systemPrompt: "fixture instructions", messages: [{ role: "user", content: "fixture task", timestamp: 0 }] }, {
+		}, Number(PI_HOST_VERSION.split(".")[1]) >= 86
+			? { messages: [{ role: "system", content: "fixture instructions", timestamp: 0 }, { role: "user", content: "fixture task", timestamp: 1 }] }
+			: { systemPrompt: "fixture instructions", messages: [{ role: "user", content: "fixture task", timestamp: 0 }] }, {
 			apiKey: anthropic ? "sk-ant-oat01-fixture" : "fixture", maxRetries: 0,
 			onPayload: async (payload: any) => ({ ...payload, callerMarker: true }),
 			fetch: async (_url: any, init: any) => {
