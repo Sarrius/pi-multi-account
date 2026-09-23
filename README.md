@@ -27,11 +27,12 @@ pi install npm:pi-multi-account
 Restart Pi or run `/reload` after installation.
 
 Requires Node 22+ and Agent Pi / pi-ai **>=0.85.1, <0.88.0** (CI covers 0.85.1, 0.86.1 and 0.87.1).
-Pi core packages are peers, not a private pinned transport dependency. Provider wrappers use Pi's
-host-bound imports, so the request adapter and host context format stay together; a stale nested
-pi-ai cannot silently remove tools or system instructions. Standalone SDK callers must pair their
-context with the installed pi-ai version. The OAuth/catalog bridge remains a separate, best-effort
-compatibility layer: unavailable subscription login does not prevent API-key account discovery.
+Pi's host package is a peer. `pi-ai` is a runtime dependency for the OAuth/catalog bridge:
+Pi-managed installs intentionally do not install extension peer dependencies, but subscription
+login must be able to locate pi-ai on disk. Provider transports still use Pi's **host-bound**
+imports, not that filesystem-resolved bridge copy, so a stale nested pi-ai cannot remove tools or
+system instructions. Standalone SDK callers must pair their context with the installed pi-ai
+version. If the OAuth bridge is unavailable, API-key account discovery still works.
 
 Kimi OAuth spares remain available in `/login`, but are not written to `models.json`: without a
 Kimi child OAuth proxy those aliases would be resolvable but unauthenticated. Only real API-key
