@@ -12073,6 +12073,49 @@ test("the proxy swaps the placeholder for the real token and never forwards the 
 	}
 });
 
+test("the proxy refreshes an expired opaque Anthropic token before forwarding", async () => {
+	// Anthropic OAuth access tokens (`sk-ant-oat…`) are not JWTs, so there is no `exp` to decode.
+	// The stored `expires` is the only expiry signal; ignoring it forwards a dead token upstream.
+	rmSync(MODELS, { force: true });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		accounts: {
+			"anthropic-account-2": {
+				type: "oauth",
+				access: "sk-ant-oat01-opaque-expired",
+				refresh: "a-ref-2",
+				expires: Date.now() - 60_000,
+			},
+		},
+	});
+	const realFetch = globalThis.fetch;
+	let refreshes = 0;
+	t.ctx.modelRegistry.authStorage.forceRefreshProvider = async (provider: string) => {
+		if (provider === "anthropic-account-2") refreshes++;
+		return { status: "refreshed" };
+	};
+	try {
+		await t.fire("session_start");
+		const slot = JSON.parse(readFileSync(MODELS, "utf8")).providers["anthropic-account-2"];
+		assert.ok(slot?.baseUrl, "the slot must be published against the running proxy");
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			})) as typeof fetch;
+
+		const response = await callProxy(slot.baseUrl, "/v1/messages", {
+			authorization: `Bearer ${slot.apiKey}`,
+		});
+		assert.equal(response.status, 200);
+		assert.equal(refreshes, 1, "an opaque token past its stored expiry must be refreshed first");
+	} finally {
+		globalThis.fetch = realFetch;
+		await t.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
 test("the proxy refuses a caller that did not come from a slot we published", async () => {
 	// A loopback port is reachable by every process on this machine, and what sits behind it is
 	// the user's subscription. Anything that cannot present the published placeholder is refused
