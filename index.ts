@@ -42,7 +42,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { createServer, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { Readable } from "node:stream";
 import { dirname, join } from "node:path";
@@ -3933,11 +3933,48 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let subagentChild = isSubagentChildProcess();
 	let hostOwnsSessionModel = false;
 	let startupModel: { provider: string; id: string } | undefined;
-	// A live activation lease, not a permanent first-factory flag: /reload and /new
-	// must be able to acquire root ownership after the previous root shuts down.
+	// Terminal Pi keeps the conservative one-root lease. A replacement of the SAME host
+	// session can reacquire it; an unrelated in-process child remains passive.
 	const activationKey = Symbol.for("pi-multi-account:active-root-session");
-	const activations = globalThis as typeof globalThis & { [activationKey]?: object };
+	const activations = globalThis as typeof globalThis & {
+		[activationKey]?: { owner: object; sessionId?: string; relinquish: () => void };
+	};
 	const activationOwner = {};
+	// Independent SDK roots share the canonical child listener and its auth/models
+	// publication by port. Their failover state remains private to each session.
+	type SharedProxyMember = {
+		sessionId?: string;
+		ready: boolean;
+		proxyEnabled: boolean;
+		prepareRoutes: (slotIds: readonly string[], port: number) => boolean;
+		relinquish: () => void;
+		handleRequest: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+	};
+	type SharedProxyCoordinator = {
+		members: Map<object, SharedProxyMember>;
+		// Every published slot stays routable when its discovering root exits first.
+		routes: Map<string, ProxyRoute>;
+		sessionOwners: Map<string, object>;
+		server?: Server;
+		starting?: Promise<number | undefined>;
+		publisher?: object;
+		handlerOwner?: object;
+	};
+	const coordinatorKey = Symbol.for("pi-multi-account:shared-slot-proxy-coordinators");
+	const coordinatorGlobals = globalThis as typeof globalThis & {
+		[coordinatorKey]?: Map<number, SharedProxyCoordinator>;
+	};
+	const coordinators = coordinatorGlobals[coordinatorKey] ??= new Map<number, SharedProxyCoordinator>();
+	let slotProxyCoordinator: SharedProxyCoordinator | undefined;
+	// pi-web's session daemon hosts many independent root sessions in ONE process. The
+	// terminal-Pi lease heuristic would demote every session but the first to passive,
+	// silently disabling failover there. Genuine subagent children under pi-web run in a
+	// runner process marked PI_SUBAGENT_CHILD, which is checked above and still wins.
+	// Any other multi-session SDK host (e.g. Enso) opts in with the host-neutral switch
+	// PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS=1 instead of borrowing pi-web's marker.
+	const multiSessionHost =
+		process.env.PI_WEB_SESSION === "1" ||
+		process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS === "1";
 	const explicitCliArgs = parseExplicitCliArgs();
 	const explicitCli = {
 		model: explicitCliArgs.model !== undefined,
@@ -3952,6 +3989,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	const sessionInstanceId = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
 	let config = loadConfig();
 	let sessionClosed = false;
+	let supersededRoot = false;
 	let manualRouteOwnsErrors = false;
 	const automaticFailoverEnabled = () => config.enabled && !subagentChild && !sessionClosed;
 	debugLogEnabled = config.debugLog;
@@ -10647,15 +10685,90 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	const SLOT_PROXY_PORT =
 		Number(process.env.PI_MULTI_ACCOUNT_SLOT_PROXY_PORT) || 41977;
 
-	/**
-	 * One process owns every child-facing file publication. With the normal proxy enabled, the
-	 * canonical listening port is the ownership token. A pi-subagents child is never an owner,
-	 * even if no parent happens to be listening when it starts.
-	 */
+	/** A shared publisher must still own the canonical socket and a live root membership. */
 	function ownsSharedChildPublication(): boolean {
 		if (subagentChild) return false;
-		if (!config.childProxy) return true;
-		return !slotProxyForeignOwner && slotProxyPort === SLOT_PROXY_PORT;
+		if (!config.childProxy) {
+			const cohort = slotProxyCoordinator ?? coordinators.get(SLOT_PROXY_PORT);
+			if (cohort?.server || [...(cohort?.members.values() ?? [])].some((member) => member.proxyEnabled)) {
+				return false;
+			}
+			return !Object.entries(readAuthFileRaw()).some(([id, entry]) =>
+				isChildFacingPlaceholderForSlot(entry, id));
+		}
+		if (sessionClosed) return false;
+		const coordinator = slotProxyCoordinator;
+		return !!coordinator && coordinator.members.has(activationOwner) &&
+			coordinator.publisher === activationOwner && coordinator.server?.listening === true &&
+			!slotProxyForeignOwner && slotProxyPort === SLOT_PROXY_PORT;
+	}
+
+	function readyProxyOwner(coordinator: SharedProxyCoordinator): object | undefined {
+		return [...coordinator.members].reverse().find(([, member]) => member.ready)?.[0];
+	}
+
+	function relinquishRoot(): void {
+		if (supersededRoot) return;
+		supersededRoot = true;
+		subagentChild = true;
+		sessionClosed = true;
+		chainEpoch++;
+		completionRouterContext = undefined;
+		if (pendingWakeTimer) clearTimeout(pendingWakeTimer);
+		pendingWakeTimer = undefined;
+		clearUsageStatusTimer();
+		endResumeWatch();
+		clearQueuedInputs();
+	}
+
+	function prepareSharedRoutes(slotIds: readonly string[], port: number): boolean {
+		if (config.childProxy || sessionClosed || subagentChild) return false;
+		slotProxyPort = port;
+		for (const id of slotIds) {
+			if (!registeredSlots.has(id)) continue;
+			const baseUrl = publishedRouteFor(port, id);
+			const family = proxyFamilyOf(id);
+			if (family === "codex") {
+				const cached = codexModelCatalogByProvider.get(id)?.models;
+				registerCodexSlot(pi, id, config.autoDiscoverModels && cached?.length
+					? (cached as Array<Record<string, unknown>>) : undefined, baseUrl);
+			} else if (family === "anthropic") {
+				registerAnthropicSlot(pi, id, DEFAULT_ANTHROPIC_MODELS, baseUrl);
+			}
+		}
+		return true;
+	}
+
+	function joinSharedProxy(sessionId?: string): void {
+		let coordinator = coordinators.get(SLOT_PROXY_PORT);
+		if (!coordinator) {
+			coordinator = { members: new Map(), routes: new Map(), sessionOwners: new Map() };
+			coordinators.set(SLOT_PROXY_PORT, coordinator);
+		}
+		slotProxyCoordinator = coordinator;
+		if (sessionId) {
+			const previousOwner = coordinator.sessionOwners.get(sessionId);
+			if (previousOwner && previousOwner !== activationOwner) {
+				coordinator.members.get(previousOwner)?.relinquish();
+				coordinator.members.delete(previousOwner);
+				if (coordinator.publisher === previousOwner) coordinator.publisher = readyProxyOwner(coordinator);
+				if (coordinator.handlerOwner === previousOwner) coordinator.handlerOwner = readyProxyOwner(coordinator);
+			}
+			coordinator.sessionOwners.set(sessionId, activationOwner);
+		}
+		coordinator.members.set(activationOwner, {
+			sessionId, ready: false, proxyEnabled: config.childProxy,
+			prepareRoutes: prepareSharedRoutes, relinquish: relinquishRoot,
+			handleRequest: handleProxyRequest,
+		});
+	}
+
+	function activateSharedProxy(): void {
+		const coordinator = slotProxyCoordinator;
+		const member = coordinator?.members.get(activationOwner);
+		if (!member || sessionClosed || subagentChild || !coordinator?.server?.listening) return;
+		member.ready = true;
+		coordinator.handlerOwner = activationOwner;
 	}
 
 	refreshDiscovery(true);
@@ -10683,12 +10796,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return proxyFamilyFor(slotId);
 	}
 
-	//
-	// Behavior is unchanged from the single helper this replaced: a numbered Anthropic alias
-	// falls back to the public API when this process has no loopback route yet.
-	//
+	// An existing child-facing placeholder (possibly published by another root)
+	// must also stay on its canonical loopback, even when this instance's proxy is off.
 	function numberedAnthropicBaseUrl(id: string): string {
 		if (typeof slotProxyPort === "number") return publishedRouteFor(slotProxyPort, id);
+		if (isChildFacingPlaceholderForSlot(readAuthFileRaw()[id], id)) return publishedRouteFor(SLOT_PROXY_PORT, id);
 		return "https://api.anthropic.com";
 	}
 
@@ -10707,12 +10819,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * slot. If the port is never served the request fails to connect, which is loud and
 	 * harmless — unlike a credential that reaches a provider that cannot read it.
 	 *
-	 * With the proxy disabled no placeholder is ever published: the real credential is what Pi
-	 * presents, so the public upstream is the correct destination.
+	 * With the proxy disabled AND no other root's placeholder published, Pi presents a real
+	 * credential and the public upstream is correct. A published placeholder always takes
+	 * the canonical loopback instead, even if this sibling disabled its own proxy.
 	 */
 	function numberedCodexBaseUrl(id: string): string {
 		if (typeof slotProxyPort === "number") return publishedRouteFor(slotProxyPort, id);
-		if (!config.childProxy) return "https://chatgpt.com/backend-api";
+		if (!config.childProxy && !isChildFacingPlaceholderForSlot(readAuthFileRaw()[id], id)) {
+			return "https://chatgpt.com/backend-api";
+		}
 		return publishedRouteFor(SLOT_PROXY_PORT, id);
 	}
 
@@ -10776,7 +10891,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const verdict = admitRequest({
 			rawUrl: req.url ?? "",
 			headers: req.headers ?? {},
-			routes: slotProxyRoutes,
+			routes: slotProxyCoordinator?.server ? slotProxyCoordinator.routes : slotProxyRoutes,
 			acceptedSecrets: presentedSecret ? [presentedSecret] : [],
 		});
 		if (!verdict.ok) {
@@ -10860,11 +10975,38 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	/** Start the loopback listener once, preferring a stable port so published routes survive. */
 	function startSlotProxy(): Promise<number | undefined> {
 		if (slotProxyPort !== undefined) return Promise.resolve(slotProxyPort);
+		const coordinator = slotProxyCoordinator;
+		if (coordinator?.server?.listening) {
+			slotProxyPort = SLOT_PROXY_PORT;
+			return Promise.resolve(SLOT_PROXY_PORT);
+		}
+		if (coordinator?.starting) {
+			return coordinator.starting.then((port) => {
+				if (port === SLOT_PROXY_PORT && coordinator.server?.listening) {
+					slotProxyPort = SLOT_PROXY_PORT;
+					return SLOT_PROXY_PORT;
+				}
+				return startSlotProxy(); // a foreign owner forced the first member onto a local port
+			});
+		}
 		if (slotProxyStarting) return slotProxyStarting;
 		slotProxyStarting = new Promise<number | undefined>((resolve) => {
 			let retriedOnEphemeralPort = false;
+			let canonicalListener = false;
 			const server = createServer((req, res) => {
-				handleProxyRequest(req, res).catch((error) => {
+				// The socket outlives its first session. Dispatch only to a live, ready root;
+				// a handoff gap must fail closed, never use a closed root's refresh context.
+				const owner = coordinator?.handlerOwner;
+				const member = owner ? coordinator?.members.get(owner) : undefined;
+				const handler = canonicalListener
+					? (member?.ready ? member.handleRequest : undefined)
+					: handleProxyRequest;
+				if (!handler) {
+					res.writeHead(503, { "content-type": "application/json" });
+					res.end(JSON.stringify({ error: { message: "slot proxy handoff in progress" } }));
+					return;
+				}
+				handler(req, res).catch((error) => {
 					logEvent("slot_proxy_handler_failed", {
 						reason: error instanceof Error ? error.message : String(error),
 					});
@@ -10926,31 +11068,93 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// retries on an ephemeral port.
 			server.once("listening", () => {
 				const address = server.address();
-				slotProxyPort = typeof address === "object" && address ? address.port : undefined;
+				const port = typeof address === "object" && address ? address.port : undefined;
+				if (port === SLOT_PROXY_PORT && coordinator) {
+					if (coordinator.members.size === 0) {
+						server.close();
+						resolve(undefined);
+						return;
+					}
+					coordinator.server = server;
+					canonicalListener = true;
+					coordinator.publisher = [...coordinator.members.keys()].at(-1);
+				}
+				// An instance replaced mid-bind must not retain a private listener.
+				if (sessionClosed && port !== SLOT_PROXY_PORT) {
+					server.close();
+					resolve(undefined);
+					return;
+				}
+				slotProxyPort = port;
 				slotProxyServer = server;
 				server.unref(); // never hold Pi open on our account
-				logEvent("slot_proxy_listening", { port: slotProxyPort });
-				resolve(slotProxyPort);
+				logEvent("slot_proxy_listening", { port });
+				resolve(port);
 			});
 			server.listen(SLOT_PROXY_PORT, "127.0.0.1");
 		}).finally(() => {
+			if (coordinator && coordinator.starting === slotProxyStarting) coordinator.starting = undefined;
+			if (coordinator && coordinator.members.size === 0 && coordinators.get(SLOT_PROXY_PORT) === coordinator) {
+				coordinators.delete(SLOT_PROXY_PORT);
+			}
 			slotProxyStarting = undefined;
 		});
+		if (coordinator) coordinator.starting = slotProxyStarting;
 		return slotProxyStarting;
 	}
 
 	function stopSlotProxy() {
-		// Capture authority before clearing the port that proves it.
-		const publishedSharedFiles = ownsSharedChildPublication();
-		try {
-			slotProxyServer?.close();
-		} catch {
-			/* closing a server that never opened is not a problem */
+		const coordinator = slotProxyCoordinator;
+		if (coordinator) {
+			const member = coordinator.members.get(activationOwner);
+			const cleanupWithoutProxy = !config.childProxy && ownsSharedChildPublication();
+			if (member) {
+				coordinator.members.delete(activationOwner);
+				if (member.sessionId && coordinator.sessionOwners.get(member.sessionId) === activationOwner) {
+					coordinator.sessionOwners.delete(member.sessionId);
+				}
+				if (coordinator.publisher === activationOwner) coordinator.publisher = readyProxyOwner(coordinator);
+				if (coordinator.handlerOwner === activationOwner) coordinator.handlerOwner = readyProxyOwner(coordinator);
+			}
+			// An ephemeral listener never owns shared files, even when another process
+			// owns the canonical port. A superseded root cannot close its old canonical
+			// listener: the coordinator still serves it for the replacement.
+			if (slotProxyServer && slotProxyServer !== coordinator.server) {
+				try { slotProxyServer.close(); } catch { /* already closed */ }
+			}
+			if (member && coordinator.members.size === 0) {
+				if (coordinator.server) {
+					// Keep the canonical port claimed until shared files are restored; another
+					// process must not publish a new placeholder during our final cleanup.
+					coordinator.routes.clear();
+					restoreChildFacingAuth();
+					unprovisionOwnLoopbacks();
+					try { coordinator.server.close(); } catch { /* already closed */ }
+					coordinator.server = undefined;
+				}
+				if (!coordinator.server && cleanupWithoutProxy) {
+					unprovisionOwnLoopbacks();
+					restoreChildFacingAuth();
+				}
+				if (!coordinator.starting && coordinators.get(SLOT_PROXY_PORT) === coordinator) {
+					coordinators.delete(SLOT_PROXY_PORT);
+				}
+				coordinator.routes.clear();
+			}
+			slotProxyCoordinator = undefined;
+			slotProxyServer = undefined;
+			slotProxyPort = undefined;
+			slotProxyRoutes.clear();
+			return;
 		}
+		// Passive children and non-coordinated (proxy-disabled) instances own only
+		// their process-local server. Preserve the pre-existing disabled-proxy cleanup.
+		const publishedSharedFiles = ownsSharedChildPublication();
+		try { slotProxyServer?.close(); } catch { /* already closed */ }
 		slotProxyServer = undefined;
 		slotProxyPort = undefined;
 		slotProxyRoutes.clear();
-		if (!publishedSharedFiles) return; // the owner's state outlives this process
+		if (!publishedSharedFiles) return;
 		restoreChildFacingAuth();
 		unprovisionOwnLoopbacks();
 	}
@@ -10962,6 +11166,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	async function publishProxiedSlots(ctx: any): Promise<void> {
 		if (!config.childProxy) return;
 		slotProxyContext = ctx ?? slotProxyContext;
+		const coordinator = slotProxyCoordinator;
+		if (coordinator?.server?.listening && coordinator.members.has(activationOwner) && !sessionClosed) {
+			coordinator.publisher = activationOwner;
+		}
 		const parent = readAuthFile();
 		const slots = [
 			...new Set([
@@ -10971,12 +11179,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		].filter((id) => proxyFamilyOf(id) !== undefined && isEntryUsable(parent[id]));
 		if (slots.length === 0) {
 			if (ownsSharedChildPublication()) {
-				restoreChildFacingAuth();
+				// Keep OAuth in the parent-only sidecar while any root is active, even
+				// when every credential is unusable. Only final shutdown restores it.
+				coordinator?.routes.clear();
 				unprovisionOwnLoopbacks();
 			}
+			slotProxyRoutes.clear();
+			activateSharedProxy();
 			return;
 		}
 		const port = await startSlotProxy();
+		if (sessionClosed) return;
+		if (port === SLOT_PROXY_PORT && coordinator?.members.has(activationOwner)) {
+			coordinator.publisher = activationOwner;
+		}
 		if (port === undefined) {
 			if (ownsSharedChildPublication()) {
 				restoreChildFacingAuth();
@@ -10992,7 +11208,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 		if (!ownsSharedChildPublication()) {
 			logEvent("slot_proxy_local_routes_ready", { port, slots });
+			activateSharedProxy();
 			return;
+		}
+		coordinator?.routes.clear();
+		for (const id of slots) {
+			const family = proxyFamilyOf(id);
+			if (family) coordinator?.routes.set(id, { slotId: id, family });
+		}
+		// A proxy-disabled root may have registered a public URL before this root
+		// started. Retire every such route synchronously BEFORE publishing a placeholder.
+		for (const [owner, member] of coordinator?.members ?? []) {
+			if (owner === activationOwner || member.proxyEnabled) continue;
+			if (!member.prepareRoutes(slots, port)) return;
+			member.ready = true;
 		}
 		shadowChildFacingAuth(slots);
 		for (const id of slots) {
@@ -11029,6 +11258,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				});
 			}
 		}
+		activateSharedProxy();
 		logEvent("slot_proxy_published", { port, slots });
 	}
 
@@ -11236,13 +11466,23 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const startEpoch = ++chainEpoch;
 		sessionClosed = false;
 		hostOwnsSessionModel = typeof ctx?.sessionManager?.getBranch === "function";
-		if (hostOwnsSessionModel && !subagentChild) {
-			if (activations[activationKey] && activations[activationKey] !== activationOwner) {
-				subagentChild = true;
-			} else {
-				activations[activationKey] = activationOwner;
+		const rawSessionId = ctx?.sessionManager?.getSessionId?.();
+		const sessionId = typeof rawSessionId === "string" && rawSessionId.length > 0
+			? rawSessionId : undefined;
+		if (hostOwnsSessionModel && !subagentChild && !multiSessionHost) {
+			const previous = activations[activationKey];
+			if (previous && previous.owner !== activationOwner) {
+				if (sessionId && previous.sessionId === sessionId && typeof previous.relinquish === "function") {
+					previous.relinquish();
+				} else {
+					subagentChild = true;
+				}
 			}
+			if (!subagentChild) activations[activationKey] = {
+				owner: activationOwner, sessionId, relinquish: relinquishRoot,
+			};
 		}
+		if (!subagentChild) joinSharedProxy(sessionId);
 		// Pi's branch and SDK launch model belong to THIS session. Shared account
 		// telemetry (or another pane's legacy preference) cannot override them.
 		startupModel = ctx?.model;
@@ -11276,11 +11516,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		slotProxyContext = ctx;
 		// Bind the loopback before discovery so numbered slots register against this process,
 		// not the real upstream, while a child-facing placeholder is in auth.json.
-		if (config.childProxy) await startSlotProxy();
+		if (config.childProxy) {
+			await startSlotProxy();
+		} else if (slotProxyCoordinator) {
+			const cohort = slotProxyCoordinator;
+			if (cohort.starting) await cohort.starting;
+			if (cohort.server?.listening) prepareSharedRoutes([...cohort.routes.keys()], SLOT_PROXY_PORT);
+		}
+		if (sessionClosed || chainEpoch !== startEpoch) return;
 		refreshDiscovery(true, ctx);
 		// Publish the OAuth slots against a route this process serves, so anything spawned
 		// without this extension can actually run on the account the rotation chose.
 		await publishProxiedSlots(ctx);
+		if (!config.childProxy) activateSharedProxy();
 		publishOwnedNativeAliases(ctx);
 		// Not installed → silent skip (refreshCursorSlots warns only on the explicit path).
 		if (config.includeCursor) await refreshCursorSlots(readAuthFile(), ctx);
@@ -11334,22 +11582,28 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// runner owns fallback selection in a child, so multiplying that fleet-wide probe across
 		// every parallel child buys nothing.
 		if (!subagentChild) await refreshRotationUsage(ctx);
+		if (sessionClosed || chainEpoch !== startEpoch) return;
 		await syncCodexModelCatalog(ctx);
+		if (sessionClosed || chainEpoch !== startEpoch) return;
 		await syncOllamaModelCatalog(ctx);
+		if (sessionClosed || chainEpoch !== startEpoch) return;
 		// Pi restores the session model BEFORE extension catalogs finish registering
 		// unless the factory returned the Cursor setup promise. Re-apply anyway: a
 		// cold catalog, a compaction inner session, or a git-reset leftover can still
 		// leave getModel(cursor, grok-4.6) empty.
 		if (cursorReady) await cursorReady.catch(() => undefined);
+		if (sessionClosed || chainEpoch !== startEpoch) return;
 		// Cursor slot catalogs changed too — same stale-hidden-copy repair as the model syncs.
 		applyOnlyActiveFilter(ctx);
 		if (!subagentChild) {
 			await restoreRememberedModel(ctx);
+			if (sessionClosed || chainEpoch !== startEpoch) return;
 			await ensureReadyModel(
 				ctx,
 				"startup preflight: selected account unavailable",
 			);
 		}
+		if (sessionClosed || chainEpoch !== startEpoch) return;
 		startUsageStatusTimer(ctx);
 	});
 
@@ -11358,10 +11612,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// Kill every timer and drop the pending continuation so nothing survives the session.
 	safeOn("session_shutdown", async (_event, ctx) => {
 		chainEpoch++;
-		if (activations[activationKey] === activationOwner) delete activations[activationKey];
+		if (activations[activationKey]?.owner === activationOwner) delete activations[activationKey];
 		sessionClosed = true;
 		completionRouterContext = undefined;
-		rememberUserModel(ctx?.model);
+		if (!supersededRoot) rememberUserModel(ctx?.model);
 		if (pendingWakeTimer) {
 			clearTimeout(pendingWakeTimer);
 			pendingWakeTimer = undefined;
@@ -11373,7 +11627,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		contextGuardCompactionRetryAfter = 0;
 		settleContextGuardCompaction();
 		endResumeWatch();
-		// The published routes point at this process; nothing must be left listening after it.
+		// Release this root's membership; only the final root closes shared child routes.
 		stopSlotProxy();
 		watchdogAborting = false;
 		expectingInjectedContinuation = false;

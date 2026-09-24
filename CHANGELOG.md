@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## Unreleased
+
+### Fixed
+
+- Sessions hosted by pi-web's session daemon no longer deactivate after the first one. The in-process root-activation lease (designed for terminal Pi's `/reload` and in-process children) misclassified every later pi-web session as a subagent child, leaving it in `subagent-child-passive` mode with failover, preflight and auto-continue silently disabled. When `PI_WEB_SESSION=1` is present, each session now activates as an independent root; any other multi-session SDK host can opt in with the host-neutral `PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS=1`. Genuine pi-subagents children still run in a runner process marked `PI_SUBAGENT_CHILD=1` and remain passive.
+- In-process independent roots and same-session rehydrates now share a process-scoped canonical child proxy and publication lifetime. A sibling can exit in either order without restoring real OAuth into child-facing `auth.json` or orphaning `models.json` loopback routes; only the final root closes the listener and restores auth. A root whose proxy is disabled still retires public numbered aliases before another root publishes placeholders, and keeps that listener alive through handoff. The surviving root handles newly discovered slots, while explicit `PI_SUBAGENT_CHILD` remains passive.
 
 ## [1.23.1] — 2026-09-23
 
