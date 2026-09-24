@@ -1,7 +1,5 @@
 # Shared Child Proxy Coordinator Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Keep numbered OAuth child-facing auth/models and the canonical loopback listener alive until the final in-process root closes, while preserving failover for independent roots and same-session rehydration.
 
 **Architecture:** A process-scoped coordinator keyed by canonical proxy port manages live root memberships and a single canonical listener/publication. Session-local failover remains session-local. Rehydration supersedes same-session failover ownership without counting the old instance twice. Proxy requests use the current active member's route/refresh context; root shutdown only releases the shared publication after the last member leaves. Foreign-process listeners remain non-publishers; child processes cannot join. Avoid chained per-instance `releaseProxy` callbacks and leaking real OAuth to child-facing auth during handoff.
