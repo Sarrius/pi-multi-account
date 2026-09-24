@@ -3884,6 +3884,299 @@ test("PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS lets any multi-session host opt in", as
 	} finally { await second.fire("session_shutdown"); await first.fire("session_shutdown"); }
 });
 
+test("shared proxy survives either independent-root shutdown order", async () => {
+	for (const firstToClose of [true, false]) {
+		rmSync(MODELS, { force: true });
+		const accounts: Account = {
+			"openai-codex": { type: "oauth", access: "base-fixture", refresh: "base-refresh", accountId: "base" },
+			"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+		};
+		const first = setup({ accounts, piWebHost: true, current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+			config: { autoContinue: false, preferLatestModel: false } });
+		first.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "web-root-a" };
+		await first.fire("session_start");
+		const publishedRoute = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key");
+		const second = setup({ reuseSlotProxyPort: true, accounts: {
+			...JSON.parse(readFileSync(AUTH, "utf8")),
+			"openai-codex-account-3": { type: "oauth", access: "third-fixture", refresh: "third-refresh", accountId: "third" },
+		},
+			piWebHost: true, current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+			config: { autoContinue: false, preferLatestModel: false } });
+		second.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "web-root-b" };
+		let firstClosed = false;
+		let secondClosed = false;
+		try {
+			await second.fire("session_start");
+			const extraRoute = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-3"].baseUrl;
+			assert.equal(new URL(extraRoute).port, new URL(publishedRoute).port);
+			await (firstToClose ? first : second).fire("session_shutdown");
+			if (firstToClose) firstClosed = true;
+			else secondClosed = true;
+			assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key",
+				"a live sibling must keep OAuth behind the child-facing placeholder");
+			assert.equal(JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl, publishedRoute);
+			assert.equal((await callProxy(publishedRoute, "/codex/responses", {})).status, 401,
+				"the canonical listener must still reject unauthenticated children");
+			assert.equal((await callProxy(extraRoute, "/codex/responses", {})).status, 401,
+				`a slot introduced by the sibling must remain routable when ${firstToClose ? "first" : "second"} exits first`);
+			const thirdSlot = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-3"];
+			const realFetch = globalThis.fetch;
+			try {
+				globalThis.fetch = (async (_input: any, init: any) => {
+					assert.equal(init.headers.authorization, "Bearer third-fixture",
+						"the surviving root must still retrieve the sibling's credential from the sidecar");
+					return new Response("{}", { status: 200 });
+				}) as typeof fetch;
+				assert.equal((await callProxy(extraRoute, "/codex/responses", {
+					authorization: `Bearer ${thirdSlot.apiKey}`,
+				})).status, 200);
+			} finally { globalThis.fetch = realFetch; }
+			await (firstToClose ? second : first).fire("session_shutdown");
+			if (firstToClose) secondClosed = true;
+			else firstClosed = true;
+			assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "oauth",
+				"only the final root restores the child-facing auth file");
+			assert.equal(JSON.parse(readFileSync(MODELS, "utf8")).providers?.["openai-codex-account-2"], undefined);
+			await assert.rejects(callProxy(publishedRoute, "/codex/responses", {}),
+				(error: any) => error?.code === "ECONNREFUSED" || error?.code === "ECONNRESET",
+				"the final root must close the canonical listener");
+		} finally {
+			if (!secondClosed) await second.fire("session_shutdown");
+			if (!firstClosed) await first.fire("session_shutdown");
+			rmSync(MODELS, { force: true });
+		}
+	}
+});
+
+test("same-session rehydrate takes over failover without releasing shared proxy", async () => {
+	rmSync(MODELS, { force: true });
+	const accounts: Account = {
+		"openai-codex": { type: "oauth", access: "base-fixture", refresh: "base-refresh", accountId: "base" },
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const original = setup({ accounts, piWebHost: true, current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		hostCodexModels: ["gpt-5.6-sol"], config: { autoContinue: false, preferLatestModel: false } });
+	original.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "restored-session" };
+	await original.fire("session_start");
+	const publishedRoute = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+	const replacement = setup({ reuseSlotProxyPort: true, accounts: JSON.parse(readFileSync(AUTH, "utf8")),
+		piWebHost: true, current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		hostCodexModels: ["gpt-5.6-sol"], config: { autoContinue: false, preferLatestModel: false } });
+	replacement.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "restored-session" };
+	let originalClosed = false;
+	try {
+		await replacement.fire("session_start");
+		await finishError(replacement, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.ok(replacement.rec.setModels.includes("openai-codex-account-2/gpt-5.6-sol"));
+		await finishError(original, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.deepEqual(original.rec.setModels, [], "superseded instance must not switch the same session again");
+		await original.fire("session_shutdown");
+		originalClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key");
+		assert.equal((await callProxy(publishedRoute, "/codex/responses", {})).status, 401);
+	} finally {
+		if (!originalClosed) await original.fire("session_shutdown");
+		await replacement.fire("session_shutdown");
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "oauth");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("terminal Pi rehydrates the same session without admitting a different child", async () => {
+	rmSync(MODELS, { force: true });
+	const accounts: Account = {
+		"openai-codex": { type: "oauth", access: "base-fixture", refresh: "base-refresh", accountId: "base" },
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const makeSession = (sessionId: string, reuseSlotProxyPort = false) => {
+		const t = setup({ accounts: reuseSlotProxyPort ? JSON.parse(readFileSync(AUTH, "utf8")) : accounts,
+			reuseSlotProxyPort, current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+			hostCodexModels: ["gpt-5.6-sol"], config: { autoContinue: false, preferLatestModel: false } });
+		t.ctx.sessionManager = { getBranch: () => [], getSessionId: () => sessionId };
+		return t;
+	};
+	const first = makeSession("terminal-session");
+	await first.fire("session_start");
+	const publishedRoute = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+	const resumed = makeSession("terminal-session", true);
+	let firstClosed = false;
+	let different: ReturnType<typeof setup> | undefined;
+	try {
+		await resumed.fire("session_start");
+		await finishError(resumed, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.ok(resumed.rec.setModels.includes("openai-codex-account-2/gpt-5.6-sol"));
+		await finishError(first, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.deepEqual(first.rec.setModels, []);
+		await first.fire("session_shutdown");
+		firstClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key");
+		assert.equal((await callProxy(publishedRoute, "/codex/responses", {})).status, 401);
+		different = makeSession("different-child", true);
+		await different.fire("session_start");
+		await finishError(different, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.deepEqual(different.rec.setModels, [], "a distinct in-process terminal child stays passive");
+	} finally {
+		if (different) await different.fire("session_shutdown");
+		if (!firstClosed) await first.fire("session_shutdown");
+		await resumed.fire("session_shutdown");
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "oauth");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("overlapping independent-root startup and shutdown retains the canonical proxy", async () => {
+	rmSync(MODELS, { force: true });
+	const accounts: Account = {
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const first = setup({ accounts, piWebHost: true, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	first.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "overlap-first" };
+	const firstStart = first.fire("session_start");
+	const second = setup({ reuseSlotProxyPort: true, accounts: JSON.parse(readFileSync(AUTH, "utf8")),
+		piWebHost: true, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	second.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "overlap-second" };
+	let firstClosed = false;
+	try {
+		const secondStart = second.fire("session_start");
+		await first.fire("session_shutdown");
+		firstClosed = true;
+		await Promise.all([firstStart, secondStart]);
+		const route = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+		assert.equal(new URL(route).port, String(currentSlotProxyPort()));
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key");
+		assert.equal((await callProxy(route, "/codex/responses", {})).status, 401);
+	} finally {
+		if (!firstClosed) await first.fire("session_shutdown");
+		await second.fire("session_shutdown");
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "oauth");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("a proxy-disabled sibling cannot expose or unpublish another root's placeholders", async () => {
+	rmSync(MODELS, { force: true });
+	const accounts: Account = {
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const owner = setup({ accounts, piWebHost: true, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	owner.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "proxy-owner" };
+	await owner.fire("session_start");
+	const route = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+	const disabled = setup({ reuseSlotProxyPort: true, accounts: JSON.parse(readFileSync(AUTH, "utf8")),
+		piWebHost: true, config: { childProxy: false }, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	disabled.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "proxy-disabled-sibling" };
+	let disabledClosed = false;
+	try {
+		await disabled.fire("session_start");
+		assert.equal(disabled.providerConfigs.get("openai-codex-account-2")?.baseUrl, route,
+			"the sibling must not send a published placeholder to public ChatGPT");
+		await disabled.fire("session_shutdown");
+		disabledClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key");
+		assert.equal(JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl, route);
+		assert.equal((await callProxy(route, "/codex/responses", {})).status, 401);
+	} finally {
+		if (!disabledClosed) await disabled.fire("session_shutdown");
+		await owner.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("a preloaded proxy-disabled sibling repairs a public alias after another root shadows it", async () => {
+	rmSync(MODELS, { force: true });
+	const accounts: Account = {
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const owner = setup({ accounts, piWebHost: true, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	owner.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "late-owner" };
+	const disabled = setup({ reuseSlotProxyPort: true, accounts, piWebHost: true,
+		config: { childProxy: false }, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	disabled.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "preloaded-disabled" };
+	assert.equal(disabled.providerConfigs.get("openai-codex-account-2")?.baseUrl, "https://chatgpt.com/backend-api",
+		"before publication, a proxy-disabled root can register the real OAuth route");
+	let ownerClosed = false;
+	let disabledClosed = false;
+	try {
+		await owner.fire("session_start");
+		const route = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+		await disabled.fire("session_start");
+		assert.equal(disabled.providerConfigs.get("openai-codex-account-2")?.baseUrl, route,
+			"startup must re-register the alias rather than send a new placeholder to ChatGPT");
+		await disabled.fire("session_shutdown");
+		disabledClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key");
+		await owner.fire("session_shutdown");
+		ownerClosed = true;
+	} finally {
+		if (!disabledClosed) await disabled.fire("session_shutdown");
+		if (!ownerClosed) await owner.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("an already-running proxy-disabled root switches its alias before a sibling publishes placeholders", async () => {
+	rmSync(MODELS, { force: true });
+	const accounts: Account = {
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const enabled = setup({ accounts, piWebHost: true, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	enabled.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "later-publisher" };
+	const disabled = setup({ reuseSlotProxyPort: true, accounts, piWebHost: true,
+		config: { childProxy: false }, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	disabled.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "already-running-disabled" };
+	await disabled.fire("session_start");
+	assert.equal(disabled.providerConfigs.get("openai-codex-account-2")?.baseUrl, "https://chatgpt.com/backend-api");
+	let enabledClosed = false;
+	try {
+		await enabled.fire("session_start");
+		const route = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+		assert.equal(disabled.providerConfigs.get("openai-codex-account-2")?.baseUrl, route,
+			"the public alias must be retired before any child-facing placeholder is published");
+		await enabled.fire("session_shutdown");
+		enabledClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "api_key",
+			"the still-running disabled root must keep the canonical route alive");
+		assert.equal((await callProxy(route, "/codex/responses", {})).status, 401);
+	} finally {
+		if (!enabledClosed) await enabled.fire("session_shutdown");
+		await disabled.fire("session_shutdown");
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "oauth");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("unusable slots never restore hidden OAuth before the last root exits", async () => {
+	rmSync(MODELS, { force: true });
+	const slot = "openai-codex-account-2";
+	const first = setup({ piWebHost: true, accounts: {
+		[slot]: { type: "oauth", access: "expired-fixture", refresh: "fixture-refresh", accountId: "second" },
+	}, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	first.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "expired-first" };
+	await first.fire("session_start");
+	const sidecar = JSON.parse(readFileSync(PROXY_OAUTH_SIDECAR, "utf8"));
+	writeFileSync(PROXY_OAUTH_SIDECAR, JSON.stringify({
+		...sidecar, [slot]: { ...sidecar[slot], refresh: undefined, expires: 1 },
+	}));
+	const second = setup({ reuseSlotProxyPort: true, piWebHost: true,
+		accounts: JSON.parse(readFileSync(AUTH, "utf8")),
+		current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	second.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "expired-second" };
+	let firstClosed = false;
+	try {
+		await second.fire("session_start");
+		await first.fire("session_shutdown");
+		firstClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))[slot].type, "api_key",
+			"a still-active root may not expose unusable real OAuth in child-facing auth");
+	} finally {
+		if (!firstClosed) await first.fire("session_shutdown");
+		await second.fire("session_shutdown");
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))[slot].type, "oauth");
+		rmSync(MODELS, { force: true });
+	}
+});
+
 test("a pi-subagents child process stays passive even under pi-web", async () => {
 	// The runner process inherits PI_WEB_SESSION=1 from the daemon AND sets PI_SUBAGENT_CHILD=1;
 	// the child marker must win over the pi-web lease exemption.
@@ -3897,6 +4190,40 @@ test("a pi-subagents child process stays passive even under pi-web", async () =>
 		assert.deepEqual(child.rec.setModels, [], "parent runner alone owns child fallback");
 		assert.equal(child.rec.continueCalls.length, 0);
 	} finally { await child.fire("session_shutdown"); }
+});
+
+test("explicit child marker cannot join independent host's proxy membership", async () => {
+	rmSync(MODELS, { force: true });
+	const accounts: Account = {
+		"openai-codex": { type: "oauth", access: "base-fixture", refresh: "base-refresh", accountId: "base" },
+		"openai-codex-account-2": { type: "oauth", access: "alias-fixture", refresh: "alias-refresh", accountId: "second" },
+	};
+	const root = setup({ accounts, independentRoots: true, current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { autoContinue: false, preferLatestModel: false } });
+	root.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "sdk-root" };
+	await root.fire("session_start");
+	const publishedRoute = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl;
+	const child = setup({ reuseSlotProxyPort: true, accounts: JSON.parse(readFileSync(AUTH, "utf8")),
+		independentRoots: true, subagentChild: true, current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { autoContinue: false, preferLatestModel: false } });
+	child.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "sdk-child" };
+	let rootClosed = false;
+	try {
+		await child.fire("session_start");
+		await finishError(child, "openai-codex", "gpt-5.6-sol", "Codex error: The usage limit has been reached");
+		assert.deepEqual(child.rec.setModels, [], "PI_SUBAGENT_CHILD takes precedence over the independent-root opt-in");
+		await root.fire("session_shutdown");
+		rootClosed = true;
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"].type, "oauth",
+			"a passive child cannot keep the parent's publication alive");
+		assert.equal(JSON.parse(readFileSync(MODELS, "utf8")).providers?.["openai-codex-account-2"], undefined);
+		await assert.rejects(callProxy(publishedRoute, "/codex/responses", {}),
+			(error: any) => error?.code === "ECONNREFUSED" || error?.code === "ECONNRESET");
+	} finally {
+		await child.fire("session_shutdown");
+		if (!rootClosed) await root.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
 });
 
 test("manual model selection adopts host per-model thinking defaults in auto mode", async () => {
