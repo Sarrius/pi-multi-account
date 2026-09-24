@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [Unreleased]
+
+### Fixed
+
+- The loopback proxy now refreshes an expired Anthropic OAuth token before forwarding. Anthropic access tokens (`sk-ant-oat…`) are opaque, so the JWT `exp` check never fired and a numbered slot's dead token went upstream until Pi refreshed it some other way. The proxy now falls back to the stored `expires`, the same signal `isEntryUsable` already used; both share one `oauthExpiryMs` helper.
+
 ## [1.23.2] — 2026-09-24
 
 ### Fixed

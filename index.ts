@@ -2371,6 +2371,17 @@ function jwtExpMs(token: string): number | undefined {
 		: undefined;
 }
 
+/**
+ * When an OAuth access token expires. Anthropic's `sk-ant-oat…` tokens are opaque, so the JWT
+ * `exp` is absent and the stored `expires` (seconds or milliseconds) is the only signal.
+ */
+function oauthExpiryMs(entry: AuthEntry): number | undefined {
+	const fromJwt = typeof entry.access === "string" ? jwtExpMs(entry.access) : undefined;
+	if (fromJwt !== undefined) return fromJwt;
+	if (typeof entry.expires !== "number" || !Number.isFinite(entry.expires)) return undefined;
+	return entry.expires < 10_000_000_000 ? entry.expires * 1000 : entry.expires;
+}
+
 function getCursorSubFromAccessToken(token: string): string | undefined {
 	const sub = decodeJwtPayload(token)?.sub;
 	return typeof sub === "string" && sub.length > 0 ? sub : undefined;
@@ -2501,13 +2512,7 @@ function isEntryUsable(entry: AuthEntry | undefined): boolean {
 	if (typeof entry.access !== "string" || entry.access.length === 0)
 		return false;
 	// Expired access token with no refresh token → unrecoverable.
-	const storedExpiry =
-		typeof entry.expires === "number" && Number.isFinite(entry.expires)
-			? entry.expires < 10_000_000_000
-				? entry.expires * 1000
-				: entry.expires
-			: undefined;
-	const expMs = jwtExpMs(entry.access) ?? storedExpiry;
+	const expMs = oauthExpiryMs(entry);
 	if (
 		expMs !== undefined &&
 		expMs <= Date.now() &&
@@ -10847,7 +10852,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		let entry = readAuthFile()[slotId];
 		if (!entry) return undefined;
 		if (entry.type !== "oauth" || typeof entry.access !== "string") return entry;
-		const expiry = jwtExpMs(entry.access);
+		const expiry = oauthExpiryMs(entry);
 		// A minute of slack: a token that expires mid-flight fails the child's whole request, and
 		// refreshing one turn early costs nothing.
 		if (expiry !== undefined && expiry - 60_000 <= Date.now()) {
