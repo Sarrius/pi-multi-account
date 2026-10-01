@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Compatibility
+
+- Support Pi 0.99.x alongside 0.85.1–0.87.x; CI tests 0.85.1, 0.86.1, 0.87.1 and 0.99.2.
+- Resolve OAuth and catalog metadata through Pi's host-bound `pi-ai/compat` and `pi-ai/providers/all` entrypoints. Both host SDKs are peers, not private runtime dependencies. This fixes peer-only managed installs without restoring the filesystem bridge copy from 1.23.1.
+- Leave Pi virtual model selections outside account chat failover and retain configured image/classifier definitions when registering API-key base providers.
+- Existing account aliases, cooldowns, thinking levels, persistence and continuation policy are unchanged. No virtual model migration or cross-extension selection arbitration is included.
+
 ## [1.23.2] — 2026-09-24
 
 ### Fixed
