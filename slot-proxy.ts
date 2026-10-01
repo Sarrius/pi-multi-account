@@ -273,7 +273,14 @@ export function shapeUpstreamRequest(args: {
 		}
 	}
 
-	return { ok: true, url: `${base}${rest}`, headers };
+	// Image tools append these endpoints directly to the slot base; chat already sends /codex.
+	// Leave all other paths and families intact, including usage requests.
+	const upstreamRest =
+		route.family === "codex" && /^\/images\/(?:generations|edits)(?:\?.*)?$/.test(rest)
+			? `/codex${rest}`
+			: rest;
+
+	return { ok: true, url: `${base}${upstreamRest}`, headers };
 }
 
 /** Keep any beta flags the caller asked for, and add ours once. */
