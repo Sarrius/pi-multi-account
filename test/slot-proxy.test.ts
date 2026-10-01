@@ -188,6 +188,56 @@ test("Codex is routed by account, which it refuses to serve without", () => {
 	assert.equal(shaped.headers.originator, "pi");
 });
 
+test("Codex image endpoints appended to a numbered slot gain /codex and keep their query", () => {
+	for (const path of ["/images/generations", "/images/edits"]) {
+		for (const query of ["", "?stream=1&label=a%2Fb"]) {
+			const rest = `${path}${query}`;
+			const admitted = admitRequest({
+				rawUrl: `/openai-codex-account-4${rest}`,
+				headers: withKey(PROXY_PLACEHOLDER_JWT),
+				routes: ROUTES,
+			});
+			assert.equal(admitted.ok, true);
+			if (!admitted.ok) return;
+			const shaped = shapeUpstreamRequest({
+				route: admitted.route,
+				rest: admitted.rest!,
+				headers: withKey(PROXY_PLACEHOLDER_JWT),
+				credential: { type: "oauth", access: "t", accountId: "acct-9" },
+			});
+			assert.equal(shaped.ok, true);
+			if (!shaped.ok) return;
+			assert.equal(shaped.url, `https://chatgpt.com/backend-api/codex${rest}`);
+		}
+	}
+});
+
+test("image routing leaves prefixed, chat, usage, similar paths and Anthropic unchanged", () => {
+	const paths = [
+		"/codex/images/generations", "/codex/images/edits?stream=1",
+		"/codex/responses?stream=1", "/wham/usage",
+		"/images/generations/", "/images/edits/extra?stream=1",
+		"/images/generations-extra", "/images/editsx?stream=1",
+		"/images/variations", "/v1/images/generations",
+	];
+	for (const route of [codexRoute, anthropicRoute]) {
+		const unchanged = route.family === "anthropic"
+			? [...paths, "/images/generations", "/images/edits?stream=1"]
+			: paths;
+		for (const rest of unchanged) {
+			const shaped = shapeUpstreamRequest({
+				route,
+				rest,
+				headers: {},
+				credential: { type: "oauth", access: "t" },
+			});
+			assert.equal(shaped.ok, true);
+			if (!shaped.ok) return;
+			assert.equal(shaped.url, `${UPSTREAM_BASE[route.family]}${rest}`);
+		}
+	}
+});
+
 test("an API-key slot uses the header its family actually reads", () => {
 	const anthropic = shapeUpstreamRequest({
 		route: anthropicRoute,
