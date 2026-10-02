@@ -25,6 +25,11 @@ import { piAutoPersistsSelectedModel } from "../pi-contract.ts";
 import { childFacingAuthEntryForSlot } from "../slot-proxy-auth.ts";
 import { XAI_SUBSCRIPTION_USAGE_URL, ZAI_CODING_CN_USAGE_URL } from "../usage.ts";
 
+function usesModernAgentContext(version: string): boolean {
+	const [major = 0, minor = 0] = version.replace(/^v/, "").split(".").map(Number);
+	return major > 0 || (major === 0 && minor >= 86);
+}
+
 const AGENT_DIR = mkdtempSync(join(tmpdir(), "pmacct-test-"));
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
 // The Cursor provider lives in a separate, optional repo. Point the bridge at a directory we
@@ -865,6 +870,27 @@ test("account picker filters only its UI and uses the model's native thinking de
 	assert.equal(t.thinkingLevel(), "low");
 	assert.deepEqual(t.ctx.modelRegistry.getAvailable().map((m: any) => `${m.provider}/${m.id}`), before);
 });
+test("Pi virtual models remain host-owned and never enter account failover", async () => {
+	const t = setup({
+		current: { provider: "virtual-router", id: "balanced" },
+		config: { fallbacks: ["anthropic", "openai-codex-account-2"] },
+	});
+	t.ctx.model.api = "pi-virtual";
+	await t.fire("session_start", {});
+	await t.fire("before_agent_start", {});
+	await finishError(t, "virtual-router", "balanced", "429 rate limit");
+	assert.deepEqual(t.rec.setModels, [], "a virtual selection must remain owned by Pi");
+
+	const originalFind = t.ctx.modelRegistry.find;
+	t.ctx.modelRegistry.find = (provider: string, id: string) =>
+		provider === "virtual-router"
+			? { provider, id, api: "pi-virtual" }
+			: originalFind(provider, id);
+	await t.command("switch virtual-router/balanced");
+	assert.deepEqual(t.rec.setModels, [], "virtual models are not account fallback targets");
+	await t.fire("session_shutdown", {});
+});
+
 
 test("cancelled or stale account picker never changes the model", async () => {
 	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, thinkingLevel: "high" });
@@ -3506,7 +3532,7 @@ test("public Anthropic and Qwen provider streams shape native requests without s
 			id: anthropic ? "claude-sonnet-4-6" : "qwen-max", baseUrl: "https://fixture.invalid/v1",
 			reasoning: true, input: ["text"], contextWindow: 10000, maxTokens: 100,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: { supportsDeveloperRole: true },
-		}, Number(PI_HOST_VERSION.split(".")[1]) >= 86
+		}, usesModernAgentContext(PI_HOST_VERSION)
 			? { messages: [{ role: "system", content: "fixture instructions", timestamp: 0 }, { role: "user", content: "fixture task", timestamp: 1 }] }
 			: { systemPrompt: "fixture instructions", messages: [{ role: "user", content: "fixture task", timestamp: 0 }] }, {
 			apiKey: anthropic ? "sk-ant-oat01-fixture" : "fixture", maxRetries: 0,
@@ -9331,6 +9357,8 @@ test("registering the Ollama base provider must not narrow the user's own model 
 						{ id: "glm-5.2:cloud" },
 						{ id: "qwen3.5:cloud" },
 						{ id: "deepseek-v4-flash:cloud" },
+						{ id: "image-gen", type: "image", api: "openai-images", marker: "keep-image" },
+						{ id: "content-safety", type: "classifier", api: "openai-classifier", marker: "keep-classifier" },
 					],
 				},
 			},
@@ -9357,6 +9385,17 @@ test("registering the Ollama base provider must not narrow the user's own model 
 				`a configured model must survive registration; got ${JSON.stringify(models)}`,
 			);
 		}
+		const registered = t.providerConfigs.get("ollama")?.models ?? [];
+		assert.equal(
+			registered.find((model: any) => model.id === "image-gen")?.marker,
+			"keep-image",
+			"Pi 0.99 image model definitions must remain operation-typed",
+		);
+		assert.equal(
+			registered.find((model: any) => model.id === "content-safety")?.marker,
+			"keep-classifier",
+			"Pi 0.99 classifier model definitions must remain operation-typed",
+		);
 	} finally {
 		rmSync(join(AGENT_DIR, "models.json"), { force: true });
 	}
@@ -9373,7 +9412,8 @@ test("a catalog sync remains public with only-active enabled, so an immediate sw
 			providers: {
 				ollama: {
 					api: "openai-completions",
-					models: [{ id: "glm-5.2:cloud" }],
+					models: [{ id: "glm-5.2:cloud" },
+						{ id: "image-gen", type: "image", api: "openai-images", marker: "keep-image" }],
 				},
 			},
 		}),
@@ -9420,6 +9460,9 @@ test("a catalog sync remains public with only-active enabled, so an immediate sw
 			ids.includes("glm-5.2:cloud"),
 			`configured ids must survive too; got ${JSON.stringify(ids)}`,
 		);
+		assert.equal(t.providerConfigs.get("ollama")?.models?.find(
+			(model: any) => model.id === "image-gen",
+		)?.marker, "keep-image", "catalog sync must preserve non-chat definitions too");
 		await t.fire("session_shutdown");
 	} finally {
 		globalThis.fetch = originalFetch;

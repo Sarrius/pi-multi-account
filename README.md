@@ -26,13 +26,17 @@ pi install npm:pi-multi-account
 
 Restart Pi or run `/reload` after installation.
 
-Requires Node 22+ and Agent Pi / pi-ai **>=0.85.1, <0.88.0** (CI covers 0.85.1, 0.86.1 and 0.87.1).
-Pi's host package is a peer. `pi-ai` is a runtime dependency for the OAuth/catalog bridge:
-Pi-managed installs intentionally do not install extension peer dependencies, but subscription
-login must be able to locate pi-ai on disk. Provider transports still use Pi's **host-bound**
-imports, not that filesystem-resolved bridge copy, so a stale nested pi-ai cannot remove tools or
-system instructions. Standalone SDK callers must pair their context with the installed pi-ai
-version. If the OAuth bridge is unavailable, API-key account discovery still works.
+Requires Node 22+ and Agent Pi / pi-ai **>=0.85.1, <0.88.0; >=0.99.0, <0.100.0; or >=1.0.0, <2.0.0**.
+CI covers Pi **0.85.1, 0.86.1, 0.87.1, 0.99.2 and 1.0.0**; Pi 0.99+ requires Node >=22.19.0.
+Both Pi SDK packages are peers supplied by the running host. OAuth, catalogs and transports
+use public host-bound imports; do not install a private runtime pi-ai copy alongside this extension.
+Standalone SDK callers must supply matching Pi SDK versions. Pi 0.99+ support retains numbered
+account aliases and existing rotation/continuation semantics; it does not introduce a virtual model.
+Pi-owned virtual selections and image/classifier models are not account chat failover targets.
+
+This release does not arbitrate multiple extensions calling `pi.setModel`. Keep one automatic
+foreground selection owner: independent routing extensions can otherwise overwrite each other's
+choices. Account failover still owns ordinary selected chat accounts; virtual models remain host-owned.
 
 Kimi OAuth spares remain available in `/login`, but are not written to `models.json`: without a
 Kimi child OAuth proxy those aliases would be resolvable but unauthenticated. Only real API-key

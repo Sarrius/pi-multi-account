@@ -29,11 +29,18 @@ if (!Number.isSafeInteger(packed[0].unpackedSize) || packed[0].unpackedSize > 2 
 // pins the source constant to it as well, and fails the release instead of shipping a
 // build that misreports itself.
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-// Pi deliberately skips installing peer dependencies for managed extension packages.
-// OAuth uses createRequire(import.meta.url) to locate pi-ai on disk; unlike host-bound
-// transport imports, it cannot work with an absent package in a fresh pi install.
-if (!manifest.dependencies?.["@earendil-works/pi-ai"]) {
-	throw new Error("OAuth requires @earendil-works/pi-ai as a runtime dependency; Pi does not install extension peers");
+// Pi binds SDK imports to the running host. Shipping another SDK creates split
+// catalogs/auth implementations and must never be required by a managed install.
+for (const name of ["pi-ai", "pi-agent-core", "pi-coding-agent", "pi-tui"]) {
+	if (manifest.dependencies?.[`@earendil-works/${name}`]) {
+		throw new Error(`${name} must not be an extension runtime dependency`);
+	}
+}
+const supportedPi = ">=0.85.1 <0.88.0 || >=0.99.0 <0.100.0 || >=1.0.0 <2.0.0";
+for (const name of ["pi-ai", "pi-coding-agent"]) {
+	if (manifest.peerDependencies?.[`@earendil-works/${name}`] !== supportedPi) {
+		throw new Error(`${name} must declare the tested Pi host compatibility range`);
+	}
 }
 const declaredVersion = /^const VERSION = "([^"]+)";$/m.exec(
 	readFileSync(join(root, "index.ts"), "utf8"),

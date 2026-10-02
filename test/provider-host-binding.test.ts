@@ -5,6 +5,11 @@ import { join } from "node:path";
 import test from "node:test";
 import * as NativeHost from "@earendil-works/pi-coding-agent";
 
+function usesModernAgentContext(version: string): boolean {
+	const [major = 0, minor = 0] = version.replace(/^v/, "").split(".").map(Number);
+	return major > 0 || (major === 0 && minor >= 86);
+}
+
 // Exercise Pi's REAL loader rather than importing the wrapper in this test process.
 // A deliberately incompatible nested package must never supply the transport.
 for (const bundled of [false, true]) for (const api of ["anthropic-messages", "openai-completions"]) {
@@ -30,7 +35,7 @@ export default function(pi) { pi.registerProvider("fixture", { api: ${JSON.strin
 			assert.deepEqual(loaded.errors, []);
 			const streamSimple = loaded.runtime.pendingProviderRegistrations.find(r => r.name === "fixture")!.config.streamSimple!;
 			const tool = { name: "probe", description: "fixture", parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } };
-			const modern = Number(VERSION.split(".")[1]) >= 86;
+			const modern = usesModernAgentContext(VERSION);
 			const context: any = modern ? { messages: [
 				{ role: "system", content: "SYSTEM_MARKER", toolsAdded: [{ ...tool, name: "obsolete" }], timestamp: 0 },
 				{ role: "system", content: "UPDATED_MARKER", toolsRemoved: [{ name: "obsolete" }], toolsAdded: [tool], timestamp: 1 },
