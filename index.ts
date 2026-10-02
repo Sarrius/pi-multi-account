@@ -46,7 +46,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { homedir } from "node:os";
 import { Readable } from "node:stream";
 import { dirname, join } from "node:path";
-import { createRequire } from "node:module";
+import { getModel as getHostModel } from "@earendil-works/pi-ai/compat";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -120,33 +121,15 @@ import {
 } from "./context-guard.ts";
 
 // ---------------------------------------------------------------------------
-// pi-ai OAuth bridge (version-agnostic)
+// Host-bound pi-ai OAuth bridge
 // ---------------------------------------------------------------------------
-//
-// This is the single most fragile boundary in the extension, and it has now broken
-// twice in the field:
-//
-//   * pi-coding-agent's extension loader aliases `@earendil-works/pi-ai/oauth` to an
-//     empty stub in its own node_modules, so a plain static import yields undefined —
-//     the `undefined is not an object (evaluating
-//     '_oauth.openaiCodexOAuthProvider.usesCallbackServer')` crash at startup.
-//   * pi-ai 0.80 REMOVED the runtime OAuth surface: `dist/oauth.js` is now literally
-//     `export {}` (types only), `getModel` moved to `dist/compat.js`, and the OAuth
-//     implementations live behind provider factories
-//     (`anthropicProvider().auth.oauth`) with a new `login(interaction)` /
-//     `refresh(credential)` shape.
-//
-// So we resolve pi-ai on disk ourselves and normalize BOTH eras behind one internal
-// surface. Everything here is best-effort: a pi-ai we cannot adapt degrades to
-// "subscription logins unavailable" and the extension still loads, so API-key
-// accounts keep rotating instead of the whole extension dying at load time.
-//
-// The 0.80+ adaptation follows the approach contributed by @lfoscari in PR #4.
-
+// Pi's extension loader binds these public imports to the running host SDK.
+// Never probe a private SDK copy: its provider catalog/auth may differ from Pi's.
+// Supported Pi versions use provider factories; legacy callbacks are adapted below.
 /** Normalized OAuth surface — identical for every supported pi-ai version. */
 type PiAiOauthBridge = {
 	/** pi-ai release line this was adapted from, for the debug log. */
-	era: "legacy-oauth-entry" | "provider-factories";
+	era: "provider-factories";
 	anthropic: {
 		login: (callbacks: any) => Promise<any>;
 		refresh: (credentials: any, signal: AbortSignal) => Promise<any>;
@@ -174,57 +157,6 @@ type PiAiOauthBridge = {
 
 let piAiOauthBridge: PiAiOauthBridge | undefined;
 let piAiOauthLoadError: string | undefined;
-let piAiPackageRoot: string | undefined | null; // null = searched, not found
-
-/**
- * Locate the `@earendil-works/pi-ai` package directory, nearest-first.
- *
- * A git checkout keeps pi-ai in the extension's OWN node_modules, but `npm i` /
- * `pi install` HOIST it next to the package instead
- * (`~/.pi/agent/npm/node_modules/pi-multi-account` +
- * `~/.pi/agent/npm/node_modules/@earendil-works/pi-ai`), and pnpm hides it behind a
- * symlinked store. Probing only the nested path made the extension fail to load on
- * every hoisted install, so walk ancestors the way Node's own resolver does and fall
- * back to require.resolve().
- */
-export function piAiRootCandidates(
-	fromFile: string,
-	resolver?: (specifier: string) => string,
-): string[] {
-	const candidates: string[] = [];
-	let dir = dirname(fromFile);
-	for (let depth = 0; depth < 16; depth++) {
-		candidates.push(join(dir, "node_modules", "@earendil-works", "pi-ai"));
-		const parent = dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	if (resolver) {
-		try {
-			// Resolves through "exports"/symlinks even when no ancestor path matched.
-			candidates.push(dirname(resolver("@earendil-works/pi-ai/package.json")));
-		} catch {
-			// Not resolvable from here — the ancestor paths above may still hit.
-		}
-	}
-	return [...new Set(candidates)];
-}
-
-function findPiAiRoot(): string | undefined {
-	if (piAiPackageRoot !== undefined) return piAiPackageRoot ?? undefined;
-	const here = fileURLToPath(import.meta.url);
-	const localRequire = createRequire(import.meta.url);
-	for (const candidate of piAiRootCandidates(here, (specifier) =>
-		localRequire.resolve(specifier),
-	)) {
-		if (existsSync(join(candidate, "package.json"))) {
-			piAiPackageRoot = candidate;
-			return candidate;
-		}
-	}
-	piAiPackageRoot = null;
-	return undefined;
-}
 
 /**
  * Bridge Pi's legacy extension OAuth callbacks (`onAuth`/`onDeviceCode`/`onPrompt`/
@@ -272,48 +204,15 @@ function toAuthInteraction(callbacks: any) {
 	};
 }
 
-/** pi-ai <= 0.79: runtime OAuth helpers exported straight from `dist/oauth.js`. */
-function adaptLegacyOauthEntry(mod: any): PiAiOauthBridge | undefined {
-	const codex = mod?.openaiCodexOAuthProvider;
-	if (
-		typeof mod?.loginAnthropic !== "function" ||
-		typeof mod?.refreshAnthropicToken !== "function" ||
-		typeof codex?.login !== "function" ||
-		typeof codex?.refreshToken !== "function"
-	) {
-		return undefined;
-	}
-	return {
-		era: "legacy-oauth-entry",
-		anthropic: {
-			login: (callbacks) => mod.loginAnthropic(callbacks),
-			// This era exchanges the bare refresh token, not the whole credential.
-			refresh: (credentials, signal) =>
-				mod.refreshAnthropicToken(credentials.refresh, signal),
-		},
-		codex: {
-			usesCallbackServer: codex.usesCallbackServer ?? true,
-			login: (callbacks) => codex.login(callbacks),
-			refresh: (credentials, signal) => codex.refreshToken(credentials, signal),
-			getApiKey: (credentials) =>
-				typeof codex.getApiKey === "function"
-					? codex.getApiKey(credentials)
-					: credentials.access,
-		},
-	};
-}
 
 /** pi-ai >= 0.80: OAuth lives behind provider factories, with an AuthInteraction API. */
-function adaptProviderFactories(
-	anthropicMod: any,
-	codexMod: any,
-	kimiMod?: any,
-	xaiMod?: any,
-): PiAiOauthBridge | undefined {
-	const anthropicOauth = anthropicMod?.anthropicProvider?.()?.auth?.oauth;
-	const codexOauth = codexMod?.openaiCodexProvider?.()?.auth?.oauth;
-	const kimiOauth = kimiMod?.kimiCodingProvider?.()?.auth?.oauth;
-	const xaiOauth = xaiMod?.xaiProvider?.()?.auth?.oauth;
+function adaptProviderFactories(): PiAiOauthBridge | undefined {
+	const providers = builtinProviders();
+	const oauth = (id: string): any => providers.find((provider) => provider.id === id)?.auth?.oauth;
+	const anthropicOauth = oauth("anthropic");
+	const codexOauth = oauth("openai-codex");
+	const kimiOauth = oauth("kimi-coding");
+	const xaiOauth = oauth("xai");
 	if (
 		typeof anthropicOauth?.login !== "function" ||
 		typeof anthropicOauth?.refresh !== "function" ||
@@ -355,58 +254,18 @@ function adaptProviderFactories(
 	};
 }
 
-/**
- * Best-effort load + normalization of pi-ai's OAuth surface. NEVER throws.
- *
- * Uses a synchronous require() (Node >= 22 supports require() of ESM without
- * top-level await, and pi-ai qualifies) because providers are registered
- * synchronously — `usesCallbackServer` is read while Pi merely LISTS providers.
- */
+/** Adapt the running host's public factories without loading another SDK instance. */
 function tryLoadPiAiOauth(): PiAiOauthBridge | undefined {
 	if (piAiOauthBridge) return piAiOauthBridge;
-	const root = findPiAiRoot();
-	if (!root) {
-		piAiOauthLoadError = `@earendil-works/pi-ai was not found near ${fileURLToPath(import.meta.url)}. Install @earendil-works/pi-ai alongside pi-multi-account.`;
-		return undefined;
+	try {
+		piAiOauthBridge = adaptProviderFactories();
+		piAiOauthLoadError = piAiOauthBridge
+			? undefined
+			: "the running Pi host exposes no usable pi-ai OAuth provider factories";
+	} catch (error) {
+		piAiOauthLoadError = error instanceof Error ? error.message : String(error);
 	}
-	const localRequire = createRequire(import.meta.url);
-	const load = (relative: string): any => {
-		const file = join(root, "dist", relative);
-		if (!existsSync(file)) return undefined;
-		try {
-			return localRequire(file);
-		} catch (error) {
-			tried.push(
-				`${relative}: ${error instanceof Error ? error.message : String(error)}`,
-			);
-			return undefined;
-		}
-	};
-	const tried: string[] = [];
-
-	const legacy = adaptLegacyOauthEntry(load("oauth.js"));
-	if (legacy) {
-		piAiOauthBridge = legacy;
-		piAiOauthLoadError = undefined;
-		return legacy;
-	}
-	tried.push("dist/oauth.js exports no runtime OAuth helpers (pi-ai >= 0.80)");
-
-	const modern = adaptProviderFactories(
-		load(join("providers", "anthropic.js")),
-		load(join("providers", "openai-codex.js")),
-		load(join("providers", "kimi-coding.js")),
-		load(join("providers", "xai.js")),
-	);
-	if (modern) {
-		piAiOauthBridge = modern;
-		piAiOauthLoadError = undefined;
-		return modern;
-	}
-	tried.push("dist/providers/{anthropic,openai-codex}.js exposed no auth.oauth");
-
-	piAiOauthLoadError = `the @earendil-works/pi-ai at ${root} exposes no OAuth surface this extension can use. ${tried.join("; ")}`;
-	return undefined;
+	return piAiOauthBridge;
 }
 
 /** Load reason, or undefined when OAuth is available. */
@@ -425,36 +284,10 @@ function requirePiAiOauth(): PiAiOauthBridge {
 	return bridge;
 }
 
-/**
- * pi-ai's static model catalog lookup. It lived on the package root until 0.79 and
- * moved to `dist/compat.js` in 0.80, so resolve it lazily from whichever is present
- * — and treat "absent" as "no canonical metadata", never as a load failure.
- */
-let piAiGetModelFn: ((provider: string, id: string) => any) | null | undefined;
-
+/** Canonical chat metadata comes from the same SDK catalog as the running host. */
 function piAiGetModel(provider: string, id: string): any {
-	if (piAiGetModelFn === undefined) {
-		piAiGetModelFn = null;
-		const root = findPiAiRoot();
-		if (root) {
-			const localRequire = createRequire(import.meta.url);
-			for (const relative of ["compat.js", "index.js"]) {
-				const file = join(root, "dist", relative);
-				if (!existsSync(file)) continue;
-				try {
-					const candidate = localRequire(file)?.getModel;
-					if (typeof candidate === "function") {
-						piAiGetModelFn = candidate;
-						break;
-					}
-				} catch {
-					// Try the next entry point.
-				}
-			}
-		}
-	}
 	try {
-		return piAiGetModelFn?.(provider, id);
+		return getHostModel(provider as any, id as any);
 	} catch {
 		return undefined;
 	}
@@ -830,11 +663,27 @@ function configuredModelIds(provider: string): string[] {
 		const models = parsed?.providers?.[provider]?.models;
 		if (Array.isArray(models)) {
 			return models
+				.filter((model: any) => !model?.type || model.type === "chat")
 				.map((model: any) => (typeof model === "string" ? model : model?.id))
 				.filter((id: unknown): id is string => typeof id === "string" && id.length > 0);
 		}
 		if (models && typeof models === "object") return Object.keys(models);
 		return [];
+	} catch {
+		return [];
+	}
+}
+
+// Pi 0.99's provider composer replaces a supplied models array in full. Preserve
+// non-chat definitions verbatim; they must never become account chat aliases.
+function configuredOperationModels(provider: string): any[] {
+	try {
+		const parsed = JSON.parse(readFileSync(MODELS_CONFIG_PATH, "utf8"));
+		const models = parsed?.providers?.[provider]?.models;
+		return Array.isArray(models)
+			? models.filter((model: any) => model && typeof model === "object" &&
+				(model.type === "image" || model.type === "classifier"))
+			: [];
 	} catch {
 		return [];
 	}
@@ -3077,7 +2926,7 @@ function registerCodexCatalog(
 		baseUrl,
 		api: "openai-codex-responses" as any,
 		oauth: codexOAuthOverride(id, name),
-		models: models as any,
+		models: [...models, ...configuredOperationModels(id)] as any,
 	});
 }
 
@@ -3930,10 +3779,8 @@ interface HostCompletionRouterAPI {
 export default function piMultiAccount(pi: ExtensionAPI) {
 	// Warm up the OAuth helpers before any provider registration: providers are
 	// registered synchronously below and their `usesCallbackServer`/`getApiKey`
-	// read from the cached module. Deliberately NON-fatal — if pi-ai's oauth entry
-	// cannot be resolved (hoisted npm layout, incompatible pi-ai), the extension
-	// still loads and every non-OAuth account keeps working; only subscription
-	// logins are unavailable, and the user is told once at session start.
+	// use the cached host adapter. An unusable OAuth factory remains non-fatal:
+	// API-key accounts keep working and session start reports unavailable OAuth.
 	const oauthUnavailable = piAiOauthUnavailableReason();
 	let subagentChild = isSubagentChildProcess();
 	let hostOwnsSessionModel = false;
@@ -5286,6 +5133,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return; // keep the previous (or empty) discovered set; configured ids still serve
 		}
 		const models = ollamaRotationModelIds().map((m) => ollamaModelDef(m, OLLAMA_BASE));
+		models.push(...configuredOperationModels(OLLAMA_BASE));
 		pi.registerProvider(OLLAMA_BASE, {
 			name: "Ollama",
 			baseUrl: OLLAMA_CLOUD_BASE_URL,
@@ -6697,6 +6545,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return idx < 0 ? Number.MAX_SAFE_INTEGER : idx;
 	}
 
+	// Virtual and non-chat operations belong to Pi, not account chat rotation.
+	function isAccountChatModel(model: any): boolean {
+		return !!model && model.api !== "pi-virtual" &&
+			(!model.type || model.type === "chat");
+	}
+
 	function resolveTargets(
 		ctx: any,
 		target: string,
@@ -6707,7 +6561,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (!parsed) return [];
 		if (parsed.modelId) {
 			const model = findModelIncludingHidden(ctx, parsed.provider, parsed.modelId);
-			return model ? [model] : [];
+			return isAccountChatModel(model) ? [model] : [];
 		}
 
 		const family = classifyProvider(parsed.provider, config.qwenProvider);
@@ -6744,7 +6598,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		for (const modelId of modelIds) {
 			if (seen.has(modelId)) continue;
 			const model = findModelIncludingHidden(ctx, parsed.provider, modelId);
-			if (!model) {
+			if (!isAccountChatModel(model)) {
 				seen.add(modelId);
 				continue;
 			}
@@ -7121,6 +6975,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			waitForQuotaRecovery?: boolean;
 		} = {},
 	) {
+		if (!isAccountChatModel(failedModel) || (ctx.model && !isAccountChatModel(ctx.model))) return false;
 		if (!options.manual && (isFailoverExempt(failedModel?.provider) || isFailoverExempt(ctx.model?.provider))) return false;
 		const switchEpoch = chainEpoch;
 		if (!automaticFailoverEnabled() || !failedModel?.provider || !failedModel?.id)
@@ -7381,6 +7236,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	async function ensureReadyModel(ctx: any, reason: string) {
+		if (ctx.model && !isAccountChatModel(ctx.model)) return true;
 		// The launch candidate is authoritative in a pi-subagents child. Let the
 		// request produce its real error so the parent runner can advance its own
 		// fallbackModels chain instead of starting a competing router here.
@@ -10089,6 +9945,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const models = ids.map((m) =>
 			family === "ollama" ? ollamaModelDef(m, baseId) : qwenModelDef(m, baseId),
 		);
+		models.push(...configuredOperationModels(baseId));
 		pi.registerProvider(baseId, {
 			name: family === "ollama" ? "Ollama" : "Alibaba/Qwen",
 			baseUrl,
@@ -12077,6 +11934,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	});
 
 	safeOn("message_end", async (event, ctx) => {
+		if (!isAccountChatModel(ctx.model)) return;
 		const errorEpoch = chainEpoch;
 		const staleError = () => sessionClosed || errorEpoch !== chainEpoch || userAbortedChain || ctx.signal?.aborted;
 		const message = (event as any).message;
@@ -12292,6 +12150,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	});
 
 	safeOn("agent_end", async (event, ctx) => {
+		if (!isAccountChatModel(ctx.model)) return;
 		if (!automaticFailoverEnabled()) return;
 		const stop = lastAssistantStopReason((event as any).messages ?? []);
 		// Our own watchdog aborted a wedged resumed turn — this is RECOVERY, not a user cancel.
