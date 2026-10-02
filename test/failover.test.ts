@@ -25,6 +25,11 @@ import { piAutoPersistsSelectedModel } from "../pi-contract.ts";
 import { childFacingAuthEntryForSlot } from "../slot-proxy-auth.ts";
 import { XAI_SUBSCRIPTION_USAGE_URL, ZAI_CODING_CN_USAGE_URL } from "../usage.ts";
 
+function usesModernAgentContext(version: string): boolean {
+	const [major = 0, minor = 0] = version.replace(/^v/, "").split(".").map(Number);
+	return major > 0 || (major === 0 && minor >= 86);
+}
+
 const AGENT_DIR = mkdtempSync(join(tmpdir(), "pmacct-test-"));
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
 // The Cursor provider lives in a separate, optional repo. Point the bridge at a directory we
@@ -3527,7 +3532,7 @@ test("public Anthropic and Qwen provider streams shape native requests without s
 			id: anthropic ? "claude-sonnet-4-6" : "qwen-max", baseUrl: "https://fixture.invalid/v1",
 			reasoning: true, input: ["text"], contextWindow: 10000, maxTokens: 100,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: { supportsDeveloperRole: true },
-		}, Number(PI_HOST_VERSION.split(".")[1]) >= 86
+		}, usesModernAgentContext(PI_HOST_VERSION)
 			? { messages: [{ role: "system", content: "fixture instructions", timestamp: 0 }, { role: "user", content: "fixture task", timestamp: 1 }] }
 			: { systemPrompt: "fixture instructions", messages: [{ role: "user", content: "fixture task", timestamp: 0 }] }, {
 			apiKey: anthropic ? "sk-ant-oat01-fixture" : "fixture", maxRetries: 0,

@@ -36,7 +36,7 @@ for (const name of ["pi-ai", "pi-agent-core", "pi-coding-agent", "pi-tui"]) {
 		throw new Error(`${name} must not be an extension runtime dependency`);
 	}
 }
-const supportedPi = ">=0.85.1 <0.88.0 || >=0.99.0 <0.100.0";
+const supportedPi = ">=0.85.1 <0.88.0 || >=0.99.0 <0.100.0 || >=1.0.0 <2.0.0";
 for (const name of ["pi-ai", "pi-coding-agent"]) {
 	if (manifest.peerDependencies?.[`@earendil-works/${name}`] !== supportedPi) {
 		throw new Error(`${name} must declare the tested Pi host compatibility range`);

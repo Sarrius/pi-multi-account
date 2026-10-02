@@ -18,7 +18,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const SUPPORTED_PI_RANGE = ">=0.85.1 <0.88.0 || >=0.99.0 <0.100.0";
+const SUPPORTED_PI_RANGE = ">=0.85.1 <0.88.0 || >=0.99.0 <0.100.0 || >=1.0.0 <2.0.0";
 
 test("Pi host SDKs are peers, never extension-local runtime dependencies", () => {
 	const manifest = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));

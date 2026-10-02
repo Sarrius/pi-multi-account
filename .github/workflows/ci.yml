@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pi: ["0.85.1", "0.86.1", "0.87.1", "0.99.2"]
+        pi: ["0.85.1", "0.86.1", "0.87.1", "0.99.2", "1.0.0"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
