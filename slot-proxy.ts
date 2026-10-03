@@ -37,6 +37,14 @@
 export const PROXY_PLACEHOLDER_KEY = "pi-multi-account-proxy";
 
 /**
+ * Non-secret Anthropic placeholder with the shape Pi's native transport recognizes as OAuth.
+ * Request identity, tool-name conversion and response mapping all depend on this marker; adding
+ * a Bearer header at the proxy is too late. The proxy replaces it with the real token on egress.
+ * The legacy generic placeholder remains recognizable for restoration during an upgrade.
+ */
+export const ANTHROPIC_PROXY_PLACEHOLDER_KEY = "sk-ant-oat01-pi-multi-account-proxy";
+
+/**
  * The `apiKey` published for a **Codex** slot.
  *
  * Pi's Codex API does not merely pass the key along: before any request it splits it on `.`,
@@ -60,9 +68,10 @@ export const PROXY_PLACEHOLDER_JWT = [
 	"",
 ].join(".");
 
-/** Either published placeholder — neither is a credential, both mark "a child we published for". */
+/** Current or legacy published placeholder — none is a real credential. */
 export function isPublishedPlaceholder(value: string | undefined): boolean {
-	return value === PROXY_PLACEHOLDER_KEY || value === PROXY_PLACEHOLDER_JWT;
+	return value === PROXY_PLACEHOLDER_KEY || value === PROXY_PLACEHOLDER_JWT ||
+		value === ANTHROPIC_PROXY_PLACEHOLDER_KEY;
 }
 
 export type ProxyFamily = "anthropic" | "codex";
@@ -296,7 +305,13 @@ function mergeBeta(existing: string | undefined, required: string): string {
 
 /** The `apiKey` to publish for a slot of this family. */
 export function placeholderKeyFor(family: ProxyFamily): string {
-	return family === "codex" ? PROXY_PLACEHOLDER_JWT : PROXY_PLACEHOLDER_KEY;
+	return family === "codex" ? PROXY_PLACEHOLDER_JWT : ANTHROPIC_PROXY_PLACEHOLDER_KEY;
+}
+
+/** Recognize the previous Anthropic publication without mistaking real tokens for placeholders. */
+export function isPlaceholderFor(family: ProxyFamily, value: unknown): boolean {
+	return value === placeholderKeyFor(family) ||
+		(family === "anthropic" && value === PROXY_PLACEHOLDER_KEY);
 }
 
 /** The `models.json` route to publish for a slot served by this proxy. */
@@ -312,7 +327,7 @@ export function isOwnLoopbackPublication(
 	if (!existing || typeof existing !== "object") return false;
 	const rec = existing as Record<string, unknown>;
 	return (
-		rec.apiKey === placeholderKeyFor(family) &&
+		isPlaceholderFor(family, rec.apiKey) &&
 		typeof rec.baseUrl === "string" &&
 		rec.baseUrl.startsWith("http://127.0.0.1:")
 	);

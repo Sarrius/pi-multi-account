@@ -1,6 +1,6 @@
 {
   "name": "pi-multi-account",
-  "version": "1.23.2",
+  "version": "1.24.0",
   "description": "Automatic multi-account failover & rotation for Pi Agent across Anthropic (Claude), OpenAI/ChatGPT Codex, Kimi For Coding, Cursor, Qwen/Alibaba, and Ollama. Auto-discovers authenticated accounts, grows the rotation on login, and drops accounts on logout, expiry, or quota/rate-limit errors",
   "type": "module",
   "license": "MIT",
@@ -45,7 +45,9 @@
     "provider-payload-stream.ts",
     "auth-file-transaction.ts",
     "state-file-transaction.ts",
+    "config-file-transaction.ts",
     "model-catalog.ts",
+    "model-pins.ts",
     "usage.ts",
     "cursor-bridge.ts",
     "cursor-model-name.ts",
@@ -78,12 +80,12 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.85.1 <0.88.0 || >=0.99.0 <0.100.0 || >=1.0.0 <2.0.0",
-    "@earendil-works/pi-ai": ">=0.85.1 <0.88.0 || >=0.99.0 <0.100.0 || >=1.0.0 <2.0.0"
+    "@earendil-works/pi-ai": ">=0.85.1 <0.88.0 || >=0.99.0 <0.100.0 || >=1.0.0 <2.0.0",
+    "@earendil-works/pi-coding-agent": ">=0.85.1 <0.88.0 || >=0.99.0 <0.100.0 || >=1.0.0 <2.0.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.85.1",
-    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
     "@types/node": "^22.20.4",
     "typescript": "^6.0.3"
   },
@@ -93,7 +95,7 @@
     ]
   },
   "dependencies": {
-    "@bufbuild/protobuf": "^2.14.0",
+    "@bufbuild/protobuf": "^2.15.0",
     "proper-lockfile": "4.1.2"
   },
   "overrides": {

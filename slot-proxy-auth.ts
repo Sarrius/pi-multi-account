@@ -28,6 +28,7 @@ import {
 } from "./cursor-bridge.ts";
 import {
 	needsChildFacingApiKey,
+	isPlaceholderFor,
 	placeholderKeyFor,
 	proxyFamilyFor,
 	type ProxyFamily,
@@ -67,7 +68,7 @@ export function isChildFacingPlaceholder(
 	entry: AuthBlob | undefined,
 	family: ProxyFamily,
 ): boolean {
-	return entry?.type === "api_key" && entry.key === placeholderKeyFor(family);
+	return entry?.type === "api_key" && isPlaceholderFor(family, entry.key);
 }
 
 export function isChildFacingPlaceholderForSlot(
@@ -75,7 +76,9 @@ export function isChildFacingPlaceholderForSlot(
 	slotId: string,
 ): boolean {
 	const key = childFacingPlaceholderKey(slotId);
-	return !!key && entry?.type === "api_key" && entry.key === key;
+	const family = proxyFamilyFor(slotId);
+	return !!key && entry?.type === "api_key" &&
+		(family ? isPlaceholderFor(family, entry.key) : entry.key === key);
 }
 
 /** What the parent should use for refresh/upstream: sidecar OAuth wins over a child-facing placeholder. */
@@ -101,6 +104,13 @@ export function applyShadowPlan(
 		return { auth: { ...auth }, sidecar: { ...sidecar }, changed: false };
 	}
 	const entry = auth[slotId];
+	const hidden = sidecar[slotId];
+	if (isChildFacingPlaceholderForSlot(entry, slotId) && entry?.key !== facing.key &&
+		hidden?.type === "oauth" && typeof hidden.access === "string" && hidden.access.length > 0) {
+		// Upgrade only a publication backed by the parent's actual OAuth blob. Never rewrite a
+		// user's real API key or replace the hidden credential with a placeholder during migration.
+		return { auth: { ...auth, [slotId]: facing }, sidecar: { ...sidecar }, changed: true };
+	}
 	if (entry?.type === "oauth" && typeof entry.access === "string" && entry.access.length > 0) {
 		return {
 			auth: { ...auth, [slotId]: facing },
