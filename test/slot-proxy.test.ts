@@ -9,6 +9,7 @@ import test from "node:test";
 import {
 	PROXY_PLACEHOLDER_JWT,
 	PROXY_PLACEHOLDER_KEY,
+	ANTHROPIC_PROXY_PLACEHOLDER_KEY,
 	UPSTREAM_BASE,
 	admitRequest,
 	parseProxyPath,
@@ -145,6 +146,22 @@ test("the placeholder never reaches the upstream; the real token does", () => {
 	assert.equal(shaped.headers.authorization, "Bearer real-anthropic-token");
 	assert.equal(JSON.stringify(shaped.headers).includes(PROXY_PLACEHOLDER_KEY), false);
 	assert.equal(shaped.headers["content-type"], "application/json");
+});
+
+test("the OAuth-shaped Anthropic placeholder is admitted and stripped from either auth header", () => {
+	for (const headers of [
+		{ authorization: `Bearer ${ANTHROPIC_PROXY_PLACEHOLDER_KEY}` },
+		{ "x-api-key": ANTHROPIC_PROXY_PLACEHOLDER_KEY },
+	]) {
+		assert.equal(admitRequest({ rawUrl: "/anthropic-account-2/v1/messages", headers, routes: ROUTES }).ok, true);
+		const shaped = shapeUpstreamRequest({ route: anthropicRoute, rest: "/v1/messages", headers,
+			credential: { type: "oauth", access: "sk-ant-oat01-actual-upstream-token" } });
+		assert.equal(shaped.ok, true);
+		if (!shaped.ok) continue;
+		assert.equal(shaped.headers.authorization, "Bearer sk-ant-oat01-actual-upstream-token");
+		assert.equal(shaped.headers["x-api-key"], undefined);
+		assert.equal(JSON.stringify(shaped).includes(ANTHROPIC_PROXY_PLACEHOLDER_KEY), false);
+	}
 });
 
 test("Anthropic gets the header without which a subscription token is rejected", () => {
@@ -326,11 +343,13 @@ test("Pi reads an account id out of the Codex key, so that placeholder is token-
 
 test("each family is published with the placeholder its own API will accept", () => {
 	assert.equal(placeholderKeyFor("codex"), PROXY_PLACEHOLDER_JWT);
-	assert.equal(placeholderKeyFor("anthropic"), PROXY_PLACEHOLDER_KEY);
+	assert.equal(placeholderKeyFor("anthropic"), ANTHROPIC_PROXY_PLACEHOLDER_KEY);
+	assert.equal(placeholderKeyFor("anthropic").includes("sk-ant-oat"), true);
 });
 
 test("both placeholders are admitted; nothing else is", () => {
 	assert.equal(isPublishedPlaceholder(PROXY_PLACEHOLDER_KEY), true);
+	assert.equal(isPublishedPlaceholder(ANTHROPIC_PROXY_PLACEHOLDER_KEY), true);
 	assert.equal(isPublishedPlaceholder(PROXY_PLACEHOLDER_JWT), true);
 	for (const other of [undefined, "", "sk-real", `${PROXY_PLACEHOLDER_JWT}x`]) {
 		assert.equal(isPublishedPlaceholder(other), false, String(other));

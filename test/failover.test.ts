@@ -23,6 +23,7 @@ import test from "node:test";
 import { VERSION as PI_HOST_VERSION } from "@earendil-works/pi-coding-agent";
 import { piAutoPersistsSelectedModel } from "../pi-contract.ts";
 import { childFacingAuthEntryForSlot } from "../slot-proxy-auth.ts";
+import { publishedRouteFor } from "../slot-proxy.ts";
 import { XAI_SUBSCRIPTION_USAGE_URL, ZAI_CODING_CN_USAGE_URL } from "../usage.ts";
 
 function usesModernAgentContext(version: string): boolean {
@@ -374,6 +375,8 @@ function setup(opts: {
 	 * `forceRefreshProvider`, which short-circuits the extension's own refresh path.
 	 */
 	hostAuthStorage?: "pi-0.84";
+	/** Keep actual persisted config when constructing a fresh instance for restart regressions. */
+	preserveConfig?: boolean;
 	/** Contend for the port the previous instance is still listening on, instead of a fresh one. */
 	reuseSlotProxyPort?: boolean;
 }) {
@@ -382,7 +385,7 @@ function setup(opts: {
 	}
 	const accounts = opts.accounts ?? TWO_ACCOUNTS;
 	writeFileSync(AUTH, JSON.stringify(accounts));
-	writeFileSync(
+	if (!opts.preserveConfig) writeFileSync(
 		CONFIG,
 		JSON.stringify({
 			enabled: true,
@@ -959,6 +962,116 @@ test("save-default refuses a busy session", async () => {
 	writeFileSync(SETTINGS, "{}");
 	await t.command("save-default");
 	assert.equal(readFileSync(SETTINGS, "utf8"), "{}");
+});
+
+test("pin controls persist one family preference without selecting or filtering models", async () => {
+	const t = setup({ config: { preferredModels: { "openai-codex": ["gpt-5.5", "gpt-5.4"] }, pinnedModels: { anthropic: "claude-opus-4-8" }, unrelated: "kept" } });
+	const registry = t.ctx.modelRegistry.getAll().map((model: any) => `${model.provider}/${model.id}`);
+	const raw = JSON.parse(readFileSync(CONFIG, "utf8")); raw.concurrentRoot = "kept"; raw.pinnedModels.cursor = "cursor-grok-4.6";
+	writeFileSync(CONFIG, JSON.stringify(raw));
+	await t.command("pin openai-codex-account-2/gpt-5.4");
+	assert.deepEqual(JSON.parse(readFileSync(CONFIG, "utf8")).pinnedModels, { anthropic: "claude-opus-4-8", cursor: "cursor-grok-4.6", "openai-codex": "gpt-5.4" });
+	assert.equal(JSON.parse(readFileSync(CONFIG, "utf8")).concurrentRoot, "kept");
+	assert.equal(JSON.parse(readFileSync(CONFIG, "utf8")).unrelated, "kept");
+	assert.deepEqual(t.rec.setModels, []);
+	assert.deepEqual(t.ctx.modelRegistry.getAll().map((model: any) => `${model.provider}/${model.id}`), registry);
+	assert.ok(t.rec.notifies.some(text => /across sibling accounts/.test(text)));
+	await t.command("unpin openai-codex-account-2");
+	assert.equal(JSON.parse(readFileSync(CONFIG, "utf8")).pinnedModels["openai-codex"], undefined);
+	assert.deepEqual(JSON.parse(readFileSync(CONFIG, "utf8")).preferredModels["openai-codex"], ["gpt-5.5", "gpt-5.4"]);
+	await t.command("unpin openai-codex");
+	assert.deepEqual(t.rec.setModels, []);
+});
+
+test("pin controls reject busy, child, closed and stale sessions without persisting", async () => {
+	for (const opts of [{ idle: false }, { subagentChild: true }]) {
+		const t = setup(opts);
+		const before = readFileSync(CONFIG, "utf8");
+		await t.command("pin openai-codex-account-2/gpt-5.4");
+		await t.command("unpin openai-codex");
+		await t.command("pins");
+		assert.equal(readFileSync(CONFIG, "utf8"), before);
+		assert.deepEqual(t.rec.setModels, []);
+	}
+	const closed = setup({}); await closed.fire("session_shutdown");
+	const closedBefore = readFileSync(CONFIG, "utf8");
+	await closed.command("pin openai-codex-account-2/gpt-5.4");
+	assert.equal(readFileSync(CONFIG, "utf8"), closedBefore);
+	const stale = setup({});
+	const find = stale.ctx.modelRegistry.find;
+	stale.ctx.modelRegistry.find = (provider: string, id: string) => { stale.setIdle(false); return find(provider, id); };
+	const staleBefore = readFileSync(CONFIG, "utf8");
+	await stale.command("pin openai-codex-account-2/gpt-5.4");
+	assert.equal(readFileSync(CONFIG, "utf8"), staleBefore);
+	assert.ok(stale.rec.notifies.some(text => /not saved/.test(text)));
+});
+
+test("pin controls reject malformed input and host-owned operation models", async () => {
+	const t = setup({});
+	const before = readFileSync(CONFIG, "utf8");
+	for (const command of ["pin", "pin openai-codex", "pin /model", "pin openai-codex/", "pin openai-codex/gpt-5.4 extra", "unpin", "unpin openai-codex/gpt-5.4", "pins extra", "pins list extra"]) {
+		await t.command(command); assert.equal(readFileSync(CONFIG, "utf8"), before, command);
+	}
+	for (const definition of [{ api: "pi-virtual" }, { api: "openai-images", type: "image" }, { api: "fixture-classifier", type: "classifier" }]) {
+		t.ctx.modelRegistry.find = (provider: string, id: string) => ({ provider, id, ...definition });
+		await t.command("pin virtual-router/model");
+		assert.equal(readFileSync(CONFIG, "utf8"), before);
+	}
+	assert.deepEqual(t.rec.setModels, []);
+});
+
+test("pins listing is read-only and missing future models remain persisted", async () => {
+	const t = setup({});
+	await t.command("pin future-provider/future-model");
+	assert.equal(JSON.parse(readFileSync(CONFIG, "utf8")).pinnedModels["future-provider"], "future-model");
+	assert.ok(t.rec.notifies.some(text => /currently absent/.test(text)));
+	const before = readFileSync(CONFIG, "utf8");
+	const registrations = t.rec.registrations.length;
+	t.ctx.modelRegistry.authStorage.forceRefreshProvider = async () => { assert.fail("listing must not refresh"); };
+	t.setIdle(false);
+	await t.command("pins"); await t.command("pins list");
+	assert.equal(readFileSync(CONFIG, "utf8"), before);
+	assert.equal(t.rec.registrations.length, registrations);
+	assert.deepEqual(t.rec.setModels, []);
+	assert.deepEqual(t.rec.sent, []);
+	assert.ok(t.rec.notifies.at(-1)?.includes("missing from catalog"));
+});
+
+test("pin persistence and the existing priority command share one cross-process config lock", async () => {
+	const t = setup({ config: { providerPriority: ["cursor"], unrelated: "kept" } });
+	const ready = join(AGENT_DIR, "pin-writer-ready"), release = join(AGENT_DIR, "pin-writer-release");
+	rmSync(ready, { force: true }); rmSync(release, { force: true });
+	const module = import.meta.resolve("../model-pins.ts");
+	const code = `import { persistModelPin } from ${JSON.stringify(module)}; import { existsSync, writeFileSync } from 'node:fs';
+		let checks=0;const sleeper=new Int32Array(new SharedArrayBuffer(4));persistModelPin(${JSON.stringify(CONFIG)},'anthropic','claude-opus-4-8',()=>{
+		 if(++checks===2){writeFileSync(${JSON.stringify(ready)},'ready');const end=Date.now()+5000;while(!existsSync(${JSON.stringify(release)})){if(Date.now()>end)throw Error('release timeout');Atomics.wait(sleeper,0,0,5);}}return true;});`;
+	const writer = spawn(process.execPath, ["--input-type=module", "-e", code], { stdio: ["ignore", "pipe", "pipe"] });
+	let stderr = ""; writer.stderr.on("data", chunk => { stderr += chunk; });
+	const finished = new Promise<number | null>(resolve => writer.once("close", resolve));
+	let unlocker: ReturnType<typeof spawn> | undefined;
+	try {
+		const end = Date.now() + 5000;
+		while (!existsSync(ready)) { if (Date.now() > end) assert.fail("pin writer did not acquire its lock: " + stderr); await wait(5); }
+		unlocker = spawn(process.execPath, ["-e", `process.stdout.write('ready');setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(release)},'release'),50)`], { stdio: ["ignore", "pipe", "pipe"] });
+		await new Promise<void>((resolve, reject) => { unlocker!.stdout!.once("data", () => resolve()); unlocker!.once("error", reject); });
+		await t.command("priority anthropic openai-codex");
+		assert.equal(await finished, 0, stderr);
+		const disk = JSON.parse(readFileSync(CONFIG, "utf8"));
+		assert.equal(disk.pinnedModels.anthropic, "claude-opus-4-8");
+		assert.deepEqual(disk.providerPriority, ["anthropic", "openai-codex"]);
+		assert.equal(disk.unrelated, "kept");
+	} finally { writeFileSync(release, "release"); writer.kill("SIGTERM"); unlocker?.kill("SIGTERM"); rmSync(ready, { force: true }); rmSync(release, { force: true }); }
+});
+
+test("a failed pin write preserves the previous runtime preference", async () => {
+	const t = setup({ config: { pinnedModels: { "openai-codex": "gpt-5.4" } } });
+	writeFileSync(CONFIG, "{invalid");
+	await t.command("pin openai-codex-account-2/gpt-5.5");
+	assert.equal(readFileSync(CONFIG, "utf8"), "{invalid");
+	assert.ok(t.rec.notifies.at(-1)?.includes("not saved"));
+	await t.command("pins");
+	assert.ok(t.rec.notifies.at(-1)?.includes("gpt-5.4"));
+	assert.deepEqual(t.rec.setModels, []);
 });
 
 function wait(ms: number) {
@@ -7796,6 +7909,118 @@ test("preferredModels config override pins the newest model per provider without
 	);
 });
 
+test("a persisted same-band pin outranks catalog defaults and survives reload and restart", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, config: { preferredModels: { "openai-codex": ["gpt-5.5", "gpt-5.4"] } } });
+	await t.command("pin openai-codex-account-2/gpt-5.4");
+	await t.command("reload");
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	assert.equal(t.rec.setModels.at(-1), "openai-codex-account-2/gpt-5.4");
+	await t.fire("session_shutdown");
+	const restarted = setup({ preserveConfig: true, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	await finishError(restarted, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	assert.equal(restarted.rec.setModels.at(-1), "openai-codex-account-2/gpt-5.4");
+	await restarted.fire("session_shutdown");
+	const unpinned = setup({ preserveConfig: true });
+	await unpinned.command("unpin openai-codex");
+	await unpinned.fire("session_shutdown");
+	const fresh = setup({ preserveConfig: true, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	await finishError(fresh, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	assert.equal(fresh.rec.setModels.at(-1), "openai-codex-account-2/gpt-5.5");
+	await fresh.fire("session_shutdown");
+});
+
+test("a different model pin cannot displace a healthy exact sibling as a fake upgrade", async () => {
+	const accounts = {
+		"openai-codex-account-2": { type: "oauth", access: "two", refresh: "two-r", accountId: "two" },
+		"openai-codex-account-3": { type: "oauth", access: "three", refresh: "three-r", accountId: "three" },
+	};
+	const t = setup({ accounts, current: { provider: "openai-codex-account-2", id: "gpt-5.4" },
+		config: { preferredModels: { "openai-codex": ["gpt-5.5", "gpt-5.4"] }, pinnedModels: { "openai-codex": "gpt-5.5" } } });
+	await finishError(t, "openai-codex-account-2", "gpt-5.4", "429 rate_limit_error");
+	assert.equal(t.rec.setModels.at(-1), "openai-codex-account-3/gpt-5.4");
+	await t.fire("session_shutdown");
+});
+
+test("a selected older pin stays on its exact sibling instead of upgrading to a default", async () => {
+	const t = setup({ accounts: {
+		"openai-codex-account-2": { type: "oauth", access: "two", refresh: "two-r", accountId: "two" },
+		"openai-codex-account-3": { type: "oauth", access: "three", refresh: "three-r", accountId: "three" },
+	}, current: { provider: "openai-codex-account-2", id: "gpt-5.4" },
+		config: { preferredModels: { "openai-codex": ["gpt-5.5", "gpt-5.4"] }, pinnedModels: { "openai-codex": "gpt-5.4" } } });
+	await finishError(t, "openai-codex-account-2", "gpt-5.4", "429 rate_limit_error");
+	assert.equal(t.rec.setModels.at(-1), "openai-codex-account-3/gpt-5.4");
+	await t.fire("session_shutdown");
+});
+
+test("cheap pins cannot demote frontier work but explicit cheap selection keeps that band", async () => {
+	const accounts = { anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		"openai-codex-account-2": { type: "oauth", access: "two", refresh: "two-r", accountId: "two" },
+		"openai-codex-account-3": { type: "oauth", access: "three", refresh: "three-r", accountId: "three" } };
+	const config = { pinnedModels: { "openai-codex": "gpt-5.6-luna" }, preferredModels: { "openai-codex": ["gpt-5.6-sol", "gpt-5.6-luna"] } };
+	const frontier = setup({ accounts, config, current: { provider: "anthropic", id: "claude-opus-4-8" }, hostCodexModels: ["gpt-5.6-sol", "gpt-5.6-luna"] });
+	await finishError(frontier, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	assert.ok(frontier.rec.setModels.at(-1)?.endsWith("/gpt-5.6-sol"));
+	assert.ok(!frontier.rec.setModels.some(model => model.endsWith("/gpt-5.6-luna")));
+	await frontier.fire("session_shutdown");
+	const cheap = setup({ accounts, config, hostCodexModels: ["gpt-5.6-sol", "gpt-5.6-luna"], current: { provider: "openai-codex-account-2", id: "gpt-5.6-luna" } });
+	await finishError(cheap, "openai-codex-account-2", "gpt-5.6-luna", "429 rate_limit_error");
+	assert.equal(cheap.rec.setModels.at(-1), "openai-codex-account-3/gpt-5.6-luna");
+	await cheap.fire("session_shutdown");
+});
+
+test("missing and model-cooled pins stay saved without bypassing availability", async () => {
+	for (const pin of ["gpt-future-sol", "gpt-5.4"]) {
+		const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, config: { pinnedModels: { "openai-codex": pin }, preferredModels: { "openai-codex": ["gpt-5.5", "gpt-5.4"] } },
+			seedState: { stateVersion: 5, exhaustedUntilByModel: { "openai-codex-account-2/gpt-5.4": Date.now() + 600_000 } } });
+		await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+		assert.equal(t.rec.setModels.at(-1), "openai-codex-account-2/gpt-5.5");
+		assert.equal(JSON.parse(readFileSync(CONFIG, "utf8")).pinnedModels["openai-codex"], pin);
+		await t.fire("session_shutdown");
+	}
+});
+
+test("a cheap model pin cannot change tier through a provider-only switch", async () => {
+	const manual = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, hostCodexModels: ["gpt-5.6-sol", "gpt-5.6-luna"],
+		config: { pinnedModels: { "openai-codex": "gpt-5.6-luna" }, preferredModels: { "openai-codex": ["gpt-5.6-sol", "gpt-5.6-luna"] } } });
+	await manual.command("switch openai-codex-account-2");
+	assert.equal(manual.rec.setModels.at(-1), "openai-codex-account-2/gpt-5.6-sol");
+	await manual.command("switch openai-codex-account-2/gpt-5.6-luna");
+	assert.equal(manual.rec.setModels.at(-1), "openai-codex-account-2/gpt-5.6-luna", "an explicit model selection owns the cheaper tier");
+	await manual.fire("session_shutdown");
+});
+
+test("a cheap model pin cannot downgrade automatically routed compaction", async () => {
+	const compact = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, hostCodexModels: ["gpt-5.6-sol", "gpt-5.6-luna"],
+		config: { pinnedModels: { "openai-codex": "gpt-5.6-luna" }, preferredModels: { "openai-codex": ["gpt-5.6-sol", "gpt-5.6-luna"] } },
+		seedCooldownsMsFromNow: { anthropic: 3600_000 }, compactionAuth: { ok: false } });
+	await compact.fire("session_before_compact", { reason: "overflow", preparation: { messagesToSummarize: [], firstKeptEntryId: "e1", tokensBefore: 250000 }, signal: { aborted: false } });
+	assert.equal(compact.rec.compactionAuthFor[0], "openai-codex-account-2/gpt-5.6-sol");
+	assert.ok(!compact.rec.compactionAuthFor.some(model => model.endsWith("/gpt-5.6-luna")));
+	await compact.fire("session_shutdown");
+});
+
+test("a missing pin cannot suppress a custom provider's existing catalog on provider-only switch", async () => {
+	const t = setup({ accounts: { zai: { type: "api_key", key: "custom-fixture" } }, current: { provider: "anthropic", id: "claude-opus-4-8" },
+		hostModelsByProvider: { zai: ["glm-5.2"] }, config: { pinnedModels: { zai: "future-model" } } });
+	const find = t.ctx.modelRegistry.find;
+	t.ctx.modelRegistry.find = (provider: string, id: string) => provider === "zai" && id !== "glm-5.2" ? undefined : find(provider, id);
+	await t.command("switch zai");
+	assert.equal(t.rec.setModels.at(-1), "zai/glm-5.2");
+	assert.equal(JSON.parse(readFileSync(CONFIG, "utf8")).pinnedModels.zai, "future-model");
+	await t.fire("session_shutdown");
+});
+
+test("a model pin is not paid-apex fallback consent", async () => {
+	const t = setup({ accounts: { anthropic: { type: "oauth", access: "a", refresh: "ar" }, openai: { type: "api_key", key: "paid-fixture" } },
+		current: { provider: "anthropic", id: "claude-fable-5-1" },
+		hostModelsByProvider: { anthropic: ["claude-fable-5-1"], openai: ["gpt-6-astra"] },
+		config: { pinnedModels: { openai: "gpt-6-astra" }, autoContinue: false } });
+	await finishError(t, "anthropic", "claude-fable-5-1", "429 rate_limit_error");
+	assert.ok(!t.rec.setModels.some(model => model.startsWith("openai/")));
+	assert.equal(JSON.parse(readFileSync(CONFIG, "utf8")).pinnedModels.openai, "gpt-6-astra");
+	await t.fire("session_shutdown");
+});
+
 test("failover messages are stamped with the running version so a stale (un-restarted) Pi window is obvious at a glance", async () => {
 	const t = setup({
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
@@ -12133,27 +12358,353 @@ test("the proxy refreshes an expired opaque Anthropic token before forwarding", 
 	});
 	const realFetch = globalThis.fetch;
 	let refreshes = 0;
+	let forwardedAuth: string | undefined;
 	t.ctx.modelRegistry.authStorage.forceRefreshProvider = async (provider: string) => {
-		if (provider === "anthropic-account-2") refreshes++;
+		if (provider === "anthropic-account-2") {
+			refreshes++;
+			const stored = JSON.parse(readFileSync(PROXY_OAUTH_SIDECAR, "utf8"));
+			stored[provider] = { ...stored[provider], access: "sk-ant-oat01-refreshed", expires: Date.now() + 3600_000 };
+			writeFileSync(PROXY_OAUTH_SIDECAR, JSON.stringify(stored));
+		}
 		return { status: "refreshed" };
 	};
 	try {
 		await t.fire("session_start");
 		const slot = JSON.parse(readFileSync(MODELS, "utf8")).providers["anthropic-account-2"];
 		assert.ok(slot?.baseUrl, "the slot must be published against the running proxy");
-		globalThis.fetch = (async () =>
-			new Response(JSON.stringify({ ok: true }), {
+		globalThis.fetch = (async (_url: any, options: any) => {
+			forwardedAuth = new Headers(options.headers).get("authorization") ?? undefined;
+			return new Response(JSON.stringify({ ok: true }), {
 				status: 200,
 				headers: { "content-type": "application/json" },
-			})) as typeof fetch;
+			});
+		}) as typeof fetch;
 
 		const response = await callProxy(slot.baseUrl, "/v1/messages", {
 			authorization: `Bearer ${slot.apiKey}`,
 		});
 		assert.equal(response.status, 200);
 		assert.equal(refreshes, 1, "an opaque token past its stored expiry must be refreshed first");
+		assert.equal(forwardedAuth, "Bearer sk-ant-oat01-refreshed", "the newly persisted token must actually go upstream");
 	} finally {
 		globalThis.fetch = realFetch;
+		await t.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("opaque Anthropic expiry accepts seconds and refreshes inside the flight slack only", async () => {
+	for (const [expires, expected] of [
+		[Math.floor((Date.now() - 60_000) / 1000), 1],
+		[Math.floor((Date.now() + 30_000) / 1000), 1],
+		[Date.now() + 30_000, 1],
+		[Date.now() + 600_000, 0],
+		[undefined, 0],
+	] as const) {
+		rmSync(MODELS, { force: true });
+		const t = setup({ accounts: { "anthropic-account-2": {
+			type: "oauth", access: "sk-ant-oat01-expiry-fixture", refresh: "fixture-refresh", expires,
+		} } });
+		const originalFetch = globalThis.fetch;
+		let refreshes = 0;
+		t.ctx.modelRegistry.authStorage.forceRefreshProvider = async () => { refreshes++; return { status: "refreshed" }; };
+		try {
+			await t.fire("session_start");
+			const slot = JSON.parse(readFileSync(MODELS, "utf8")).providers["anthropic-account-2"];
+			globalThis.fetch = (async () => new Response("{}", { status: 200 })) as typeof fetch;
+			assert.equal((await callProxy(slot.baseUrl, "/v1/messages", { authorization: `Bearer ${slot.apiKey}` })).status, 200);
+			assert.equal(refreshes, expected, `stored expiry ${expires}`);
+		} finally {
+			globalThis.fetch = originalFetch;
+			await t.fire("session_shutdown");
+			rmSync(MODELS, { force: true });
+		}
+	}
+});
+
+function anthropicOAuthFixtureResponse(modelId: string, tool = true): string {
+	return [
+		{ type: "message_start", message: { id: "oauth-fixture", type: "message", role: "assistant", model: modelId, content: [], usage: { input_tokens: 1, output_tokens: 0 } } },
+		{ type: "content_block_start", index: 0, content_block: tool ? { type: "tool_use", id: "call_oauth_fixture", name: "Read", input: {} } : { type: "text", text: "" } },
+		{ type: "content_block_delta", index: 0, delta: tool ? { type: "input_json_delta", partial_json: '{"path":"fixture.txt"}' } : { type: "text_delta", text: "DONE" } },
+		{ type: "content_block_stop", index: 0 },
+		{ type: "message_delta", delta: { stop_reason: tool ? "tool_use" : "end_turn" }, usage: { output_tokens: 1 } },
+		{ type: "message_stop" },
+	].map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+}
+
+test("numbered Anthropic parent and bare native streams preserve OAuth identity and tool roundtrips", async () => {
+	rmSync(MODELS, { force: true });
+	const slotId = "anthropic-account-2";
+	const t = setup({ accounts: { [slotId]: {
+		type: "oauth", access: "sk-ant-oat01-private-fixture", refresh: "private-fixture-refresh", expires: Date.now() + 3600_000,
+	} } });
+	const originalFetch = globalThis.fetch;
+	try {
+		await t.fire("session_start");
+		const slot = JSON.parse(readFileSync(MODELS, "utf8")).providers[slotId];
+		const native = (await import("@earendil-works/pi-ai/compat")).getApiProvider("anthropic-messages")!;
+		assert.ok(slot.apiKey.includes("sk-ant-oat"));
+		assert.equal(readFileSync(MODELS, "utf8").includes("private-fixture"), false);
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))[slotId].key, slot.apiKey);
+		const model: any = { provider: slotId, api: "anthropic-messages", id: "claude-sonnet-4-6", baseUrl: slot.baseUrl,
+			reasoning: false, input: ["text"], contextWindow: 200000, maxTokens: 100,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+		const tool = { name: "read", description: "fixture", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } };
+		for (const streamSimple of [t.providerConfigs.get(slotId).streamSimple, native.streamSimple]) {
+			const context: any = usesModernAgentContext(PI_HOST_VERSION)
+				? { messages: [{ role: "system", content: "OAUTH_SYSTEM_FIXTURE", toolsAdded: [tool], timestamp: 0 }, { role: "user", content: "fixture request", timestamp: 1 }] }
+				: { systemPrompt: "OAUTH_SYSTEM_FIXTURE", tools: [tool], messages: [{ role: "user", content: "fixture request", timestamp: 1 }] };
+			const untouched = structuredClone(context);
+			const upstream: any[] = [];
+			globalThis.fetch = (async (url: any, init: any) => {
+				assert.equal(new URL(String(url)).origin, "https://api.anthropic.com");
+				assert.equal(new URL(String(url)).pathname, "/v1/messages");
+				upstream.push({ headers: Object.fromEntries(new Headers(init.headers)), body: JSON.parse(Buffer.from(init.body).toString("utf8")) });
+				return new Response(anthropicOAuthFixtureResponse(model.id, upstream.length === 1), { headers: { "content-type": "text/event-stream" } });
+			}) as typeof fetch;
+			const clientUrls: string[] = [];
+			const options: any = { apiKey: slot.apiKey, maxRetries: 0, fetch: async (url: any, init: any) => {
+				clientUrls.push(String(url));
+				const requested = new URL(String(url));
+				const published = new URL(slot.baseUrl);
+				assert.equal(requested.origin, published.origin);
+				assert.equal(requested.pathname, published.pathname + "/v1/messages");
+				const response = await callProxy(slot.baseUrl, "/v1/messages" + requested.search, Object.fromEntries(new Headers(init.headers)), init.body);
+				return new Response(response.body, { status: response.status, headers: { "content-type": "text/event-stream" } });
+			} };
+			const stream = streamSimple(model, context, options);
+			assert.equal(stream instanceof Promise, false, "public stream construction remains synchronous");
+			const first = await stream.result();
+			assert.equal(first.stopReason, "toolUse", `${first.errorMessage ?? ""}; client URLs: ${JSON.stringify(clientUrls)}`);
+			const call: any = first.content.find((block: any) => block.type === "toolCall");
+			assert.equal(call?.name, "read", "native OAuth response mapping must return the actual Pi tool name");
+			assert.deepEqual(call.arguments, { path: "fixture.txt" });
+			assert.deepEqual(context, untouched);
+			context.messages.push(first, { role: "toolResult", toolCallId: call.id, toolName: "read", content: [{ type: "text", text: "OAUTH_RESULT_FIXTURE" }], isError: false, timestamp: 2 });
+			const second = streamSimple(model, context, options);
+			const events: any[] = [];
+			for await (const event of second) events.push(event);
+			assert.equal((await second.result()).stopReason, "stop");
+			assert.ok(events.some(event => event.type === "done"));
+			assert.equal(upstream.length, 2);
+			for (const request of upstream) {
+				assert.equal(request.headers.authorization, "Bearer sk-ant-oat01-private-fixture");
+				assert.equal(request.headers["x-api-key"], undefined);
+				assert.equal(request.headers["x-app"], "cli");
+				assert.match(JSON.stringify(request.body), /x-anthropic-billing-header:/);
+				assert.match(JSON.stringify(request.body), /OAUTH_SYSTEM_FIXTURE/);
+				assert.equal(request.body.tools.find((item: any) => /read/i.test(item.name))?.name, "Read");
+				assert.equal(JSON.stringify(request).includes(slot.apiKey), false);
+			}
+			assert.match(JSON.stringify(upstream[1].body), /OAUTH_RESULT_FIXTURE/);
+		}
+	} finally {
+		globalThis.fetch = originalFetch;
+		await t.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("numbered API-key slots retain direct native publication while OAuth siblings use the proxy", async () => {
+	rmSync(MODELS, { force: true });
+	const slotId = "anthropic-account-2";
+	const t = setup({ accounts: { [slotId]: { type: "api_key", key: "sk-ant-api-numbered-fixture" },
+		"openai-codex-account-2": { type: "oauth", access: "codex-oauth-fixture", refresh: "codex-refresh" } } });
+	try {
+		await t.fire("session_start");
+		const providers = JSON.parse(readFileSync(MODELS, "utf8")).providers;
+		assert.equal(providers[slotId].baseUrl, "https://api.anthropic.com");
+		assert.equal(providers[slotId].apiKey, undefined);
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))[slotId].key, "sk-ant-api-numbered-fixture");
+		assert.equal(JSON.parse(readFileSync(PROXY_OAUTH_SIDECAR, "utf8"))[slotId], undefined);
+		assert.equal(new URL(providers["openai-codex-account-2"].baseUrl).hostname, "127.0.0.1");
+		assert.equal(t.providerConfigs.get(slotId).baseUrl, "https://api.anthropic.com");
+	} finally { await t.fire("session_shutdown"); rmSync(MODELS, { force: true }); }
+});
+
+test("an API-key slot's stale loopback accepts only its current key and preserves API-key shaping", async () => {
+	rmSync(MODELS, { force: true });
+	const slotId = "anthropic-account-2";
+	const t = setup({ accounts: { [slotId]: { type: "api_key", key: "sk-ant-api-current-fixture" } } });
+	const originalFetch = globalThis.fetch;
+	let calls = 0;
+	try {
+		await t.fire("session_start");
+		globalThis.fetch = (async (url: any, init: any) => {
+			calls++;
+			assert.equal(new URL(String(url)).origin, "https://api.anthropic.com");
+			const headers = new Headers(init.headers);
+			assert.equal(headers.get("x-api-key"), "sk-ant-api-current-fixture");
+			assert.equal(headers.get("authorization"), null);
+			assert.equal(headers.get("x-app"), null);
+			assert.equal(Buffer.from(init.body).toString("utf8"), "{}");
+			return Response.json({ ok: true });
+		}) as typeof fetch;
+		const route = publishedRouteFor(currentSlotProxyPort(), slotId);
+		assert.equal((await callProxy(route, "/v1/messages", { "x-api-key": "wrong-api-fixture" })).status, 401);
+		assert.equal(calls, 0);
+		assert.equal((await callProxy(route, "/v1/messages", { "x-api-key": "sk-ant-api-current-fixture" })).status, 200);
+		assert.equal(calls, 1);
+	} finally { globalThis.fetch = originalFetch; await t.fire("session_shutdown"); rmSync(MODELS, { force: true }); }
+});
+
+test("legacy set-only refresh persistence updates the private sidecar without writing public OAuth", async () => {
+	rmSync(MODELS, { force: true });
+	const slotId = "anthropic-account-2";
+	const t = setup({ accounts: { [slotId]: { type: "oauth", access: "old-private-fixture", refresh: "old-refresh" } } });
+	try {
+		await t.fire("session_start");
+		const before = JSON.parse(readFileSync(AUTH, "utf8"))[slotId];
+		const next = { type: "oauth", access: "new-private-fixture", refresh: "new-refresh", expires: Date.now() + 3600_000 };
+		assert.equal(await persistRefreshedCredentials({ set: () => assert.fail("must not expose OAuth through public AuthStorage") }, slotId, next), true);
+		assert.deepEqual(JSON.parse(readFileSync(AUTH, "utf8"))[slotId], before);
+		assert.deepEqual(JSON.parse(readFileSync(PROXY_OAUTH_SIDECAR, "utf8"))[slotId], next);
+	} finally { await t.fire("session_shutdown"); rmSync(MODELS, { force: true }); }
+});
+
+test("production Anthropic refresh keeps a shadowed slot private throughout persistence", async () => {
+	rmSync(MODELS, { force: true });
+	const slotId = "anthropic-account-2";
+	const t = setup({ hostAuthStorage: "pi-0.84", accounts: { [slotId]: { type: "oauth", access: "sk-ant-oat01-expired-production-fixture", refresh: "production-refresh-fixture", expires: Date.now() - 1000 } } });
+	const originalFetch = globalThis.fetch;
+	const snapshots: any[] = [];
+	let refreshes = 0, forwarded: string | undefined;
+	try {
+		await t.fire("session_start");
+		const slot = JSON.parse(readFileSync(MODELS, "utf8")).providers[slotId];
+		const modify = t.ctx.modelRegistry.authStorage.modify;
+		t.ctx.modelRegistry.authStorage.modify = async (...args: any[]) => {
+			const result = await modify(...args);
+			snapshots.push(JSON.parse(readFileSync(AUTH, "utf8"))[slotId]);
+			await wait(10); // A bare child could observe this committed auth snapshot.
+			return result;
+		};
+		globalThis.fetch = (async (url: any, init: any) => {
+			if (new URL(String(url)).pathname.endsWith("/oauth/token")) {
+				refreshes++;
+				return Response.json({ access_token: "sk-ant-oat01-rotated-production-fixture", refresh_token: "rotated-production-refresh", expires_in: 3600 });
+			}
+			assert.equal(new URL(String(url)).origin, "https://api.anthropic.com");
+			forwarded = new Headers(init.headers).get("authorization") ?? undefined;
+			return Response.json({ ok: true });
+		}) as typeof fetch;
+		const result = await callProxy(slot.baseUrl, "/v1/messages", { authorization: `Bearer ${slot.apiKey}` });
+		assert.equal(result.status, 200, result.body);
+		assert.equal(refreshes, 1);
+		assert.equal(forwarded, "Bearer sk-ant-oat01-rotated-production-fixture");
+		assert.ok(snapshots.length > 0, "the real production AuthStorage persistence path was exercised");
+		assert.ok(snapshots.every(entry => entry.type === "api_key" && entry.key === slot.apiKey), JSON.stringify(snapshots));
+		assert.equal(JSON.parse(readFileSync(PROXY_OAUTH_SIDECAR, "utf8"))[slotId].access, "sk-ant-oat01-rotated-production-fixture");
+	} finally { globalThis.fetch = originalFetch; await t.fire("session_shutdown"); rmSync(MODELS, { force: true }); }
+});
+
+test("the Anthropic wrapper preserves ordinary API-key request semantics and pre-dispatch cancellation", async () => {
+	const t = setup({ accounts: { anthropic: { type: "api_key", key: "sk-ant-api-plain-fixture" } } });
+	const streamSimple = t.providerConfigs.get("anthropic").streamSimple;
+	const model: any = { provider: "anthropic", api: "anthropic-messages", id: "claude-sonnet-4-6", baseUrl: "https://api.anthropic.com",
+		reasoning: false, input: ["text"], contextWindow: 200000, maxTokens: 100, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+	const tool = { name: "read", description: "fixture", parameters: { type: "object", properties: {} } };
+	const context: any = usesModernAgentContext(PI_HOST_VERSION)
+		? { messages: [{ role: "system", content: "PLAIN_API_SYSTEM", toolsAdded: [tool], timestamp: 0 }, { role: "user", content: "fixture", timestamp: 1 }] }
+		: { systemPrompt: "PLAIN_API_SYSTEM", tools: [tool], messages: [{ role: "user", content: "fixture", timestamp: 1 }] };
+	let captured: any;
+	await streamSimple(model, context, { apiKey: "sk-ant-api-plain-fixture", maxRetries: 0, fetch: async (_url: any, init: any) => {
+		captured = { headers: Object.fromEntries(new Headers(init.headers)), body: JSON.parse(init.body) };
+		return new Response('{"error":{"message":"fixture stop"}}', { status: 400 });
+	} }).result();
+	assert.ok(captured);
+	assert.equal(captured.headers["x-api-key"], "sk-ant-api-plain-fixture");
+	assert.equal(captured.headers.authorization, undefined);
+	assert.equal(captured.headers["x-app"], undefined);
+	assert.equal(captured.body.tools[0].name, "read");
+	assert.equal(JSON.stringify(captured.body).includes("x-anthropic-billing-header:"), false);
+	const abort = new AbortController(); abort.abort();
+	let fetches = 0;
+	const stopped = await streamSimple(model, context, { apiKey: "sk-ant-oat01-cancel-fixture", signal: abort.signal, maxRetries: 0,
+		fetch: async () => { fetches++; throw new Error("must not dispatch an already cancelled request"); } }).result();
+	assert.equal(stopped.stopReason, "aborted", stopped.errorMessage);
+	assert.equal(fetches, 0);
+});
+
+test("an extension-free Pi subprocess authenticates a numbered Anthropic slot and completes a native tool roundtrip", async () => {
+	rmSync(MODELS, { force: true });
+	const slotId = "anthropic-account-2";
+	const t = setup({ accounts: { [slotId]: { type: "oauth", access: "sk-ant-oat01-private-cli-fixture", refresh: "private-cli-refresh", expires: Date.now() + 3600_000 } } });
+	const originalFetch = globalThis.fetch;
+	let child: ReturnType<typeof spawn> | undefined;
+	try {
+		await t.fire("session_start");
+		const slot = JSON.parse(readFileSync(MODELS, "utf8")).providers[slotId];
+		const modelId = slot.models.find((model: any) => /sonnet/.test(model.id))?.id ?? slot.models[0].id;
+		writeFileSync(join(AGENT_DIR, "fixture.txt"), "OAUTH_CLI_RESULT");
+		const requests: any[] = [];
+		globalThis.fetch = (async (url: any, init: any) => {
+			assert.equal(new URL(String(url)).origin, "https://api.anthropic.com");
+			const body = JSON.parse(Buffer.from(init.body).toString("utf8"));
+			requests.push({ body, headers: Object.fromEntries(new Headers(init.headers)) });
+			return new Response(anthropicOAuthFixtureResponse(modelId, requests.length === 1), { headers: { "content-type": "text/event-stream" } });
+		}) as typeof fetch;
+		const cli = fileURLToPath(new URL("./cli.js", import.meta.resolve("@earendil-works/pi-coding-agent")));
+		child = spawn(process.execPath, [cli, "-p", "--mode", "json", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates",
+			"--system-prompt", "OAUTH_CLI_SYSTEM", "--model", `${slotId}/${modelId}`, "--tools", "read", "Read fixture.txt then reply DONE"], {
+			cwd: AGENT_DIR,
+			env: { PATH: process.env.PATH, HOME: AGENT_DIR, PI_CODING_AGENT_DIR: AGENT_DIR, PI_OFFLINE: "1", PI_TELEMETRY: "0", TERM: "dumb", NO_COLOR: "1" },
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let stdout = "", stderr = "";
+		child.stdout!.on("data", chunk => { stdout += chunk; });
+		child.stderr!.on("data", chunk => { stderr += chunk; });
+		const exit = await new Promise<number | null>((resolve, reject) => {
+			const timeout = setTimeout(() => { child?.kill("SIGTERM"); reject(new Error("bare Pi OAuth fixture timed out")); }, 30_000);
+			child!.once("error", error => { clearTimeout(timeout); reject(error); });
+			child!.once("close", code => { clearTimeout(timeout); resolve(code); });
+		});
+		assert.equal(exit, 0, stderr + stdout);
+		assert.match(stdout, /DONE/);
+		assert.equal(requests.length, 2, stderr + stdout);
+		for (const request of requests) {
+			assert.equal(request.headers.authorization, "Bearer sk-ant-oat01-private-cli-fixture");
+			assert.equal(request.headers["x-app"], "cli");
+			assert.match(JSON.stringify(request.body), /x-anthropic-billing-header:/);
+			assert.equal(request.body.tools.find((tool: any) => /read/i.test(tool.name))?.name, "Read");
+			assert.equal(JSON.stringify(request).includes(slot.apiKey), false);
+		}
+		assert.match(JSON.stringify(requests[1].body), /OAUTH_CLI_RESULT/);
+	} finally {
+		child?.kill("SIGTERM");
+		globalThis.fetch = originalFetch;
+		await t.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("a disconnected loopback caller aborts its upstream request without a provider failure verdict", async () => {
+	rmSync(MODELS, { force: true });
+	const t = setup({ accounts: { "anthropic-account-2": { type: "oauth", access: "sk-ant-oat01-cancel-fixture", refresh: "cancel-refresh" } } });
+	const originalFetch = globalThis.fetch;
+	let req: ReturnType<typeof httpRequest> | undefined;
+	let began!: () => void, cancelled!: () => void;
+	const started = new Promise<void>(resolve => { began = resolve; });
+	const aborted = new Promise<void>(resolve => { cancelled = resolve; });
+	try {
+		await t.fire("session_start");
+		const slot = JSON.parse(readFileSync(MODELS, "utf8")).providers["anthropic-account-2"];
+		globalThis.fetch = ((_: any, init: any) => new Promise<Response>((_resolve, reject) => {
+			assert.ok(init.signal instanceof AbortSignal);
+			init.signal.addEventListener("abort", () => { cancelled(); reject(new DOMException("caller cancelled", "AbortError")); }, { once: true });
+			began();
+		})) as typeof fetch;
+		const url = new URL(slot.baseUrl + "/v1/messages");
+		req = httpRequest(url, { method: "POST", headers: { authorization: `Bearer ${slot.apiKey}` } });
+		req.on("error", () => {}); req.end("{}");
+		await Promise.race([started, wait(2000).then(() => { throw new Error("proxy request did not start"); })]);
+		req.destroy();
+		await Promise.race([aborted, wait(2000).then(() => { throw new Error("upstream cancellation did not propagate"); })]);
+		assert.equal(readDebugLog().some(event => event.kind === "slot_proxy_upstream_failed" && event.reason === "caller cancelled"), false);
+	} finally {
+		req?.destroy();
+		globalThis.fetch = originalFetch;
 		await t.fire("session_shutdown");
 		rmSync(MODELS, { force: true });
 	}

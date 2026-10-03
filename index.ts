@@ -28,6 +28,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createPayloadStream } from "./provider-payload-stream.ts";
 import { mutateProxyAuth } from "./auth-file-transaction.ts";
 import { mergeStateDeltas, mutateStateFile } from "./state-file-transaction.ts";
+import { normalizeModelPins, persistModelPin, validModelPinScope } from "./model-pins.ts";
+import { mutateConfigFile } from "./config-file-transaction.ts";
 import { createHash } from "node:crypto";
 import {
 	accessSync,
@@ -486,6 +488,9 @@ type ProviderFailoverConfig = {
 	// { "openai-codex": ["gpt-5.6", "gpt-5.5"], "anthropic": ["claude-opus-4-9"] }.
 	// Keys: anthropic | openai-codex | cursor | qwen | ollama.
 	preferredModels?: Record<string, string[]>;
+	// Explicit per-account-group model preference. It never selects a foreground model,
+	// bypasses a cooldown, or authorizes an automatic quality-tier change.
+	pinnedModels?: Record<string, string>;
 	// Forward-progress watchdog tunables (see constants above). 0/absent ⇒ built-in default.
 	resumeIdleTimeoutMs?: number;
 	stuckWatchdogMs?: number;
@@ -535,6 +540,7 @@ type RuntimeConfig = Required<
 		| "preferLatestModel"
 		| "reasoningLevel"
 		| "preferredModels"
+		| "pinnedModels"
 		| "resumeIdleTimeoutMs"
 		| "stuckWatchdogMs"
 		| "compactionWatchdogMs"
@@ -1044,7 +1050,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.23.2";
+const VERSION = "1.24.0";
 function sourceFingerprint(): string {
 	try {
 		const root = dirname(fileURLToPath(import.meta.url));
@@ -1665,6 +1671,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	preferLatestModel: true,
 	reasoningLevel: "auto",
 	preferredModels: {},
+	pinnedModels: {},
 	resumeIdleTimeoutMs: RESUME_IDLE_TIMEOUT_MS,
 	stuckWatchdogMs: STUCK_WATCHDOG_MS,
 	compactionWatchdogMs: COMPACTION_WATCHDOG_MS,
@@ -1677,11 +1684,12 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 function ensureDefaultConfig() {
 	if (existsSync(CONFIG_PATH)) return;
 	mkdirSync(dirname(CONFIG_PATH), { recursive: true, mode: 0o700 });
-	writeFileSync(
-		CONFIG_PATH,
-		`${JSON.stringify(DEFAULT_CONFIG, null, "\t")}\n`,
-		{ encoding: "utf8", mode: 0o600 },
-	);
+	try {
+		writeFileSync(CONFIG_PATH, `${JSON.stringify(DEFAULT_CONFIG, null, "\t")}\n`,
+			{ encoding: "utf8", mode: 0o600, flag: "wx" });
+	} catch (error: any) {
+		if (error?.code !== "EEXIST") throw error; // Another root initialized it first.
+	}
 }
 
 function positiveOr(value: unknown, fallback: number) {
@@ -1885,6 +1893,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 							.filter(([, v]) => v.length > 0),
 					)
 				: {},
+		pinnedModels: normalizeModelPins(raw.pinnedModels),
 		resumeIdleTimeoutMs: positiveOr(
 			raw.resumeIdleTimeoutMs,
 			RESUME_IDLE_TIMEOUT_MS,
@@ -2136,6 +2145,20 @@ export async function persistRefreshedCredentials(
 		write?: (data: Record<string, any>) => void;
 	},
 ): Promise<boolean> {
+	// Even legacy/set-only hosts must never unhide a numbered slot while saving a refresh.
+	if (!io && isChildFacingPlaceholderForSlot(readAuthFileRaw()[provider], provider)) {
+		try {
+			let persisted = false;
+			mutateProxyAuth(AUTH_PATH, PROXY_OAUTH_PATH, (auth, sidecar) => {
+				if (!isChildFacingPlaceholderForSlot(auth[provider], provider) || sidecar[provider]?.type !== "oauth") {
+					return { auth, sidecar, changed: false };
+				}
+				persisted = true;
+				return { auth, sidecar: { ...sidecar, [provider]: credential }, changed: true };
+			}, "shadow");
+			return persisted;
+		} catch { return false; }
+	}
 	if (typeof authStorage?.modify === "function") {
 		try {
 			await authStorage.modify(provider, () => credential);
@@ -3402,7 +3425,7 @@ const MINIMAL_ANTHROPIC_OAUTH_PROMPT = [
 ].join("\n");
 const CLAUDE_CODE_IDENTITY_PREFIX =
 	"You are Claude Code, Anthropic's official CLI";
-const CLAUDE_CODE_VERSION = "2.1.280";
+const CLAUDE_CODE_VERSION = "2.1.288";
 const BILLING_HEADER_SALT = "59cf53e54c78";
 const BILLING_HEADER_POSITIONS = [4, 7, 20] as const;
 const CLAUDE_CODE_ENTRYPOINT = "sdk-cli";
@@ -4733,11 +4756,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			let refreshed: AuthEntry | undefined;
 			let persistedUnderLock = false;
 			if (family === "anthropic") {
-				refreshed = await refreshAnthropicCredentials(
-					entry,
-					undefined,
-					provider,
-				);
+				const refreshAnthropic = (current: AuthEntry) => refreshAnthropicCredentials(current, undefined, provider);
+				if (typeof authStorage?.modify === "function") {
+					refreshed = await refreshAndPersistWithStorageLock({
+						provider, credentials: entry, authStorage,
+						readLatest: () => readAuthFile()[provider],
+						refresh: refreshAnthropic,
+						isShadowed: stored => isChildFacingPlaceholderForSlot(stored, provider),
+						persistShadowed: credential => writeProxyOAuthSidecar({ ...readProxyOAuthSidecar(), [provider]: credential }),
+					});
+					persistedUnderLock = true;
+				} else {
+					refreshed = await refreshAnthropic(entry);
+				}
 			} else if (family === "openai-codex") {
 				const refreshCodex = async (current: AuthEntry) => {
 					const next = mergeRefreshedCredentials(
@@ -6535,12 +6566,27 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return [last, ...defaults.filter((id) => id !== last)];
 	}
 
-	// Rank of a model within its family's newest-first preferred order (0 = newest).
-	// Unknown models sort last. Used to keep the latest model across accounts, not
-	// just within one account, during fallback ranking.
+	function pinnedModelForProvider(provider: string): string | undefined {
+		const scope = accountGroup(provider, config.qwenProvider);
+		return Object.hasOwn(config.pinnedModels, scope) ? config.pinnedModels[scope] : undefined;
+	}
+
+	function pinQualityCompatible(model: any, source: any): boolean {
+		const pin = pinnedModelForProvider(model.provider);
+		const sourceBand = modelQualityBand(source?.id, source?.provider);
+		return !pin || !sameModelIdentity(model.id, pin) || !sourceBand || modelQualityBand(model.id, model.provider) === sourceBand;
+	}
+
+	function preferredModelsForProvider(provider: string): string[] {
+		const order = familyPreferredModels(classifyProvider(provider, config.qwenProvider));
+		const pin = pinnedModelForProvider(provider);
+		return pin ? [pin, ...order.filter(id => !sameModelIdentity(id, pin))] : order;
+	}
+
+	// Rank includes an explicit pin, but a pin is not evidence of a quality upgrade.
+	// Unknown models sort last; identity/liveness/quality constraints still apply first.
 	function modelRecencyRank(model: any): number {
-		const family = classifyProvider(model?.provider, config.qwenProvider);
-		const order = familyPreferredModels(family);
+		const order = preferredModelsForProvider(String(model?.provider ?? ""));
 		const idx = order.findIndex((id) => sameModelIdentity(id, model?.id));
 		return idx < 0 ? Number.MAX_SAFE_INTEGER : idx;
 	}
@@ -6569,15 +6615,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			? classifyProvider(currentModel.provider, config.qwenProvider)
 			: undefined;
 		const sameFamily = !!family && !!currentFamily && family === currentFamily;
-		// A per-family config override (preferredModels) wins, so a new flagship model can be
-		// pinned without a code change. Order is newest-first either way.
-		const preferred = familyPreferredModels(family);
+		// A pin leads this account's model order without synthesizing a model or losing the
+		// underlying preferredModels/catalog order when that pin is missing or ineligible.
+		const preferred = preferredModelsForProvider(parsed.provider);
 		const keepCurrent = sameFamily && currentModel?.id ? [currentModel.id] : [];
 		// `preferredOnly` means "take this family's flagship, not an arbitrary model". A provider
 		// outside the managed families has no flagship list at all, so honouring it literally
 		// yields no candidate and the switch fails — which is what made an unmanaged account
 		// unreachable by name. Fall back to what Pi knows for it.
-		const usePreferredOnly = preferredOnly && preferred.length > 0;
+		const usePreferredOnly = preferredOnly && preferred.length > 0 && !pinnedModelForProvider(parsed.provider);
 		const registryModels = usePreferredOnly
 			? []
 			: [
@@ -6590,7 +6636,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// once downgraded (e.g. gpt-5.4 after a momentary limit on gpt-5.5) is upgraded back to
 		// the latest the moment it is available again — instead of carrying the old model forever.
 		// Legacy mode keeps the current model first (never changes the model unless it has to).
-		const modelIds = config.preferLatestModel
+		const modelIds = config.preferLatestModel || pinnedModelForProvider(parsed.provider)
 			? [...preferred, ...keepCurrent, ...registryModels]
 			: [...keepCurrent, ...preferred, ...registryModels];
 		const result: any[] = [];
@@ -6676,6 +6722,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			const sourceBand = modelQualityBand(currentModel?.id, currentModel?.provider);
 			const sourceExceptional = apexIdentity(currentModel?.id);
 			models = models.filter((model: any) => {
+				// A preference is not tier consent, including routed automatic compaction.
+				if (!pinQualityCompatible(model, currentModel)) return false;
 				const candidateBand = modelQualityBand(model.id, model.provider);
 				const candidateExceptional = apexIdentity(model.id);
 				// Cursor's Fable-named aliases are deliberately uncalibrated. A user may select one
@@ -6724,8 +6772,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// preferLatestModel still upgrades a known older sibling (gpt-5.4 → gpt-5.5)
 				// on a healthy account. An unranked catalog leftover (claude-4-sonnet beating
 				// grok only because it sorts first) must never steal the user's model.
+				const pinRepresentative = sameModelIdentity(pinnedModelForProvider(flagshipPick.provider), flagshipPick.id);
 				const upgrade =
 					config.preferLatestModel &&
+					!pinRepresentative &&
 					idRank !== Number.MAX_SAFE_INTEGER &&
 					flagRank < idRank;
 				pick = upgrade ? flagshipPick : identityPick;
@@ -8954,9 +9004,84 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return true;
 	}
 
+	function modelPinLines(ctx: any): string[] {
+		const entries = Object.entries(config.pinnedModels).sort(([a], [b]) => a.localeCompare(b));
+		if (!entries.length) return ["  none — /multi-account pin <provider/model>"];
+		const models = [...ctx.modelRegistry.getAll(), ...[...hiddenProviderModels.values()].flat()];
+		const now = Date.now();
+		return entries.map(([scope, id]) => {
+			const matching = models.filter((model: any) => accountGroup(model.provider, config.qwenProvider) === scope &&
+				sameModelIdentity(model.id, id) && isAccountChatModel(model));
+			const usable = matching.filter((model: any) => !isInvalidated(model.provider) && providerHasUsableAuth(ctx, model.provider));
+			const sourceBand = modelQualityBand(ctx.model?.id, ctx.model?.provider);
+			const compatible = usable.filter((model: any) => {
+				const band = modelQualityBand(model.id, model.provider);
+				if (sourceBand === "apex") return band === "apex" && explicitlyAllowsPaidApexFallback(model, ctx.model);
+				return band !== "apex" && (!sourceBand || band === sourceBand) && (!apexIdentity(model.id) || sameModelIdentity(model.id, ctx.model?.id));
+			});
+			const free = compatible.filter((model: any) => providerRecoveryAt(model.provider, now) <= now &&
+				(exhaustedUntilByModel.get(`${model.provider}/${model.id}`) ?? 0) <= now);
+			const status = !matching.length ? "missing from catalog" : !usable.length ? "no usable account" :
+				!compatible.length ? "incompatible with current quality band" : !free.length ? "cooling" : "preference available";
+			return `  ${scope}: ${id} — ${status}`;
+		});
+	}
+
 	async function handleCommand(args: string, ctx: any) {
-		const [commandRaw, arg1] = args.trim().split(/\s+/);
+		const parts = args.trim().split(/\s+/);
+		const [commandRaw, arg1] = parts;
 		const command = (commandRaw || "status").toLowerCase();
+
+		if (command === "pins") {
+			if (parts.length > 2 || (arg1 && arg1 !== "list")) {
+				ctx.ui.notify("pi-multi-account: usage: /multi-account pins [list]", "warning");
+				return;
+			}
+			ctx.ui.notify(["pi-multi-account model pins (routing preferences, not foreground selections):", ...modelPinLines(ctx),
+				"Exact siblings, authentication, health and quality checks still apply. Other sessions adopt edits on reload/restart."].join("\n"), "info");
+			return;
+		}
+
+		if (command === "pin" || command === "unpin") {
+			const parsed = command === "pin" ? parseTarget(arg1) : undefined;
+			const provider = command === "pin" ? parsed?.provider : arg1;
+			if (parts.length !== 2 || !provider || !validModelPinScope(provider) ||
+				(command === "pin" && (!parsed?.modelId || /\s/.test(parsed.modelId)))) {
+				ctx.ui.notify("pi-multi-account: usage: /multi-account pin <provider/model> | unpin <provider-or-family> | pins [list]", "warning");
+				return;
+			}
+			if (subagentChild || sessionClosed || !ctx.isIdle()) {
+				ctx.ui.notify("pi-multi-account: change model pins from an idle live parent session; no preference was saved", "warning");
+				return;
+			}
+			const epoch = chainEpoch;
+			const selected = ctx.model ? ref(ctx.model.provider, ctx.model.id) : undefined;
+			const session = ctx.sessionManager?.getSessionId?.();
+			const canCommit = () => !subagentChild && !sessionClosed && ctx.isIdle() && epoch === chainEpoch &&
+				(ctx.model ? ref(ctx.model.provider, ctx.model.id) : undefined) === selected && ctx.sessionManager?.getSessionId?.() === session;
+			const scope = accountGroup(provider, config.qwenProvider);
+			const modelId = parsed?.modelId;
+			const exact = modelId ? findModelIncludingHidden(ctx, provider, modelId) : undefined;
+			const known = modelId ? [exact, ...ctx.modelRegistry.getAll(), ...[...hiddenProviderModels.values()].flat()].filter((model: any) =>
+				model && accountGroup(model.provider, config.qwenProvider) === scope && sameModelIdentity(model.id, modelId)) : [];
+			if ((exact && !isAccountChatModel(exact)) || (known.length > 0 && !known.some(isAccountChatModel))) {
+				ctx.ui.notify("pi-multi-account: only account chat models can be pinned; virtual/image/classifier models remain host-owned", "warning");
+				return;
+			}
+			try {
+				const pins = persistModelPin(CONFIG_PATH, scope, modelId, canCommit);
+				config = { ...config, pinnedModels: pins };
+				claimUserControl("model pin preference changed");
+				logEvent("model_pin_set", { scope, model: modelId ?? null });
+				ctx.ui.notify(command === "unpin"
+					? `pi-multi-account: removed model pin for ${scope}; the underlying preferredModels/catalog order is unchanged`
+					: `pi-multi-account: pinned ${scope}/${modelId} across sibling accounts.${known.length ? "" : " Saved but currently absent; inactive until the catalog supplies it."} Current model was not changed; select a cheaper tier explicitly. Other sessions adopt this preference on reload/restart.`,
+					known.length || command === "unpin" ? "info" : "warning");
+			} catch {
+				ctx.ui.notify("pi-multi-account: model pin was not saved; check config syntax, permissions/lock and session ownership. Runtime preference is unchanged", "error");
+			}
+			return;
+		}
 
 		if (command === "log" || command === "logs" || command === "debug") {
 			// Show the diagnostic black box so a misbehaviour can be reported precisely.
@@ -9250,14 +9375,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			configuredFallbacks = [];
 			config = { ...config, fallbacks: [] };
 			try {
-				const raw = existsSync(CONFIG_PATH)
-					? JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
-					: {};
-				raw.fallbacks = [];
-				writeFileSync(CONFIG_PATH, `${JSON.stringify(raw, null, "\t")}\n`, {
-					encoding: "utf8",
-					mode: 0o600,
-				});
+				mutateConfigFile(CONFIG_PATH, () => ({ fallbacks: [] }));
 			} catch {
 				// non-fatal: in-memory state is still cleared
 			}
@@ -9471,7 +9589,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				? `${parsed.provider}/${parsed.modelId}`
 				: parsed.provider;
 			const candidates = resolveTargets(ctx, resolvedTarget, ctx.model, true).filter(
-				(model: any) => providerHasUsableAuth(ctx, model.provider),
+				(model: any) => providerHasUsableAuth(ctx, model.provider) &&
+					(parsed.modelId !== undefined || pinQualityCompatible(model, ctx.model)),
 			);
 			if (candidates.length === 0) {
 				const hasAuth = providerHasUsableAuth(ctx, parsed.provider);
@@ -9616,14 +9735,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			onlyActiveModels = next2;
 			config = { ...config, onlyActive: next2 };
 			try {
-				const raw = existsSync(CONFIG_PATH)
-					? JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
-					: {};
-				raw.onlyActive = next2;
-				writeFileSync(CONFIG_PATH, `${JSON.stringify(raw, null, "\t")}\n`, {
-					encoding: "utf8",
-					mode: 0o600,
-				});
+				mutateConfigFile(CONFIG_PATH, () => ({ onlyActive: next2 }));
 			} catch {
 				// non-fatal: the in-memory flag still applies for this session
 			}
@@ -9682,14 +9794,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 			config = { ...config, providerPriority: next };
 			try {
-				const raw = existsSync(CONFIG_PATH)
-					? JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
-					: {};
-				raw.providerPriority = next;
-				writeFileSync(CONFIG_PATH, `${JSON.stringify(raw, null, "\t")}\n`, {
-					encoding: "utf8",
-					mode: 0o600,
-				});
+				mutateConfigFile(CONFIG_PATH, () => ({ providerPriority: next }));
 			} catch {
 				// non-fatal: the ladder still applies for this session
 			}
@@ -9865,7 +9970,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// list below, `switch` was effectively undiscoverable and `next` pressed repeatedly
 				// was the only way anyone found to reach a chosen account.
 				`Switch accounts: /multi-account best — jump straight to an account that can work now · /multi-account switch <provider> — e.g. /multi-account switch ${rotation.find((p) => p !== ctx.model?.provider) ?? rotation[0] ?? "<provider>"} · /multi-account next steps through the rotation in order`,
-				`Other commands: status | accounts [refresh] | best | priority [...] | limits [refresh] | models | pick | save-default | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
+				`Model pins: ${Object.entries(config.pinnedModels).map(([scope, id]) => `${scope}/${id}`).join(", ") || "none"} · /multi-account pins to inspect`,
+				`Other commands: status | accounts [refresh] | best | priority [...] | limits [refresh] | models | pick | pin <provider/model> | unpin <provider-or-family> | pins [list] | save-default | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
 			].join("\n"),
 			"info",
 		);
@@ -10661,8 +10767,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// An existing child-facing placeholder (possibly published by another root)
 	// must also stay on its canonical loopback, even when this instance's proxy is off.
 	function numberedAnthropicBaseUrl(id: string): string {
+		const raw = readAuthFileRaw()[id];
+		if (raw?.type === "api_key" && !isChildFacingPlaceholderForSlot(raw, id)) return "https://api.anthropic.com";
 		if (typeof slotProxyPort === "number") return publishedRouteFor(slotProxyPort, id);
-		if (isChildFacingPlaceholderForSlot(readAuthFileRaw()[id], id)) return publishedRouteFor(SLOT_PROXY_PORT, id);
+		if (isChildFacingPlaceholderForSlot(raw, id)) return publishedRouteFor(SLOT_PROXY_PORT, id);
 		return "https://api.anthropic.com";
 	}
 
@@ -10686,6 +10794,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * the canonical loopback instead, even if this sibling disabled its own proxy.
 	 */
 	function numberedCodexBaseUrl(id: string): string {
+		const raw = readAuthFileRaw()[id];
+		if (raw?.type === "api_key" && !isChildFacingPlaceholderForSlot(raw, id)) return "https://chatgpt.com/backend-api";
 		if (typeof slotProxyPort === "number") return publishedRouteFor(slotProxyPort, id);
 		if (!config.childProxy && !isChildFacingPlaceholderForSlot(readAuthFileRaw()[id], id)) {
 			return "https://chatgpt.com/backend-api";
@@ -10746,10 +10856,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		const parsed = parseProxyPath(req.url ?? "");
-		const presentedSecret =
-			parsed && typeof readAuthFile()[parsed.slotId]?.access === "string"
-				? readAuthFile()[parsed.slotId]?.access
-				: undefined;
+		const presentedEntry = parsed ? readAuthFile()[parsed.slotId] : undefined;
+		const presentedSecret = presentedEntry?.type === "oauth" ? presentedEntry.access :
+			presentedEntry?.type === "api_key" ? presentedEntry.key : undefined;
 		const verdict = admitRequest({
 			rawUrl: req.url ?? "",
 			headers: req.headers ?? {},
@@ -10782,9 +10891,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		let body: Buffer | undefined =
 			req.method === "GET" || req.method === "HEAD" ? undefined : await readRequestBody(req);
 		if (body && verdict.route.family === "anthropic" && credential?.type === "oauth") {
-			// The same shaping the in-process path applies: without it Anthropic rejects a
-			// subscription token outright. Done here because the child cannot do it — it has no
-			// idea it is talking to a proxy.
+			// The extension-owned billing shaping also applies to bare children. Their native
+			// host supplies OAuth identity/tool mapping through the token-shaped placeholder,
+			// but does not load this extension's billing-header maintenance.
 			try {
 				const parsed = JSON.parse(body.toString("utf8"));
 				const reshaped = shapeAnthropicOAuthPayload(parsed);
@@ -10794,11 +10903,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 		}
 
+		if (res.destroyed) return;
+		const upstreamAbort = new AbortController();
+		const callerClosed = () => {
+			if (!res.writableFinished) upstreamAbort.abort();
+		};
+		res.once("close", callerClosed);
 		try {
 			const upstream = await fetch(shaped.url, {
 				method: req.method ?? "POST",
 				headers: shaped.headers,
 				body: body && body.length ? new Uint8Array(body) : undefined,
+				signal: upstreamAbort.signal,
 			});
 			const outgoing: Record<string, string> = {};
 			upstream.headers.forEach((value, name) => {
@@ -10810,7 +10926,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (upstream.body) {
 				await new Promise<void>((resolve) => {
 					const stream = Readable.fromWeb(upstream.body as any);
-					stream.on("error", () => resolve());
+					stream.on("error", () => { res.destroy(); resolve(); });
 					res.on("close", () => resolve());
 					stream.pipe(res);
 					res.on("finish", () => resolve());
@@ -10818,11 +10934,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			} else {
 				res.end();
 			}
-			logEvent("slot_proxy_forwarded", {
+			if (!upstreamAbort.signal.aborted) logEvent("slot_proxy_forwarded", {
 				slot: verdict.route.slotId,
 				status: upstream.status,
 			});
 		} catch (error) {
+			// A caller cancellation is not an upstream/provider failure or a quota verdict.
+			if (upstreamAbort.signal.aborted || res.destroyed) return;
 			const reason = error instanceof Error ? error.message : String(error);
 			logEvent("slot_proxy_upstream_failed", { slot: verdict.route.slotId, reason });
 			if (!res.headersSent) {
@@ -10831,6 +10949,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			} else {
 				res.end();
 			}
+		} finally {
+			res.off("close", callerClosed);
 		}
 	}
 
@@ -11089,12 +11209,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		for (const id of slots) {
 			const family = proxyFamilyOf(id);
 			if (!family) continue;
-			const baseUrl = publishedRouteFor(port, id);
+			const oauth = parent[id]?.type === "oauth";
+			const baseUrl = oauth ? publishedRouteFor(port, id) :
+				family === "anthropic" ? "https://api.anthropic.com" : "https://chatgpt.com/backend-api";
 			if (family === "anthropic") {
 				provisionNativeSlot(id, {
 					api: "anthropic-messages",
 					baseUrl,
-					apiKey: placeholderKeyFor(family),
+					apiKey: oauth ? placeholderKeyFor(family) : undefined,
 					models: DEFAULT_ANTHROPIC_MODELS.map((modelId) => ({
 						...anthropicModelDef(modelId, id),
 						baseUrl,
@@ -11115,7 +11237,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				provisionNativeSlot(id, {
 					api: "openai-codex-responses",
 					baseUrl,
-					apiKey: placeholderKeyFor(family),
+					apiKey: oauth ? placeholderKeyFor(family) : undefined,
 					models,
 				});
 			}

@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { containsPackageSecret } from "../package-secret-scan.ts";
 
 const root = new URL("..", import.meta.url).pathname;
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
@@ -55,12 +56,6 @@ if (declaredVersion !== manifest.version) {
 		`VERSION mismatch: index.ts says ${declaredVersion}, package.json says ${manifest.version}`,
 	);
 }
-const secretPatterns = [
-	/gh[pousr]_[A-Za-z0-9_]{20,}/,
-	/sk-[A-Za-z0-9_-]{8,}/,
-	/AIza[0-9A-Za-z_-]{20,}/,
-	/-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-];
 const personalPatterns = [
 	/@gmail\.com/i,
 	new RegExp(["vitalij", "simko"].join(""), "i"),
@@ -69,7 +64,7 @@ const personalPatterns = [
 ];
 for (const name of names) {
 	const text = readFileSync(join(root, name), "utf8");
-	if (secretPatterns.some((pattern) => pattern.test(text))) {
+	if (containsPackageSecret(text)) {
 		throw new Error(`Potential secret marker in publishable file: ${name}`);
 	}
 	if (personalPatterns.some((pattern) => pattern.test(text))) {

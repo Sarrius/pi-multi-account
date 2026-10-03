@@ -8,6 +8,7 @@ When the account you are using hits a quota or rate limit, `pi-multi-account` tr
 
 - **Auto-discovers** every authenticated account from `~/.pi/agent/auth.json` (Anthropic Claude Pro/Max, OpenAI/ChatGPT Codex, Kimi For Coding, Cursor, Qwen/Alibaba, and Ollama) and builds the failover rotation dynamically — no manual config editing.
 - **Grows the rotation on login.** Run `/login`, choose **Use a subscription**, then select a numbered slot such as `anthropic-account-3` or `openai-codex-account-5`. The next discovery sweep adds it to the rotation automatically.
+- **Pins a preferred model per account group.** `/multi-account pin provider/model` persists a routing preference across sibling accounts; `unpin` removes it and `pins` explains its current applicability. It never changes the current model, Pi's registry, cooldowns, startup defaults, or automatic quality-band rules.
 - **Auto-discovers new Codex models per account.** At session start (and on `reload` / `rediscover`) it reads OpenAI's authenticated model catalog, mirrors each account's actually available models onto its Pi alias, and follows OpenAI's server priority. A new flagship can therefore win immediately without an extension release or a hard-coded model id.
 - **Handles auth failures without poisoning healthy OAuth accounts.** A generic final 401 briefly cools down a refreshable account and moves the current task forward. Explicit provider verdicts such as `authentication token has been invalidated` force an early refresh; if the refresh token is dead too, the slot is removed and Pi prints the interactive `/login` recovery steps.
 - **Fails over on quota / rate-limit** (429 / 402 / 403 and friends): the exhausted account goes on cooldown (parsed from the provider's own reset metadata when available) and Pi first tries another account with the same model. If it must leave the family, it preserves the model's quality band — Sol/Opus/other frontier flagships stay frontier; Terra/Sonnet stay balanced; Luna/Haiku stay fast — and keeps the session's thinking level. A fresh provider verdict of `blocked` or 100% is skipped automatically instead of wasting the turn; manual `next` remains an explicit one-attempt override for stale telemetry.
@@ -109,6 +110,9 @@ All three names are aliases for the same command: `/multi-account`, `/provider-f
 | `add [anthropic\|codex\|kimi\|cursor\|ollama\|qwen]` | Print the next free account slot to select from the interactive `/login` picker. Subscription families (Anthropic, Codex, Kimi, Cursor) are logged in through `/login`; API-key families are filled in `auth.json`. |
 | `remove [anthropic\|codex\|kimi\|cursor\|ollama\|qwen\|<provider-id>]` | Remove an account from `auth.json` and rotation. Family name drops the highest numbered alias slot; a full provider id removes that exact slot. Aliases: `rm`, `delete`. |
 | `next` | Manually switch to the next compatible-quality fallback, deliberately overriding recorded cooldowns for one attempt. Use explicit `switch` to select a different tier. |
+| `pin <provider/model>` | Persist a model preference for that provider's account group. A numbered alias applies to its siblings too. Requires an idle live parent; does not select the model. |
+| `unpin <provider-or-family>` | Remove one group's pin without changing its underlying `preferredModels` or catalog order. Idempotent; requires an idle live parent. |
+| `pins [list]` | Read-only sorted list of pins and known catalog/account/cooldown/quality applicability. Never refreshes credentials or probes providers. |
 | `pick` | Open a model picker for the current account only. Uses native model selection and its thinking default; never removes models from the shared registry. Requires an idle interactive session. Built-in `/model` remains unchanged. |
 | `save-default` | Save the current model and effective thinking level together as global startup defaults for new sessions. Preserves other models' thinking preferences. Project overrides, explicit CLI options, and resumed-session settings still take precedence. Automatic rotation never invokes this. |
 | `only-active [on\|off]` | Legacy picker preference; use `pick` for a current-account-only menu. The complete Pi model registry remains available to all clients. Alias: `focus`. |
@@ -116,6 +120,27 @@ All three names are aliases for the same command: `/multi-account`, `/provider-f
 | `reset` | Clear all cooldowns, invalidations and any pending auto-resume. |
 | `reload` | Reload config from disk and re-discover accounts. |
 | `enable` / `disable` | Turn failover on/off for the current Pi process. |
+
+### Model pins
+
+```text
+/multi-account pin openai-codex-account-2/gpt-5.4
+/multi-account pins
+/multi-account unpin openai-codex
+```
+
+Pins live in `provider-failover.json` under `pinnedModels`, keyed by account group (for example
+`openai-codex`, `anthropic` or a custom provider's base ID). Other sessions adopt edits on
+`reload` or restart. Extension configuration commands share a locked read-latest transaction;
+unrelated settings and other groups' pins survive concurrent extension writes. A failed/cancelled write does not change the runtime preference.
+
+A pin leads the group's underlying preference/catalog order, but **a healthy exact-model
+sibling still wins**. A pin is not evidence that an older model is a newer flagship. Missing
+models remain saved but inactive until the catalog supplies them; cooling or unauthenticated
+accounts stay ineligible. A cheaper pin cannot demote frontier work. Select the cheaper model
+explicitly with `/model`, `pick` or `switch provider/model` to enter that quality band. A
+provider-only `switch` and automatic compaction cannot use a pin as cheaper-tier consent. Pi-owned
+virtual/image/classifier models cannot be pinned as account chat fallbacks.
 
 ## How rotation membership works
 
@@ -167,7 +192,8 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 | `debugLog` | `true` | Write a structured "black box" decision log to `provider-failover-debug.log` (no credentials — only provider/model ids and truncated reasons). View with `/multi-account log`. |
 | `preferLatestModel` | `true` | Rank the strongest/current model ahead of older siblings within the current quality band during automatic failover. |
 | `reasoningLevel` | `"auto"` | `"auto"` follows the level the session actually runs at (your Pi default, `/thinking`, per-agent `--thinking`) and only restores it after switches. Set an explicit level (`"off"`…`"xhigh"`) to **force** it on every turn regardless of the session — `"xhigh"` only if you really want the extreme level. |
-| `preferredModels` | `{}` | Optional manual strongest-first override per family; when present it wins over live catalog priority. |
+| `preferredModels` | `{}` | Optional manual strongest-first override per family; when present it wins over live catalog priority. A model pin leads this order without rewriting it. |
+| `pinnedModels` | `{}` | One explicit model ID per account group, managed by `pin` / `unpin`. Inactive when unavailable/incompatible; never grants account health or a different automatic quality band. |
 
 State (cooldowns, invalidations, recent switches, credential-free Codex model catalogs, and a diagnostic pending marker) is persisted to `~/.pi/agent/provider-failover-state.json`. The actual pending task is session-local: one Pi window never consumes or resumes another window's work. Pending work is discarded when its owning session closes.
 
@@ -221,6 +247,14 @@ A failover is only useful if the agent actually keeps working afterward. These g
 the suite on the supported newer Pi versions. Host-binding tests load the real extension wrapper
 through Pi with a deliberately incompatible nested pi-ai, inspect native request bodies, and
 complete a streamed tool-call/result cycle without real credentials or provider traffic.
+A real `pi --no-extensions` subprocess also exercises a numbered Anthropic OAuth slot and native
+`read` tool roundtrip against a fake upstream. Its non-secret OAuth-shaped placeholder preserves
+native identity and tool mapping; real credentials remain in the parent. Legacy publications
+migrate only with an intact parent-side recovery copy. Production refresh persists into the
+private sidecar under the auth lock without briefly replacing the child's placeholder. API-key
+aliases remain direct native publications; stale loopback metadata accepts only the current key.
+Cancellation aborts the proxy's upstream request; ordinary API-key request semantics remain unchanged. These are deterministic regressions,
+not a claim of live Anthropic or Codex-image acceptance.
 
 The optional companion Goal integration is selected explicitly; it never assumes a personal path:
 
