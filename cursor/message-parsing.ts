@@ -28,6 +28,8 @@ export interface OpenAIMessage {
   content: string | null | ContentPart[];
   tool_call_id?: string;
   tool_calls?: OpenAIToolCall[];
+  /** Explicit Pi tool outcome, forwarded by the provider-level adapter. */
+  pi_tool_error?: boolean;
 }
 
 export interface ParsedToolResult {
@@ -58,6 +60,7 @@ export interface ParsedTurn {
 export interface ToolResultInfo {
   toolCallId: string;
   content: string;
+  isError?: boolean;
 }
 
 export interface ParsedMessages {
@@ -172,14 +175,14 @@ export function parseMessages(
       const content = textContent(msg.content);
       const existing = toolCallId ? currentTurn.toolCallById.get(toolCallId) : undefined;
       if (existing) {
-        existing.result = { content, isError: false };
+        existing.result = { content, isError: msg.pi_tool_error === true };
       } else {
         const step: ParsedToolCallStep = {
           kind: "toolCall",
           toolCallId,
           toolName: "",
           arguments: {},
-          result: { content, isError: false },
+          result: { content, isError: msg.pi_tool_error === true },
         };
         currentTurn.steps.push(step);
         if (toolCallId) currentTurn.toolCallById.set(toolCallId, step);
@@ -203,7 +206,7 @@ export function parseMessages(
       if (hasAnyToolResults) {
         toolResults = toolCallSteps
           .filter((step) => step.result)
-          .map((step) => ({ toolCallId: step.toolCallId, content: step.result!.content }));
+          .map((step) => ({ toolCallId: step.toolCallId, content: step.result!.content, ...(step.result!.isError ? {isError:true} : {}) }));
       }
       // Keep the whole in-flight turn, not just its results. The live path ignores this;
       // the rebuild path cannot reconstruct the session without it.
@@ -279,6 +282,26 @@ const CONTINUATION_INSTRUCTION =
 
 export const CONTINUATION_PROMPT = CONTINUATION_INSTRUCTION;
 
+// A correct local KV blob is not proof every upstream model consumed it. Repeat
+// a small latest canonical checkpoint in the action as well. Full prior context
+// remains in the root prompt; never truncate it or inflate the known ~50KB stall.
+const INLINE_CHECKPOINT_BYTES = 32_000;
+const INLINE_ACTION_BYTES = 48_000;
+function withInlineCheckpoint(action:string,prior:ParsedTurn[]):string {
+  const canonicalPrefix="The conversation history before this point was compacted into the following summary:";
+  let turn: ParsedTurn | undefined;
+  for (let index = prior.length - 1; index >= 0; index -= 1) {
+    if (prior[index].userText.startsWith(canonicalPrefix)) {
+      turn = prior[index];
+      break;
+    }
+  }
+  const summary=turn?.userText.match(/<summary>\s*([\s\S]*?)\s*<\/summary>/)?.[1];
+  if(!summary || Buffer.byteLength(summary)>INLINE_CHECKPOINT_BYTES || Buffer.byteLength(action)>INLINE_CHECKPOINT_BYTES)return action;
+  const combined=`Previous Pi compaction checkpoint (prior context, not a new request):\n<summary>\n${summary}\n</summary>\n\nCurrent user request:\n${action}`;
+  return Buffer.byteLength(combined)<=INLINE_ACTION_BYTES?combined:action;
+}
+
 /** Put restored history in Cursor's fetched root prompt, never in its size-sensitive action. */
 export function systemPromptForRebuild(
   systemPrompt: string,
@@ -312,7 +335,7 @@ export function requestActionText(
   const prior = allPriorTurns(parsed);
   const transcript = renderTurnsAsText(prior);
   if (!transcript) return parsed.userText;
-  return parsed.pendingTurn ? CONTINUATION_INSTRUCTION : parsed.userText;
+  return withInlineCheckpoint(parsed.pendingTurn ? CONTINUATION_INSTRUCTION : parsed.userText,prior);
 }
 
 /** @deprecated Use {@link requestActionText}. */

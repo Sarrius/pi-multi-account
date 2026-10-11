@@ -31,6 +31,11 @@ export interface StoredConversation {
    * constantly. See {@link isStaleForTranscript}.
    */
   turnsCovered: number;
+  coveredTranscript?: string[];
+  expectedAssistant?: string;
+  expectedToolIds?: string[];
+  requestGeneration?: number;
+  workspaceCwd?: string;
 }
 
 /**
@@ -45,9 +50,57 @@ export interface StoredConversation {
  * Rebuilding costs tokens; resuming a stale checkpoint costs correctness, silently. So the
  * doubt is resolved toward rebuilding.
  */
-export function isStaleForTranscript(stored: StoredConversation, completedTurns: number): boolean {
-  if (!stored.checkpoint) return false;
-  return completedTurns > stored.turnsCovered + 1;
+export function isStaleForTranscript(stored: StoredConversation, transcript: number | readonly Record<string, any>[]): boolean {
+  // Legacy callers can still inspect the coarse heuristic. Actual proxy admission
+  // supplies canonical messages and must prove exact coverage, not count user turns.
+  if (typeof transcript === "number") return !!stored.checkpoint && transcript > stored.turnsCovered + 1;
+  if (!stored.checkpoint && !stored.expectedAssistant) return false;
+  const covered=stored.coveredTranscript;
+  if(!covered || !stored.expectedAssistant || transcript.length<=covered.length)return true;
+  if(covered.some((digest,i)=>digest!==messageDigest(transcript[i])))return true;
+  if(messageDigest(transcript[covered.length])!==stored.expectedAssistant)return true;
+  const suffix=transcript.slice(covered.length+1);
+  const toolIds=stored.expectedToolIds??[];
+  if(toolIds.length===0)return suffix.length!==1 || suffix[0].role!=="user";
+  const seen=new Set<string>();
+  return suffix.length===0 || suffix.some(message=>{
+    const id=message.tool_call_id;
+    if(message.role!=="tool" || !toolIds.includes(id) || seen.has(id))return true;
+    seen.add(id);return false;
+  });
+}
+
+function canonical(value:any):any {
+  if(Array.isArray(value))return value.map(canonical);
+  if(value && typeof value==="object")return Object.fromEntries(Object.keys(value).sort().filter(key=>value[key]!==undefined).map(key=>[key,canonical(value[key])]));
+  return value;
+}
+function messageDigest(message:Record<string,any>):string {
+  let content=message.content??"";
+  if(Array.isArray(content) && content.every(part=>part?.type==="text"))content=content.map(part=>part.text??"").join("");
+  const tools=message.tool_calls?.map((call:any)=>{
+    let args=call.function?.arguments;
+    if(typeof args==="string"){try{args=JSON.parse(args);}catch{/* malformed data stays distinct */}}
+    return {id:call.id,name:call.function?.name,arguments:args};
+  });
+  return createHash("sha256").update(JSON.stringify(canonical({role:message.role,content,tool_calls:tools?.length?tools:undefined,tool_call_id:message.tool_call_id}))).digest("hex");
+}
+export function coverTranscript(stored:StoredConversation,messages:readonly Record<string,any>[]):void {
+  stored.coveredTranscript=messages.map(messageDigest);
+  stored.expectedAssistant=undefined;stored.expectedToolIds=undefined;
+}
+export function recordAssistantResponse(stored:StoredConversation,message:Record<string,any>):void {
+  stored.expectedAssistant=messageDigest(message);
+  stored.expectedToolIds=(message.tool_calls??[]).map((call:any)=>call.id);
+}
+export interface ConversationReceipt {stored:StoredConversation;generation:number;}
+export function captureConversation(convKey:string):ConversationReceipt|undefined {
+  const stored=conversationStates.get(convKey);if(!stored)return undefined;
+  const generation=(stored.requestGeneration??0)+1;stored.requestGeneration=generation;
+  return {stored,generation};
+}
+export function ownsConversation(convKey:string,receipt:ConversationReceipt|undefined):boolean {
+  return !!receipt && conversationStates.get(convKey)===receipt.stored && receipt.stored.requestGeneration===receipt.generation;
 }
 
 export const conversationStates = new Map<string, StoredConversation>();

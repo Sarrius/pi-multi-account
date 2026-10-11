@@ -22,6 +22,8 @@
  */
 import http2 from "node:http2";
 import crypto from "node:crypto";
+import { STATUS_PREFIX, transportStatusFromHeaders, safeTransportStatus } from "./transport-status.mjs";
+const reportStatus=status=>{const safe=safeTransportStatus(status);if(Object.keys(safe).length)process.stderr.write(STATUS_PREFIX+JSON.stringify(safe)+"\n");};
 
 const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
 
@@ -105,6 +107,7 @@ function killBridge() {
 }
 
 client.on("error", () => {
+  reportStatus({code:"unavailable"});
   clearTimeout(timeout);
   process.exit(1);
 });
@@ -124,6 +127,8 @@ if (!unary) {
   headers["connect-protocol-version"] = "1";
 }
 const h2Stream = client.request(headers);
+h2Stream.on("response",headers=>reportStatus(transportStatusFromHeaders(headers)));
+h2Stream.on("trailers",headers=>reportStatus(transportStatusFromHeaders(headers)));
 
 // Forward H2 response data → stdout (length-prefixed)
 h2Stream.on("data", (chunk) => {
@@ -139,6 +144,7 @@ h2Stream.on("end", () => {
 });
 
 h2Stream.on("error", () => {
+  reportStatus({code:"unavailable"});
   clearTimeout(timeout);
   client.close();
   process.exit(1);

@@ -25,12 +25,9 @@ export type UsageSnapshot = {
 	 */
 	account?: string;
 	/**
-	 * The provider's OWN verdict on whether this account can be used right now.
-	 *
-	 * Everything else in this snapshot is arithmetic we do on quota windows — a forecast about
-	 * one window, which cannot see session limits, plan limits or an early reset. This field is
-	 * not that: it is the account answering the question directly. `undefined` means the response
-	 * stated no verdict, and only then is the forecast the best information available.
+	 * The quota/account endpoint's availability verdict at fetchedAt, not proof that
+	 * a model inference will succeed. A later actual inference refusal outranks it
+	 * during bounded retry backoff. Undefined means that no verdict was reported.
 	 */
 	serviceable?: boolean;
 	primary?: UsageWindow;
@@ -130,7 +127,8 @@ export function parseCodexUsageBody(
 	const rateLimit = record(source.rate_limit);
 	const primary = usageWindow(rateLimit.primary_window, 5 * 60 * 60);
 	const secondary = usageWindow(rateLimit.secondary_window, 7 * 24 * 60 * 60);
-	if (!primary && !secondary) return undefined;
+	if (!primary && !secondary && typeof rateLimit.allowed !== "boolean" &&
+		typeof rateLimit.limit_reached !== "boolean") return undefined;
 	const credits = record(source.credits);
 	return {
 		provider,
@@ -139,13 +137,11 @@ export function parseCodexUsageBody(
 		credentialHash,
 		plan: typeof source.plan_type === "string" ? source.plan_type : undefined,
 		account: typeof source.email === "string" && source.email.trim() ? source.email : undefined,
-		// `limit_reached` is the negative statement and `allowed` the positive one; either alone
-		// is enough. Read both so a response that carries only one of them still answers.
+		// Either explicit negative wins a contradictory payload. Missing windows must not
+		// erase a provider verdict, and missing flags must never be invented as permission.
 		serviceable:
-			typeof rateLimit.limit_reached === "boolean"
-				? !rateLimit.limit_reached
-				: typeof rateLimit.allowed === "boolean"
-					? rateLimit.allowed
+			rateLimit.allowed === false || rateLimit.limit_reached === true ? false
+				: rateLimit.allowed === true || rateLimit.limit_reached === false ? true
 					: undefined,
 		primary,
 		secondary,

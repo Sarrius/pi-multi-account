@@ -2,10 +2,35 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mergeStateDeltas, mutateStateFile } from "../state-file-transaction.ts";
+import { mergeStateDeltas, mutateConfigFile, mutateStateFile } from "../state-file-transaction.ts";
+
+for (const content of ["{broken", "[]", "null", '"not an object"']) {
+  test(`config transactions never replace malformed user-authored content: ${content}`, () => {
+    const dir = mkdtempSync(join(tmpdir(), "multi-config-invalid-")), path = join(dir, "config.json");
+    let transforms = 0;
+    try {
+      writeFileSync(path, content);
+      assert.throws(() => mutateConfigFile(path, () => { transforms++; return {}; }));
+      assert.equal(transforms, 0);
+      assert.equal(readFileSync(path, "utf8"), content);
+      assert.deepEqual(readdirSync(dir), ["config.json"], "failed write releases its lock and leaves no temp file");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+test("config transactions merge against the latest disk object and publish privately", () => {
+  const dir = mkdtempSync(join(tmpdir(), "multi-config-")), path = join(dir, "config.json");
+  try {
+    writeFileSync(path, JSON.stringify({ excludedProviders: ["first"], unrelated: { keep: true } }));
+    mutateConfigFile(path, disk => ({ ...disk, excludedProviders: [...disk.excludedProviders, "second"] }));
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { excludedProviders: ["first", "second"], unrelated: { keep: true } });
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    assert.deepEqual(readdirSync(dir), ["config.json"]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("shared state preserves other sessions' cooldowns and deliberate local clearing", () => {
   const base: { exhaustedUntilByProvider: Record<string, number> } = { exhaustedUntilByProvider: { a: 1, b: 2 } };
@@ -16,6 +41,22 @@ test("shared state preserves other sessions' cooldowns and deliberate local clea
   assert.equal(mergeStateDeltas(before,
     { usageByProvider: { a: { credentialHash: "same", fetchedAt: 2 } } },
     { usageByProvider: { a: { credentialHash: "same", fetchedAt: 3 } } }).usageByProvider.a.fetchedAt, 3);
+});
+
+test("quota QA: stale clearing cannot erase a newer sibling refusal or cooldown", () => {
+  const old = { observedAt: 1, retryAt: 100, reportedUntil: 1000 };
+  const newer = { observedAt: 2, retryAt: 200, reportedUntil: 2000 };
+  const base = { limitRefusalByProvider: { a: old }, exhaustedUntilByProvider: { a: 100 } };
+  const cleared = { limitRefusalByProvider: {}, exhaustedUntilByProvider: {} };
+  const disk = { limitRefusalByProvider: { a: newer }, exhaustedUntilByProvider: { a: 200 } };
+  const retained = mergeStateDeltas(base, cleared, disk);
+  assert.deepEqual(retained.limitRefusalByProvider, disk.limitRefusalByProvider);
+  assert.deepEqual(retained.exhaustedUntilByProvider, disk.exhaustedUntilByProvider);
+  const deliberate = mergeStateDeltas(base, cleared, base);
+  assert.deepEqual(deliberate.limitRefusalByProvider, {});
+  assert.deepEqual(deliberate.exhaustedUntilByProvider, {}, "deliberately clearing the same observed value remains allowed");
+  assert.equal(mergeStateDeltas(base, { ...base, exhaustedUntilByProvider: { a: 50 } }, disk).exhaustedUntilByProvider.a, 200);
+  assert.deepEqual(mergeStateDeltas<Record<string, any>>({}, { limitRefusalByProvider: { a: old } }, disk).limitRefusalByProvider.a, newer);
 });
 
 test("busy state lock fails boundedly without mutation and permits a later retry", () => {

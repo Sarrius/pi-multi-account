@@ -31,6 +31,7 @@ process.env.PI_CURSOR_PROVIDER_ROOT = cursorRoot;
 const rejections = [];
 const registeredProviders = [];
 const modelCounts = {};
+const modelIds = {};
 process.on("unhandledRejection", (reason) => {
 	rejections.push(String(reason && reason.message ? reason.message : reason));
 });
@@ -40,7 +41,7 @@ const mod = await import(process.argv[4]);
 const events = {};
 const notifies = [];
 const pi = {
-	registerProvider: (id, cfg) => { registeredProviders.push(id); modelCounts[id] = (cfg?.models ?? []).length; },
+	registerProvider: (id, cfg) => { registeredProviders.push(id); modelCounts[id] = (cfg?.models ?? []).length; modelIds[id] = (cfg?.models ?? []).map((model) => model.id); },
 	registerCommand: () => {},
 	on: (name, handler) => { events[name] = handler; },
 	setModel: async () => true,
@@ -65,7 +66,10 @@ const ctx = {
 	getContextUsage: () => undefined,
 };
 
-mod.default(pi);
+const factoryStart = Date.now();
+await mod.default(pi);
+const factoryElapsedMs = Date.now() - factoryStart;
+const factoryModelIds = modelIds.cursor;
 await events.session_start?.({}, ctx);
 await new Promise((r) => setTimeout(r, 400));
 
@@ -95,6 +99,8 @@ try {
 console.log("__RESULT__" + JSON.stringify({
 	registeredProviders,
 	modelCounts,
+	factoryModelIds,
+	factoryElapsedMs,
 	sessionStartCompleted: notifies.some((m) => m.includes("loaded")),
 	pendingFromAfter: state.pendingFrom,
 	cursorNotices: notifies.filter((m) => /Cursor/.test(m) && /failed to load/.test(m)).length,
@@ -262,6 +268,32 @@ test("a logged-in Cursor account gets its real catalog at startup, not the fallb
 		2,
 		`the fallback list (1 model) must be replaced by the discovered catalog, got ${result.modelCounts["cursor"]}`,
 	);
+});
+
+test("cold factory resolves a resumed Grok only after publishing its discovered catalog", () => {
+	const slowDiscovery = DISCOVERING_PROVIDER.replace(
+		'export async function discoverCursorModels() { return [{ id: "cursor-grok-4.6" }, { id: "claude-4.6-opus-high" }]; }',
+		'export async function discoverCursorModels() { await new Promise((r) => setTimeout(r, 80)); return [{ id: "grok-4.7" }]; }',
+	);
+	const result = runSession(slowDiscovery, undefined, {
+		cursor: { type: "oauth", access: "c1", refresh: "cr1" },
+	});
+	assert.ok(result.factoryModelIds.includes("grok-4.7"),
+		"Pi restores saved cursor/grok-4.7 immediately after the awaited factory returns");
+	assert.equal(result.factoryElapsedMs >= 70, true, "the discovery must actually be awaited");
+});
+
+test("cold factory has a bounded catalog wait when Cursor discovery never settles", () => {
+	const stalledDiscovery = DISCOVERING_PROVIDER.replace(
+		'export async function discoverCursorModels() { return [{ id: "cursor-grok-4.6" }, { id: "claude-4.6-opus-high" }]; }',
+		'export async function discoverCursorModels() { return new Promise(() => {}); }',
+	);
+	const result = runSession(stalledDiscovery, undefined, {
+		cursor: { type: "oauth", access: "c1", refresh: "cr1" },
+	});
+	assert.ok(result.factoryElapsedMs >= 1400 && result.factoryElapsedMs < 3500);
+	assert.deepEqual(result.factoryModelIds, ["fallback-only"]);
+	assert.equal(result.sessionStartCompleted, true);
 });
 
 test("startup without a logged-in Cursor account keeps the fallback list and stays quiet", () => {

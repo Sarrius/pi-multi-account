@@ -1,4 +1,4 @@
-/** Shared cooldown/cache state: lock before reading, merge local deltas, publish atomically. */
+/** Shared JSON transactions: lock before reading, merge local deltas, publish atomically. */
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -7,7 +7,7 @@ import { dirname } from "node:path";
 const require = createRequire(import.meta.url);
 const pause = new Int32Array(new SharedArrayBuffer(4));
 const MAP_FIELDS = ["exhaustedUntilByProvider", "exhaustedUntilByModel", "invalidatedByProvider",
-  "usageUntrustedUntilByProvider", "usageByProvider", "codexModelCatalogByProvider", "lastProbeAtByProvider"];
+  "usageUntrustedUntilByProvider", "limitRefusalByProvider", "usageByProvider", "codexModelCatalogByProvider", "lastProbeAtByProvider"];
 type State = Record<string, any>;
 
 export function mergeStateDeltas<T extends State>(base: T, local: T, disk: T): T {
@@ -22,8 +22,15 @@ export function mergeStateDeltas<T extends State>(base: T, local: T, disk: T): T
         const newer = values[key], candidate = after[key];
         if ((field === "usageByProvider" || field === "codexModelCatalogByProvider") &&
             newer?.credentialHash === candidate?.credentialHash && newer?.fetchedAt > candidate?.fetchedAt) continue;
+        if (field === "limitRefusalByProvider" && newer?.observedAt > candidate?.observedAt) continue;
+        // A local shorten based on an older snapshot cannot roll back a newer sibling refusal.
+        if (["exhaustedUntilByProvider", "usageUntrustedUntilByProvider"].includes(field) &&
+            JSON.stringify(newer) !== JSON.stringify(before[key]) && newer > candidate) continue;
         values[key] = candidate;
-      } else delete values[key];
+      } else if (JSON.stringify(values[key]) === JSON.stringify(before[key])) {
+        // CAS deletion: an old meter/cleanup may clear what it saw, never a newer observation.
+        delete values[key];
+      }
     }
     (merged as State)[field] = values;
   }
@@ -31,6 +38,15 @@ export function mergeStateDeltas<T extends State>(base: T, local: T, disk: T): T
 }
 
 export function mutateStateFile<T extends State>(path: string, transform: (disk: T) => T): T {
+  return mutateJsonFile(path, transform, true);
+}
+
+/** User-authored config is not a derived cache: malformed data must never be replaced. */
+export function mutateConfigFile<T extends State>(path: string, transform: (disk: T) => T): T {
+  return mutateJsonFile(path, transform, false);
+}
+
+function mutateJsonFile<T extends State>(path: string, transform: (disk: T) => T, recoverMalformed: boolean): T {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   if (!existsSync(path)) {
     try { writeFileSync(path, "{}\n", { mode: 0o600, flag: "wx" }); }
@@ -52,9 +68,12 @@ export function mutateStateFile<T extends State>(path: string, transform: (disk:
     let disk: T;
     try {
       disk = JSON.parse(readFileSync(path, "utf8"));
-      if (!disk || typeof disk !== "object" || Array.isArray(disk)) disk = {} as T;
+      if (!disk || typeof disk !== "object" || Array.isArray(disk)) {
+        if (!recoverMalformed) throw new Error("Config must be a JSON object");
+        disk = {} as T;
+      }
     } catch (error) {
-      if (!(error instanceof SyntaxError)) throw error;
+      if (!recoverMalformed || !(error instanceof SyntaxError)) throw error;
       disk = {} as T; // Derived state is recoverable; credentials never enter this file.
     }
     const next = transform(disk);

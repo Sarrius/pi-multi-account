@@ -19,6 +19,9 @@
  *     surface as an uncaught exception in the host process.
  */
 
+import { STATUS_PREFIX, safeTransportStatus } from "./transport-status.mjs";
+export interface BridgeTransportStatus { httpStatus?: number; code?: string; retryAfterMs?: number; }
+
 export interface BridgeStreams {
   stdin: {
     write(chunk: Uint8Array): unknown;
@@ -30,7 +33,8 @@ export interface BridgeStreams {
   stdout: {
     on(event: "data" | "error", listener: (payload: never) => void): unknown;
   } | null;
-  on(event: "exit" | "error", listener: (payload: never) => void): unknown;
+  stderr?: { on(event: "data" | "error", listener: (payload: never) => void): unknown } | null;
+  on(event: "exit" | "close" | "error", listener: (payload: never) => void): unknown;
   kill(signal?: NodeJS.Signals | number): unknown;
 }
 
@@ -42,6 +46,7 @@ export interface BridgeHandle {
   destroy(): void;
   onData(cb: (chunk: Buffer) => void): void;
   onClose(cb: (code: number) => void): void;
+  onStatus?(cb: (status: BridgeTransportStatus) => void): void;
 }
 
 /** Length-prefix a frame the way the bridge process expects it. */
@@ -60,11 +65,19 @@ export function createBridgeHandle(
   const cbs = {
     data: null as ((chunk: Buffer) => void) | null,
     close: null as ((code: number) => void) | null,
+    status: null as ((status: BridgeTransportStatus) => void) | null,
   };
 
   let exited = false;
   let ended = false;
+  let closed = false;
   let exitCode = 1;
+  let lastStatus: BridgeTransportStatus | undefined;
+  const closeOnce=(code:number|null)=>{
+    if(closed)return;
+    closed=true;exitCode=code??exitCode;
+    const callback=cbs.close;cbs.close=null;callback?.(exitCode);
+  };
 
   // The safety net. A late write, a broken pipe, a bridge that could not be spawned at all —
   // none of them may reach the host's uncaughtException handler.
@@ -76,6 +89,23 @@ export function createBridgeHandle(
   }) as never);
   proc.on("error", ((error: Error) => {
     debug("bridge.process_error", { error: String(error) });
+    if(!closed){closeOnce(1);try{proc.kill();}catch{/* failed spawn has no child */}}
+  }) as never);
+
+  // A stderr metadata channel leaves stdout's old protobuf framing compatible.
+  let statusBuffer="";
+  proc.stderr?.on("error", ((error:Error)=>debug("bridge.stderr_error",{error:String(error)})) as never);
+  proc.stderr?.on("data", ((chunk:Buffer)=>{
+    statusBuffer+=chunk.toString("utf8");
+    if(statusBuffer.length>16_384){statusBuffer="";return;}
+    const lines=statusBuffer.split("\n");statusBuffer=lines.pop()??"";
+    for(const line of lines){
+      if(!line.startsWith(STATUS_PREFIX))continue;
+      try{
+        const status=safeTransportStatus(JSON.parse(line.slice(STATUS_PREFIX.length)));
+        if(Object.keys(status).length){lastStatus=status;cbs.status?.(status);}
+      }catch{/* malformed metadata never reaches consumers */}
+    }
   }) as never);
 
   let pending = Buffer.alloc(0);
@@ -92,13 +122,14 @@ export function createBridgeHandle(
 
   proc.on("exit", ((code: number | null) => {
     exited = true;
-    exitCode = code ?? 1;
-    debug("bridge.exit", { exitCode });
-    cbs.close?.(exitCode);
+    if(!closed)exitCode = code ?? 1;
+    debug("bridge.exit", { exitCode:code??1, terminalCode:exitCode });
+    // stdout can still contain terminal frames; consume through process close.
   }) as never);
+  proc.on("close", ((code:number|null)=>{exited=true;closeOnce(code);}) as never);
 
   const writable = (): boolean => {
-    if (exited || ended) return false;
+    if (closed || exited || ended) return false;
     const stdin = proc.stdin;
     if (!stdin) return false;
     return !stdin.writableEnded && !stdin.destroyed;
@@ -121,7 +152,7 @@ export function createBridgeHandle(
     proc,
     // Ended counts as dead: a caller that asks `alive` is deciding whether to keep talking on
     // this pipe, and the answer for a pipe we closed ourselves is no.
-    get alive() { return !exited && !ended; },
+    get alive() { return !closed && !exited && !ended; },
     write(data: Uint8Array) {
       if (!writable()) {
         debug("bridge.write_after_end", { bytes: data.length, exited, ended });
@@ -142,14 +173,16 @@ export function createBridgeHandle(
       } catch (error) {
         debug("bridge.kill_failed", { error: String(error) });
       }
+      closeOnce(1); // disposal settles even if a failed kill never emits exit/close
     },
     onData(cb: (chunk: Buffer) => void) { cbs.data = cb; },
     onClose(cb: (code: number) => void) {
-      if (exited) {
+      if (closed) {
         queueMicrotask(() => cb(exitCode));
       } else {
         cbs.close = cb;
       }
     },
+    onStatus(cb) { cbs.status=cb;const snapshot=lastStatus;if(snapshot)queueMicrotask(()=>cb(snapshot)); },
   };
 }

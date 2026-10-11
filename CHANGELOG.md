@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [Unreleased local QA candidate — 1.23.3]
+
+This local checkout is based on 1.23.2. GitHub main already reports 1.24.0; this section is not a published release, a claim of Pi 1.x compatibility, or permission to replace main.
+
+### Fixed and checked locally
+
+- Persist actual inference-refusal evidence across aliases and restarts. Positive quota metadata cannot erase the refusal during bounded retry backoff; provider reset estimates and next recheck times are distinct. A completed, non-error inference clears the evidence; HTTP 200 at stream start, OAuth refresh and absent completion markers do not.
+- Preserve newer sibling refusal/cooldown records from stale shared-state deletion or shortening. Coupled weekly exhaustion wins over short-window headroom; Cursor's independent pools retain their existing semantics.
+- Codex usage parsing keeps explicit availability verdicts without windows and treats an explicit negative as authoritative when flags conflict.
+- Status, all-account waiting and continuation messages distinguish eligibility from verified availability and use the actual failure reason. Interrupted handoffs are optional bounded context, not promised durable verbatim receipts; missing results retain unknown-effect status. Exact shipped legacy defaults migrate in memory without rewriting custom prompts.
+- Backport and strengthen the Anthropic refresh transaction pattern discussed in #90: all extension-owned forced refresh families now use one cross-process credential transaction, preserve numbered-slot sidecars/placeholders, and never fall through to blind writes. Without a transactional host API, decline before spending the token.
+- Classify the known Grok 4.7 flagship as frontier (#91), without guessing future 4.x quality or treating `fast` / `non-reasoning` variants as equivalent.
+- Update the billing-header Claude Code version to the registry-observed 2.1.296 (#89), rather than the tracker's already stale 2.1.289 proposal.
+
+### Security investigation — not remediation
+
+- Confirmed Dependabot #13 (`GHSA-q2hr-2g5m-vwhr`) affects nested development `brace-expansion` 5.0.9. The SDK's published shrinkwrap defeats the attempted root override/targeted update; successful npm exits did not change the actual module. Removed the ineffective override and added a read-only advisory checker with regression tests. The dependency and GitHub alert remain unresolved; no SDK/global upgrade or alert dismissal is claimed.
+
 ## [1.23.2] — 2026-09-24
 
 ### Fixed

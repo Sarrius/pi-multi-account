@@ -159,8 +159,11 @@ export function mapNativeExecToPiTool(
 				return {
 					toolName: "bash",
 					args: {
-						command: asString(args.command),
-						...(args.workingDirectory ? { cwd: asString(args.workingDirectory) } : {}),
+						// Pi bash has no cwd argument. Scope the entire script so a failed
+						// directory change cannot execute a later semicolon-separated write.
+						command: args.workingDirectory
+							? `cd -- ${quote(asString(args.workingDirectory))} && {\n${asString(args.command) || ":"}\n}`
+							: asString(args.command),
 					},
 					resultCase: execCase === "shellStreamArgs" ? "shellStream" : "shellResult",
 				};
