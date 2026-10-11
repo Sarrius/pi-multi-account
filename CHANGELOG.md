@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Classify the known Grok 4.7 flagship as frontier (#91), without guessing future 4.x quality or treating `fast` / `non-reasoning` variants as equivalent.
 - Update the billing-header Claude Code version to the registry-observed 2.1.296 (#89), rather than the tracker's already stale 2.1.289 proposal.
 
-- Fence forced-refresh auth/sidecar commits on actual lease identity, cancellation and unchanged disk state; stage sidecar outputs until joined refresh work settles. Use a fast heartbeat compatible with older synchronous host writers, and propagate Cursor cancellation through fetch and body consumption. A lost lease never removes its replacement or grants stale-write authority.
+- Fence forced-refresh auth/sidecar commits on actual lease identity, cancellation and unchanged disk state; stage sidecar outputs until joined refresh work settles. Use a fast heartbeat compatible with older synchronous host writers, and propagate Cursor cancellation through fetch and body consumption. A lost lease never removes its replacement or grants stale-write authority, including immediate process exit; async leases avoid library-global exit unlink and contention waits within the cancellation budget.
 - Preserve upstream 1.24.0 model pins, host-native Anthropic placeholders, opaque-token proxy refresh and Codex image routing while integrating the local Cursor/compaction and quota-recovery repairs.
 
 ### Security
