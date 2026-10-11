@@ -3,7 +3,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PROXY_PLACEHOLDER_JWT, PROXY_PLACEHOLDER_KEY } from "../slot-proxy.ts";
+import { ANTHROPIC_PROXY_PLACEHOLDER_KEY, PROXY_PLACEHOLDER_JWT, PROXY_PLACEHOLDER_KEY } from "../slot-proxy.ts";
 import { CURSOR_PROXY_PLACEHOLDER_KEY } from "../cursor-bridge.ts";
 import {
 	applyRestoreAll,
@@ -12,6 +12,7 @@ import {
 	applyShadowPlan,
 	childFacingAuthEntry,
 	isChildFacingPlaceholder,
+	isChildFacingPlaceholderForSlot,
 	mergeParentAuth,
 	needsAuthShadow,
 	type AuthBlob,
@@ -28,7 +29,7 @@ test("a numbered Anthropic slot is shadowed to the published placeholder", () =>
 	const step = applyShadowPlan("anthropic-account-2", { "anthropic-account-2": oauth }, {});
 	assert.equal(step.changed, true);
 	assert.equal(step.auth["anthropic-account-2"]?.type, "api_key");
-	assert.equal(step.auth["anthropic-account-2"]?.key, PROXY_PLACEHOLDER_KEY);
+	assert.equal(step.auth["anthropic-account-2"]?.key, ANTHROPIC_PROXY_PLACEHOLDER_KEY);
 	assert.equal(step.sidecar["anthropic-account-2"]?.access, "access-token");
 	assert.equal(step.sidecar["anthropic-account-2"]?.refresh, "refresh-token");
 });
@@ -101,9 +102,35 @@ test("shadowing many slots leaves unrelated credentials alone", () => {
 });
 
 test("the Anthropic placeholder is not a JWT and the Codex one is", () => {
-	assert.equal(childFacingAuthEntry("anthropic").key, PROXY_PLACEHOLDER_KEY);
+	assert.equal(childFacingAuthEntry("anthropic").key, ANTHROPIC_PROXY_PLACEHOLDER_KEY);
+	assert.equal(childFacingAuthEntry("anthropic").key?.includes("sk-ant-oat"), true);
 	assert.notEqual(childFacingAuthEntry("codex").key, PROXY_PLACEHOLDER_KEY);
 	assert.equal(childFacingAuthEntry("codex").key?.includes("."), true);
+});
+
+test("legacy Anthropic placeholders restore and migrate without losing the hidden OAuth blob", () => {
+	const slot = "anthropic-account-2";
+	const auth = { [slot]: { type: "api_key", key: PROXY_PLACEHOLDER_KEY } };
+	const sidecar = { [slot]: oauth };
+	assert.equal(isChildFacingPlaceholderForSlot(auth[slot], slot), true);
+	assert.deepEqual(mergeParentAuth(auth, sidecar)[slot], oauth);
+	assert.deepEqual(applyRestorePlan(slot, auth, sidecar).auth[slot], oauth);
+	const upgraded = applyShadowPlan(slot, auth, sidecar);
+	assert.equal(upgraded.changed, true);
+	assert.equal(upgraded.auth[slot].key, ANTHROPIC_PROXY_PLACEHOLDER_KEY);
+	assert.deepEqual(upgraded.sidecar[slot], oauth);
+	assert.equal(applyShadowPlan(slot, upgraded.auth, upgraded.sidecar).changed, false);
+	assert.deepEqual(applyRestorePlan(slot, upgraded.auth, upgraded.sidecar).auth[slot], oauth);
+	assert.equal(applyShadowPlan(slot, auth, {}).changed, false, "no hidden token means no migration");
+});
+
+test("OAuth-looking real API keys are never mistaken for a published placeholder", () => {
+	const slot = "anthropic-account-2";
+	const real = { type: "api_key", key: "sk-ant-oat01-real-user-key" };
+	assert.equal(isChildFacingPlaceholderForSlot(real, slot), false);
+	assert.equal(isChildFacingPlaceholder({ type: "api_key", key: ANTHROPIC_PROXY_PLACEHOLDER_KEY }, "codex"), false);
+	assert.deepEqual(mergeParentAuth({ [slot]: real }, { [slot]: oauth })[slot], real);
+	assert.equal(applyShadowPlan(slot, { [slot]: real }, { [slot]: oauth }).changed, false);
 });
 
 test("base Cursor is shadowed to the cursor-proxy placeholder, unlike base Anthropic", () => {

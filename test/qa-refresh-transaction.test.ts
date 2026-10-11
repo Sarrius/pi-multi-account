@@ -19,6 +19,19 @@ for (const verdict of ["invalid_grant", "refresh_token_reused"]) {
     assert.deepEqual(result, winner); assert.deepEqual(stored, winner);
   });
 }
+test("issue 90: successful exchange also adopts a complete newer login without stale publication", async () => {
+  const original = credential("original"), winner = credential("winner");
+  let stored = original, writes = 0;
+  const result = await refreshAndPersistWithStorageLock({
+    provider: "anthropic", credentials: original, readLatest: () => stored,
+    authStorage: { modify: async (_: string, fn: (current: any) => Promise<any>) => {
+      const next = await fn(stored); if (next !== undefined) { writes++; stored = next; }
+    } },
+    refresh: async () => { stored = winner; return credential("stale-result"); },
+  });
+  assert.equal(writes, 0); assert.deepEqual(result, winner); assert.deepEqual(stored, winner);
+});
+
 for (const message of ["invalid_grant", "refresh_token_reused", "HTTP 503 temporary outage", "synthetic timeout"]) {
   test(`issue 90: ${message} never becomes a blind retry/write without a valid winner`, async () => {
     const original = credential("original"); let exchanges = 0, writes = 0;

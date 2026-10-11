@@ -9,6 +9,7 @@ import test from "node:test";
 import {
 	PROXY_PLACEHOLDER_JWT,
 	PROXY_PLACEHOLDER_KEY,
+	ANTHROPIC_PROXY_PLACEHOLDER_KEY,
 	UPSTREAM_BASE,
 	admitRequest,
 	parseProxyPath,
@@ -147,6 +148,22 @@ test("the placeholder never reaches the upstream; the real token does", () => {
 	assert.equal(shaped.headers["content-type"], "application/json");
 });
 
+test("the OAuth-shaped Anthropic placeholder is admitted and stripped from either auth header", () => {
+	for (const headers of [
+		{ authorization: `Bearer ${ANTHROPIC_PROXY_PLACEHOLDER_KEY}` },
+		{ "x-api-key": ANTHROPIC_PROXY_PLACEHOLDER_KEY },
+	]) {
+		assert.equal(admitRequest({ rawUrl: "/anthropic-account-2/v1/messages", headers, routes: ROUTES }).ok, true);
+		const shaped = shapeUpstreamRequest({ route: anthropicRoute, rest: "/v1/messages", headers,
+			credential: { type: "oauth", access: "sk-ant-oat01-actual-upstream-token" } });
+		assert.equal(shaped.ok, true);
+		if (!shaped.ok) continue;
+		assert.equal(shaped.headers.authorization, "Bearer sk-ant-oat01-actual-upstream-token");
+		assert.equal(shaped.headers["x-api-key"], undefined);
+		assert.equal(JSON.stringify(shaped).includes(ANTHROPIC_PROXY_PLACEHOLDER_KEY), false);
+	}
+});
+
 test("Anthropic gets the header without which a subscription token is rejected", () => {
 	const shaped = shapeUpstreamRequest({
 		route: anthropicRoute,
@@ -186,6 +203,56 @@ test("Codex is routed by account, which it refuses to serve without", () => {
 	assert.equal(shaped.url, `${UPSTREAM_BASE.codex}/codex/responses`);
 	assert.equal(shaped.headers["chatgpt-account-id"], "acct-9");
 	assert.equal(shaped.headers.originator, "pi");
+});
+
+test("Codex image endpoints appended to a numbered slot gain /codex and keep their query", () => {
+	for (const path of ["/images/generations", "/images/edits"]) {
+		for (const query of ["", "?stream=1&label=a%2Fb"]) {
+			const rest = `${path}${query}`;
+			const admitted = admitRequest({
+				rawUrl: `/openai-codex-account-4${rest}`,
+				headers: withKey(PROXY_PLACEHOLDER_JWT),
+				routes: ROUTES,
+			});
+			assert.equal(admitted.ok, true);
+			if (!admitted.ok) return;
+			const shaped = shapeUpstreamRequest({
+				route: admitted.route,
+				rest: admitted.rest!,
+				headers: withKey(PROXY_PLACEHOLDER_JWT),
+				credential: { type: "oauth", access: "t", accountId: "acct-9" },
+			});
+			assert.equal(shaped.ok, true);
+			if (!shaped.ok) return;
+			assert.equal(shaped.url, `https://chatgpt.com/backend-api/codex${rest}`);
+		}
+	}
+});
+
+test("image routing leaves prefixed, chat, usage, similar paths and Anthropic unchanged", () => {
+	const paths = [
+		"/codex/images/generations", "/codex/images/edits?stream=1",
+		"/codex/responses?stream=1", "/wham/usage",
+		"/images/generations/", "/images/edits/extra?stream=1",
+		"/images/generations-extra", "/images/editsx?stream=1",
+		"/images/variations", "/v1/images/generations",
+	];
+	for (const route of [codexRoute, anthropicRoute]) {
+		const unchanged = route.family === "anthropic"
+			? [...paths, "/images/generations", "/images/edits?stream=1"]
+			: paths;
+		for (const rest of unchanged) {
+			const shaped = shapeUpstreamRequest({
+				route,
+				rest,
+				headers: {},
+				credential: { type: "oauth", access: "t" },
+			});
+			assert.equal(shaped.ok, true);
+			if (!shaped.ok) return;
+			assert.equal(shaped.url, `${UPSTREAM_BASE[route.family]}${rest}`);
+		}
+	}
 });
 
 test("an API-key slot uses the header its family actually reads", () => {
@@ -276,11 +343,13 @@ test("Pi reads an account id out of the Codex key, so that placeholder is token-
 
 test("each family is published with the placeholder its own API will accept", () => {
 	assert.equal(placeholderKeyFor("codex"), PROXY_PLACEHOLDER_JWT);
-	assert.equal(placeholderKeyFor("anthropic"), PROXY_PLACEHOLDER_KEY);
+	assert.equal(placeholderKeyFor("anthropic"), ANTHROPIC_PROXY_PLACEHOLDER_KEY);
+	assert.equal(placeholderKeyFor("anthropic").includes("sk-ant-oat"), true);
 });
 
 test("both placeholders are admitted; nothing else is", () => {
 	assert.equal(isPublishedPlaceholder(PROXY_PLACEHOLDER_KEY), true);
+	assert.equal(isPublishedPlaceholder(ANTHROPIC_PROXY_PLACEHOLDER_KEY), true);
 	assert.equal(isPublishedPlaceholder(PROXY_PLACEHOLDER_JWT), true);
 	for (const other of [undefined, "", "sk-real", `${PROXY_PLACEHOLDER_JWT}x`]) {
 		assert.equal(isPublishedPlaceholder(other), false, String(other));

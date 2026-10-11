@@ -4,11 +4,9 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-## [Unreleased local QA candidate — 1.23.3]
+## [1.25.0] — Unreleased
 
-This local checkout is based on 1.23.2. GitHub main already reports 1.24.0; this section is not a published release, a claim of Pi 1.x compatibility, or permission to replace main.
-
-### Fixed and checked locally
+### Fixed
 
 - Persist actual inference-refusal evidence across aliases and restarts. Positive quota metadata cannot erase the refusal during bounded retry backoff; provider reset estimates and next recheck times are distinct. A completed, non-error inference clears the evidence; HTTP 200 at stream start, OAuth refresh and absent completion markers do not.
 - Preserve newer sibling refusal/cooldown records from stale shared-state deletion or shortening. Coupled weekly exhaustion wins over short-window headroom; Cursor's independent pools retain their existing semantics.
@@ -18,9 +16,36 @@ This local checkout is based on 1.23.2. GitHub main already reports 1.24.0; this
 - Classify the known Grok 4.7 flagship as frontier (#91), without guessing future 4.x quality or treating `fast` / `non-reasoning` variants as equivalent.
 - Update the billing-header Claude Code version to the registry-observed 2.1.296 (#89), rather than the tracker's already stale 2.1.289 proposal.
 
-### Security investigation — not remediation
+- Fence forced-refresh auth/sidecar commits on actual lease identity, cancellation and unchanged disk state; stage sidecar outputs until joined refresh work settles. Use a fast heartbeat compatible with older synchronous host writers, and propagate Cursor cancellation through fetch and body consumption. A lost lease never removes its replacement or grants stale-write authority.
+- Preserve upstream 1.24.0 model pins, host-native Anthropic placeholders, opaque-token proxy refresh and Codex image routing while integrating the local Cursor/compaction and quota-recovery repairs.
 
-- Confirmed Dependabot #13 (`GHSA-q2hr-2g5m-vwhr`) affects nested development `brace-expansion` 5.0.9. The SDK's published shrinkwrap defeats the attempted root override/targeted update; successful npm exits did not change the actual module. Removed the ineffective override and added a read-only advisory checker with regression tests. The dependency and GitHub alert remain unresolved; no SDK/global upgrade or alert dismissal is claimed.
+### Security
+
+- Remediate Dependabot #13 (`GHSA-q2hr-2g5m-vwhr`) by using the matched **1.1.0 development SDK pair**, whose published package no longer carries the vulnerable old shrinkwrap, and resolving/installing `brace-expansion` **5.0.12**. This changes development fixtures, not the user's installed Pi runtime; legacy hosts remain compatibility targets. The advisory checker verifies lock and actual installed versions. No foreign `node_modules` mutation, postinstall patch or security-alert dismissal is used.
+
+### Compatibility
+
+- Include Pi **1.1.0** in the native host test matrix. General Pi 1.x compatibility does not implement the new `openai` ChatGPT multi-account feature: #92 remains accepted and open with a distinct provider/auth/transport/usage acceptance plan in `docs/openai-chatgpt-accounts.md`. Legacy Codex credentials and aliases are not migrated.
+
+
+## [1.24.0] — 2026-10-03
+
+### Added
+
+- Explicit `/multi-account pin provider/model`, `unpin provider-or-family` and `pins [list]` controls (#74). Pins persist one preference per account group across reload/restart, without changing Pi's foreground model, shared registry or startup defaults. Exact siblings, account availability and automatic quality bands still win; missing models remain saved but inactive. All extension config commands share locked field-scoped persistence, preserving concurrent unrelated settings. Pins reject busy, passive-child, closed or stale sessions and cannot authorize cheaper provider-only switching or automatic compaction. Thanks @MarsLuay for the feature request.
+
+### Fixed
+
+- Refresh expired opaque Anthropic OAuth tokens from their stored expiry before proxy forwarding, including seconds/milliseconds and flight slack; the newly persisted token reaches upstream (#79, thanks @unclejobs-ai).
+- Numbered Anthropic OAuth slots publish a non-secret OAuth-shaped placeholder so Pi retains native Claude identity, `x-app: cli`, tool-name serialization and response mapping (#80). Real credentials stay parent-side. Sidecar-backed legacy publications migrate safely; production refresh writes privately under the auth lock without briefly unshadowing a child. API-key aliases remain direct and real API keys are not rewritten. Parent/native and real `pi --no-extensions` tool roundtrips run against deterministic fake upstreams. A disconnected proxy caller aborts its upstream request without poisoning provider health. These tests do not claim live Anthropic acceptance.
+- Normalize only Codex `/images/generations` and `/images/edits` routes by adding exactly one `/codex` segment, preserving queries and leaving chat, usage, authentication and similar paths unchanged (#83, thanks @hantusk). Live image-service success remains outside the deterministic routing guarantee.
+- Update the Anthropic billing-header Claude Code version to **2.1.288**, the current registry version at release preparation (#81).
+
+### Compatibility
+
+- Bind OAuth, catalogs and transports to the running host's public SDK surfaces, including Pi **0.99.2 and 1.0.0** alongside **0.85.1, 0.86.1 and 0.87.1** (#82, thanks @zieglar). Both SDKs are host peers; a private runtime SDK is no longer required for the factory bridge. Pi 0.99+ requires Node >=22.19.0.
+- Pi-owned virtual selections and configured image/classifier models remain host-owned and never become account chat fallback targets. Modern transcript/context conversion preserves system instructions, tools and streamed tool results.
+- Replace the split SDK updates in #84/#87 with a matched development pair at **0.87.1** and a regenerated lockfile. Update protobuf to **2.15.0** (#85) and Node types to **22.20.4** (#86). Thanks to Dependabot for the dependency updates.
 
 ## [1.23.2] — 2026-09-24
 

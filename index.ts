@@ -26,8 +26,10 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createPayloadStream } from "./provider-payload-stream.ts";
-import { mutateProxyAuth } from "./auth-file-transaction.ts";
-import { mergeStateDeltas, mutateConfigFile, mutateStateFile } from "./state-file-transaction.ts";
+import { mutateProxyAuth, mutateProxyAuthAsync } from "./auth-file-transaction.ts";
+import { mergeStateDeltas, mutateStateFile } from "./state-file-transaction.ts";
+import { normalizeModelPins, persistModelPin, validModelPinScope } from "./model-pins.ts";
+import { mutateConfigFile } from "./config-file-transaction.ts";
 import { createHash } from "node:crypto";
 import {
 	accessSync,
@@ -46,7 +48,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { homedir } from "node:os";
 import { Readable } from "node:stream";
 import { dirname, join } from "node:path";
-import { createRequire } from "node:module";
+import { getModel as getHostModel } from "@earendil-works/pi-ai/compat";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -120,33 +123,15 @@ import {
 } from "./context-guard.ts";
 
 // ---------------------------------------------------------------------------
-// pi-ai OAuth bridge (version-agnostic)
+// Host-bound pi-ai OAuth bridge
 // ---------------------------------------------------------------------------
-//
-// This is the single most fragile boundary in the extension, and it has now broken
-// twice in the field:
-//
-//   * pi-coding-agent's extension loader aliases `@earendil-works/pi-ai/oauth` to an
-//     empty stub in its own node_modules, so a plain static import yields undefined —
-//     the `undefined is not an object (evaluating
-//     '_oauth.openaiCodexOAuthProvider.usesCallbackServer')` crash at startup.
-//   * pi-ai 0.80 REMOVED the runtime OAuth surface: `dist/oauth.js` is now literally
-//     `export {}` (types only), `getModel` moved to `dist/compat.js`, and the OAuth
-//     implementations live behind provider factories
-//     (`anthropicProvider().auth.oauth`) with a new `login(interaction)` /
-//     `refresh(credential)` shape.
-//
-// So we resolve pi-ai on disk ourselves and normalize BOTH eras behind one internal
-// surface. Everything here is best-effort: a pi-ai we cannot adapt degrades to
-// "subscription logins unavailable" and the extension still loads, so API-key
-// accounts keep rotating instead of the whole extension dying at load time.
-//
-// The 0.80+ adaptation follows the approach contributed by @lfoscari in PR #4.
-
+// Pi's extension loader binds these public imports to the running host SDK.
+// Never probe a private SDK copy: its provider catalog/auth may differ from Pi's.
+// Supported Pi versions use provider factories; legacy callbacks are adapted below.
 /** Normalized OAuth surface — identical for every supported pi-ai version. */
 type PiAiOauthBridge = {
 	/** pi-ai release line this was adapted from, for the debug log. */
-	era: "legacy-oauth-entry" | "provider-factories";
+	era: "provider-factories";
 	anthropic: {
 		login: (callbacks: any) => Promise<any>;
 		refresh: (credentials: any, signal: AbortSignal) => Promise<any>;
@@ -174,57 +159,6 @@ type PiAiOauthBridge = {
 
 let piAiOauthBridge: PiAiOauthBridge | undefined;
 let piAiOauthLoadError: string | undefined;
-let piAiPackageRoot: string | undefined | null; // null = searched, not found
-
-/**
- * Locate the `@earendil-works/pi-ai` package directory, nearest-first.
- *
- * A git checkout keeps pi-ai in the extension's OWN node_modules, but `npm i` /
- * `pi install` HOIST it next to the package instead
- * (`~/.pi/agent/npm/node_modules/pi-multi-account` +
- * `~/.pi/agent/npm/node_modules/@earendil-works/pi-ai`), and pnpm hides it behind a
- * symlinked store. Probing only the nested path made the extension fail to load on
- * every hoisted install, so walk ancestors the way Node's own resolver does and fall
- * back to require.resolve().
- */
-export function piAiRootCandidates(
-	fromFile: string,
-	resolver?: (specifier: string) => string,
-): string[] {
-	const candidates: string[] = [];
-	let dir = dirname(fromFile);
-	for (let depth = 0; depth < 16; depth++) {
-		candidates.push(join(dir, "node_modules", "@earendil-works", "pi-ai"));
-		const parent = dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	if (resolver) {
-		try {
-			// Resolves through "exports"/symlinks even when no ancestor path matched.
-			candidates.push(dirname(resolver("@earendil-works/pi-ai/package.json")));
-		} catch {
-			// Not resolvable from here — the ancestor paths above may still hit.
-		}
-	}
-	return [...new Set(candidates)];
-}
-
-function findPiAiRoot(): string | undefined {
-	if (piAiPackageRoot !== undefined) return piAiPackageRoot ?? undefined;
-	const here = fileURLToPath(import.meta.url);
-	const localRequire = createRequire(import.meta.url);
-	for (const candidate of piAiRootCandidates(here, (specifier) =>
-		localRequire.resolve(specifier),
-	)) {
-		if (existsSync(join(candidate, "package.json"))) {
-			piAiPackageRoot = candidate;
-			return candidate;
-		}
-	}
-	piAiPackageRoot = null;
-	return undefined;
-}
 
 /**
  * Bridge Pi's legacy extension OAuth callbacks (`onAuth`/`onDeviceCode`/`onPrompt`/
@@ -272,48 +206,15 @@ function toAuthInteraction(callbacks: any) {
 	};
 }
 
-/** pi-ai <= 0.79: runtime OAuth helpers exported straight from `dist/oauth.js`. */
-function adaptLegacyOauthEntry(mod: any): PiAiOauthBridge | undefined {
-	const codex = mod?.openaiCodexOAuthProvider;
-	if (
-		typeof mod?.loginAnthropic !== "function" ||
-		typeof mod?.refreshAnthropicToken !== "function" ||
-		typeof codex?.login !== "function" ||
-		typeof codex?.refreshToken !== "function"
-	) {
-		return undefined;
-	}
-	return {
-		era: "legacy-oauth-entry",
-		anthropic: {
-			login: (callbacks) => mod.loginAnthropic(callbacks),
-			// This era exchanges the bare refresh token, not the whole credential.
-			refresh: (credentials, signal) =>
-				mod.refreshAnthropicToken(credentials.refresh, signal),
-		},
-		codex: {
-			usesCallbackServer: codex.usesCallbackServer ?? true,
-			login: (callbacks) => codex.login(callbacks),
-			refresh: (credentials, signal) => codex.refreshToken(credentials, signal),
-			getApiKey: (credentials) =>
-				typeof codex.getApiKey === "function"
-					? codex.getApiKey(credentials)
-					: credentials.access,
-		},
-	};
-}
 
 /** pi-ai >= 0.80: OAuth lives behind provider factories, with an AuthInteraction API. */
-function adaptProviderFactories(
-	anthropicMod: any,
-	codexMod: any,
-	kimiMod?: any,
-	xaiMod?: any,
-): PiAiOauthBridge | undefined {
-	const anthropicOauth = anthropicMod?.anthropicProvider?.()?.auth?.oauth;
-	const codexOauth = codexMod?.openaiCodexProvider?.()?.auth?.oauth;
-	const kimiOauth = kimiMod?.kimiCodingProvider?.()?.auth?.oauth;
-	const xaiOauth = xaiMod?.xaiProvider?.()?.auth?.oauth;
+function adaptProviderFactories(): PiAiOauthBridge | undefined {
+	const providers = builtinProviders();
+	const oauth = (id: string): any => providers.find((provider) => provider.id === id)?.auth?.oauth;
+	const anthropicOauth = oauth("anthropic");
+	const codexOauth = oauth("openai-codex");
+	const kimiOauth = oauth("kimi-coding");
+	const xaiOauth = oauth("xai");
 	if (
 		typeof anthropicOauth?.login !== "function" ||
 		typeof anthropicOauth?.refresh !== "function" ||
@@ -355,58 +256,18 @@ function adaptProviderFactories(
 	};
 }
 
-/**
- * Best-effort load + normalization of pi-ai's OAuth surface. NEVER throws.
- *
- * Uses a synchronous require() (Node >= 22 supports require() of ESM without
- * top-level await, and pi-ai qualifies) because providers are registered
- * synchronously — `usesCallbackServer` is read while Pi merely LISTS providers.
- */
+/** Adapt the running host's public factories without loading another SDK instance. */
 function tryLoadPiAiOauth(): PiAiOauthBridge | undefined {
 	if (piAiOauthBridge) return piAiOauthBridge;
-	const root = findPiAiRoot();
-	if (!root) {
-		piAiOauthLoadError = `@earendil-works/pi-ai was not found near ${fileURLToPath(import.meta.url)}. Install @earendil-works/pi-ai alongside pi-multi-account.`;
-		return undefined;
+	try {
+		piAiOauthBridge = adaptProviderFactories();
+		piAiOauthLoadError = piAiOauthBridge
+			? undefined
+			: "the running Pi host exposes no usable pi-ai OAuth provider factories";
+	} catch (error) {
+		piAiOauthLoadError = error instanceof Error ? error.message : String(error);
 	}
-	const localRequire = createRequire(import.meta.url);
-	const load = (relative: string): any => {
-		const file = join(root, "dist", relative);
-		if (!existsSync(file)) return undefined;
-		try {
-			return localRequire(file);
-		} catch (error) {
-			tried.push(
-				`${relative}: ${error instanceof Error ? error.message : String(error)}`,
-			);
-			return undefined;
-		}
-	};
-	const tried: string[] = [];
-
-	const legacy = adaptLegacyOauthEntry(load("oauth.js"));
-	if (legacy) {
-		piAiOauthBridge = legacy;
-		piAiOauthLoadError = undefined;
-		return legacy;
-	}
-	tried.push("dist/oauth.js exports no runtime OAuth helpers (pi-ai >= 0.80)");
-
-	const modern = adaptProviderFactories(
-		load(join("providers", "anthropic.js")),
-		load(join("providers", "openai-codex.js")),
-		load(join("providers", "kimi-coding.js")),
-		load(join("providers", "xai.js")),
-	);
-	if (modern) {
-		piAiOauthBridge = modern;
-		piAiOauthLoadError = undefined;
-		return modern;
-	}
-	tried.push("dist/providers/{anthropic,openai-codex}.js exposed no auth.oauth");
-
-	piAiOauthLoadError = `the @earendil-works/pi-ai at ${root} exposes no OAuth surface this extension can use. ${tried.join("; ")}`;
-	return undefined;
+	return piAiOauthBridge;
 }
 
 /** Load reason, or undefined when OAuth is available. */
@@ -425,36 +286,10 @@ function requirePiAiOauth(): PiAiOauthBridge {
 	return bridge;
 }
 
-/**
- * pi-ai's static model catalog lookup. It lived on the package root until 0.79 and
- * moved to `dist/compat.js` in 0.80, so resolve it lazily from whichever is present
- * — and treat "absent" as "no canonical metadata", never as a load failure.
- */
-let piAiGetModelFn: ((provider: string, id: string) => any) | null | undefined;
-
+/** Canonical chat metadata comes from the same SDK catalog as the running host. */
 function piAiGetModel(provider: string, id: string): any {
-	if (piAiGetModelFn === undefined) {
-		piAiGetModelFn = null;
-		const root = findPiAiRoot();
-		if (root) {
-			const localRequire = createRequire(import.meta.url);
-			for (const relative of ["compat.js", "index.js"]) {
-				const file = join(root, "dist", relative);
-				if (!existsSync(file)) continue;
-				try {
-					const candidate = localRequire(file)?.getModel;
-					if (typeof candidate === "function") {
-						piAiGetModelFn = candidate;
-						break;
-					}
-				} catch {
-					// Try the next entry point.
-				}
-			}
-		}
-	}
 	try {
-		return piAiGetModelFn?.(provider, id);
+		return getHostModel(provider as any, id as any);
 	} catch {
 		return undefined;
 	}
@@ -658,6 +493,9 @@ type ProviderFailoverConfig = {
 	// { "openai-codex": ["gpt-5.6", "gpt-5.5"], "anthropic": ["claude-opus-4-9"] }.
 	// Keys: anthropic | openai-codex | cursor | qwen | ollama.
 	preferredModels?: Record<string, string[]>;
+	// Explicit per-account-group model preference. It never selects a foreground model,
+	// bypasses a cooldown, or authorizes an automatic quality-tier change.
+	pinnedModels?: Record<string, string>;
 	// Forward-progress watchdog tunables (see constants above). 0/absent ⇒ built-in default.
 	resumeIdleTimeoutMs?: number;
 	stuckWatchdogMs?: number;
@@ -710,6 +548,7 @@ type RuntimeConfig = Required<
 		| "preferLatestModel"
 		| "reasoningLevel"
 		| "preferredModels"
+		| "pinnedModels"
 		| "resumeIdleTimeoutMs"
 		| "stuckWatchdogMs"
 		| "compactionWatchdogMs"
@@ -844,11 +683,27 @@ function configuredModelIds(provider: string): string[] {
 		const models = parsed?.providers?.[provider]?.models;
 		if (Array.isArray(models)) {
 			return models
+				.filter((model: any) => !model?.type || model.type === "chat")
 				.map((model: any) => (typeof model === "string" ? model : model?.id))
 				.filter((id: unknown): id is string => typeof id === "string" && id.length > 0);
 		}
 		if (models && typeof models === "object") return Object.keys(models);
 		return [];
+	} catch {
+		return [];
+	}
+}
+
+// Pi 0.99's provider composer replaces a supplied models array in full. Preserve
+// non-chat definitions verbatim; they must never become account chat aliases.
+function configuredOperationModels(provider: string): any[] {
+	try {
+		const parsed = JSON.parse(readFileSync(MODELS_CONFIG_PATH, "utf8"));
+		const models = parsed?.providers?.[provider]?.models;
+		return Array.isArray(models)
+			? models.filter((model: any) => model && typeof model === "object" &&
+				(model.type === "image" || model.type === "classifier"))
+			: [];
 	} catch {
 		return [];
 	}
@@ -1209,7 +1064,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.23.3";
+const VERSION = "1.25.0";
 function sourceFingerprint(): string {
 	try {
 		const root = dirname(fileURLToPath(import.meta.url));
@@ -1853,6 +1708,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	preferLatestModel: true,
 	reasoningLevel: "auto",
 	preferredModels: {},
+	pinnedModels: {},
 	resumeIdleTimeoutMs: RESUME_IDLE_TIMEOUT_MS,
 	stuckWatchdogMs: STUCK_WATCHDOG_MS,
 	compactionWatchdogMs: COMPACTION_WATCHDOG_MS,
@@ -1865,11 +1721,12 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 function ensureDefaultConfig() {
 	if (existsSync(CONFIG_PATH)) return;
 	mkdirSync(dirname(CONFIG_PATH), { recursive: true, mode: 0o700 });
-	writeFileSync(
-		CONFIG_PATH,
-		`${JSON.stringify(DEFAULT_CONFIG, null, "\t")}\n`,
-		{ encoding: "utf8", mode: 0o600 },
-	);
+	try {
+		writeFileSync(CONFIG_PATH, `${JSON.stringify(DEFAULT_CONFIG, null, "\t")}\n`,
+			{ encoding: "utf8", mode: 0o600, flag: "wx" });
+	} catch (error: any) {
+		if (error?.code !== "EEXIST") throw error; // Another root initialized it first.
+	}
 }
 
 function positiveOr(value: unknown, fallback: number) {
@@ -2077,6 +1934,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 							.filter(([, v]) => v.length > 0),
 					)
 				: {},
+		pinnedModels: normalizeModelPins(raw.pinnedModels),
 		resumeIdleTimeoutMs: positiveOr(
 			raw.resumeIdleTimeoutMs,
 			RESUME_IDLE_TIMEOUT_MS,
@@ -2331,6 +2189,20 @@ export async function persistRefreshedCredentials(
 		write?: (data: Record<string, any>) => void;
 	},
 ): Promise<boolean> {
+	// Even legacy/set-only hosts must never unhide a numbered slot while saving a refresh.
+	if (!io && isChildFacingPlaceholderForSlot(readAuthFileRaw()[provider], provider)) {
+		try {
+			let persisted = false;
+			mutateProxyAuth(AUTH_PATH, PROXY_OAUTH_PATH, (auth, sidecar) => {
+				if (!isChildFacingPlaceholderForSlot(auth[provider], provider) || sidecar[provider]?.type !== "oauth") {
+					return { auth, sidecar, changed: false };
+				}
+				persisted = true;
+				return { auth, sidecar: { ...sidecar, [provider]: credential }, changed: true };
+			}, "shadow");
+			return persisted;
+		} catch { return false; }
+	}
 	if (typeof authStorage?.modify === "function") {
 		try {
 			await authStorage.modify(provider, () => credential);
@@ -2413,6 +2285,17 @@ function jwtExpMs(token: string): number | undefined {
 	return typeof exp === "number" && Number.isFinite(exp)
 		? exp * 1000
 		: undefined;
+}
+
+/**
+ * When an OAuth access token expires. Anthropic's `sk-ant-oat…` tokens are opaque, so the JWT
+ * `exp` is absent and the stored `expires` (seconds or milliseconds) is the only signal.
+ */
+function oauthExpiryMs(entry: AuthEntry): number | undefined {
+	const fromJwt = typeof entry.access === "string" ? jwtExpMs(entry.access) : undefined;
+	if (fromJwt !== undefined) return fromJwt;
+	if (typeof entry.expires !== "number" || !Number.isFinite(entry.expires)) return undefined;
+	return entry.expires < 10_000_000_000 ? entry.expires * 1000 : entry.expires;
 }
 
 function getCursorSubFromAccessToken(token: string): string | undefined {
@@ -2545,13 +2428,7 @@ function isEntryUsable(entry: AuthEntry | undefined): boolean {
 	if (typeof entry.access !== "string" || entry.access.length === 0)
 		return false;
 	// Expired access token with no refresh token → unrecoverable.
-	const storedExpiry =
-		typeof entry.expires === "number" && Number.isFinite(entry.expires)
-			? entry.expires < 10_000_000_000
-				? entry.expires * 1000
-				: entry.expires
-			: undefined;
-	const expMs = jwtExpMs(entry.access) ?? storedExpiry;
+	const expMs = oauthExpiryMs(entry);
 	if (
 		expMs !== undefined &&
 		expMs <= Date.now() &&
@@ -3000,6 +2877,13 @@ export async function refreshAndPersistWithStorageLock(opts: {
 				throw new Error(`OAuth refresh returned no usable credential for ${opts.provider}`);
 			}
 
+			opts.signal?.throwIfAborted();
+			const winner = opts.readLatest();
+			if (winner?.type === "oauth" && typeof winner.access === "string" &&
+				typeof winner.refresh === "string" && oauthCredentialChanged(latest, winner)) {
+				resolved = winner;
+				return undefined;
+			}
 			if (opts.isShadowed?.(stored)) {
 				if (!opts.persistShadowed) {
 					throw new Error(`No sidecar persistence path exists for ${opts.provider}`);
@@ -3141,7 +3025,7 @@ function registerCodexCatalog(
 		baseUrl,
 		api: "openai-codex-responses" as any,
 		oauth: codexOAuthOverride(id, name),
-		models: models as any,
+		models: [...models, ...configuredOperationModels(id)] as any,
 	});
 }
 
@@ -3996,10 +3880,8 @@ interface HostCompletionRouterAPI {
 export default function piMultiAccount(pi: ExtensionAPI) {
 	// Warm up the OAuth helpers before any provider registration: providers are
 	// registered synchronously below and their `usesCallbackServer`/`getApiKey`
-	// read from the cached module. Deliberately NON-fatal — if pi-ai's oauth entry
-	// cannot be resolved (hoisted npm layout, incompatible pi-ai), the extension
-	// still loads and every non-OAuth account keeps working; only subscription
-	// logins are unavailable, and the user is told once at session start.
+	// use the cached host adapter. An unusable OAuth factory remains non-fatal:
+	// API-key accounts keep working and session start reports unavailable OAuth.
 	const oauthUnavailable = piAiOauthUnavailableReason();
 	let subagentChild = isSubagentChildProcess();
 	let hostOwnsSessionModel = false;
@@ -4968,19 +4850,40 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (!["anthropic", "openai-codex", "cursor"].includes(family ?? "") && provider !== "xai")
 				return { status: "unsupported" };
 			const signal = AbortSignal.timeout(30_000);
+			// Fail closed if the host declines its credential transaction at all.
+			// This read-only admission releases before our common-file lease is acquired.
+			await authStorage.modify(provider, () => undefined, { signal });
+			let transactionSignal = signal;
+			let shadowedCredential: AuthEntry | undefined;
+			// The host callback API cannot fence a sidecar write before its own
+			// post-callback compromise checks. Stage both outputs and commit through
+			// the same Pi auth-file lock with an explicit fast heartbeat/lease fence.
+			const guardedStorage = {
+				modify: async (_provider: string, update: (stored: AuthEntry | undefined) => Promise<AuthEntry | undefined>) => {
+					await mutateProxyAuthAsync(AUTH_PATH, PROXY_OAUTH_PATH, async (auth, sidecar, ownedSignal) => {
+						transactionSignal = ownedSignal;
+						const next = await update(auth[provider] as AuthEntry | undefined);
+						return {
+							auth: next ? { ...auth, [provider]: next } : auth,
+							sidecar: shadowedCredential ? { ...sidecar, [provider]: shadowedCredential } : sidecar,
+							changed: next !== undefined || shadowedCredential !== undefined,
+						};
+					}, "shadow", { signal });
+				},
+			};
 			const refreshed = await refreshAndPersistWithStorageLock({
-				provider, credentials: entry, authStorage, signal,
+				provider, credentials: entry, authStorage: guardedStorage, signal,
 				readLatest: () => readAuthFile()[provider],
 				refresh: async (current: AuthEntry) => {
 					// No disk-retry wrapper here: the transaction already owns the authoritative
 					// credential. A waiting refresher adopts the winner before any exchange.
 					const nextRaw = family === "anthropic"
-						? await requirePiAiOauth().anthropic.refresh(current as any, signal)
+						? await requirePiAiOauth().anthropic.refresh(current as any, transactionSignal)
 						: family === "openai-codex"
-							? await requirePiAiOauth().codex.refresh(current as any, signal)
+							? await requirePiAiOauth().codex.refresh(current as any, transactionSignal)
 							: family === "cursor"
-								? await refreshCursorCredentials(current.refresh!)
-								: await requirePiAiOauth().xai?.refresh(current as any, signal);
+								? await refreshCursorCredentials(current.refresh!, transactionSignal)
+								: await requirePiAiOauth().xai?.refresh(current as any, transactionSignal);
 					if (!nextRaw?.access) throw new Error("OAuth refresh returned no usable access token");
 					const next = mergeRefreshedCredentials(current, nextRaw) as AuthEntry;
 					if (current.accountId && next.accountId && current.accountId !== next.accountId)
@@ -4988,7 +4891,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					return next;
 				},
 				isShadowed: stored => isChildFacingPlaceholderForSlot(stored, provider),
-				persistShadowed: credential => writeProxyOAuthSidecar({ ...readProxyOAuthSidecar(), [provider]: credential }),
+				persistShadowed: credential => { shadowedCredential = credential; },
 			});
 			if (!refreshed?.access) throw new Error("OAuth refresh transaction produced no credential");
 			// A different credential ADOPTED under the lock is a legitimate newer login,
@@ -5298,6 +5201,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return; // keep the previous (or empty) discovered set; configured ids still serve
 		}
 		const models = ollamaRotationModelIds().map((m) => ollamaModelDef(m, OLLAMA_BASE));
+		models.push(...configuredOperationModels(OLLAMA_BASE));
 		pi.registerProvider(OLLAMA_BASE, {
 			name: "Ollama",
 			baseUrl: OLLAMA_CLOUD_BASE_URL,
@@ -6764,14 +6668,35 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return [last, ...defaults.filter((id) => id !== last)];
 	}
 
-	// Rank of a model within its family's newest-first preferred order (0 = newest).
-	// Unknown models sort last. Used to keep the latest model across accounts, not
-	// just within one account, during fallback ranking.
+	function pinnedModelForProvider(provider: string): string | undefined {
+		const scope = accountGroup(provider, config.qwenProvider);
+		return Object.hasOwn(config.pinnedModels, scope) ? config.pinnedModels[scope] : undefined;
+	}
+
+	function pinQualityCompatible(model: any, source: any): boolean {
+		const pin = pinnedModelForProvider(model.provider);
+		const sourceBand = modelQualityBand(source?.id, source?.provider);
+		return !pin || !sameModelIdentity(model.id, pin) || !sourceBand || modelQualityBand(model.id, model.provider) === sourceBand;
+	}
+
+	function preferredModelsForProvider(provider: string): string[] {
+		const order = familyPreferredModels(classifyProvider(provider, config.qwenProvider));
+		const pin = pinnedModelForProvider(provider);
+		return pin ? [pin, ...order.filter(id => !sameModelIdentity(id, pin))] : order;
+	}
+
+	// Rank includes an explicit pin, but a pin is not evidence of a quality upgrade.
+	// Unknown models sort last; identity/liveness/quality constraints still apply first.
 	function modelRecencyRank(model: any): number {
-		const family = classifyProvider(model?.provider, config.qwenProvider);
-		const order = familyPreferredModels(family);
+		const order = preferredModelsForProvider(String(model?.provider ?? ""));
 		const idx = order.findIndex((id) => sameModelIdentity(id, model?.id));
 		return idx < 0 ? Number.MAX_SAFE_INTEGER : idx;
+	}
+
+	// Virtual and non-chat operations belong to Pi, not account chat rotation.
+	function isAccountChatModel(model: any): boolean {
+		return !!model && model.api !== "pi-virtual" &&
+			(!model.type || model.type === "chat");
 	}
 
 	function resolveTargets(
@@ -6784,7 +6709,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (!parsed) return [];
 		if (parsed.modelId) {
 			const model = findModelIncludingHidden(ctx, parsed.provider, parsed.modelId);
-			return model ? [model] : [];
+			return isAccountChatModel(model) ? [model] : [];
 		}
 
 		const family = classifyProvider(parsed.provider, config.qwenProvider);
@@ -6792,15 +6717,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			? classifyProvider(currentModel.provider, config.qwenProvider)
 			: undefined;
 		const sameFamily = !!family && !!currentFamily && family === currentFamily;
-		// A per-family config override (preferredModels) wins, so a new flagship model can be
-		// pinned without a code change. Order is newest-first either way.
-		const preferred = familyPreferredModels(family);
+		// A pin leads this account's model order without synthesizing a model or losing the
+		// underlying preferredModels/catalog order when that pin is missing or ineligible.
+		const preferred = preferredModelsForProvider(parsed.provider);
 		const keepCurrent = sameFamily && currentModel?.id ? [currentModel.id] : [];
 		// `preferredOnly` means "take this family's flagship, not an arbitrary model". A provider
 		// outside the managed families has no flagship list at all, so honouring it literally
 		// yields no candidate and the switch fails — which is what made an unmanaged account
 		// unreachable by name. Fall back to what Pi knows for it.
-		const usePreferredOnly = preferredOnly && preferred.length > 0;
+		const usePreferredOnly = preferredOnly && preferred.length > 0 && !pinnedModelForProvider(parsed.provider);
 		const registryModels = usePreferredOnly
 			? []
 			: [
@@ -6813,7 +6738,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// once downgraded (e.g. gpt-5.4 after a momentary limit on gpt-5.5) is upgraded back to
 		// the latest the moment it is available again — instead of carrying the old model forever.
 		// Legacy mode keeps the current model first (never changes the model unless it has to).
-		const modelIds = config.preferLatestModel
+		const modelIds = config.preferLatestModel || pinnedModelForProvider(parsed.provider)
 			? [...preferred, ...keepCurrent, ...registryModels]
 			: [...keepCurrent, ...preferred, ...registryModels];
 		const result: any[] = [];
@@ -6821,7 +6746,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		for (const modelId of modelIds) {
 			if (seen.has(modelId)) continue;
 			const model = findModelIncludingHidden(ctx, parsed.provider, modelId);
-			if (!model) {
+			if (!isAccountChatModel(model)) {
 				seen.add(modelId);
 				continue;
 			}
@@ -6900,6 +6825,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			const sourceBand = modelQualityBand(currentModel?.id, currentModel?.provider);
 			const sourceExceptional = apexIdentity(currentModel?.id);
 			models = models.filter((model: any) => {
+				// A preference is not tier consent, including routed automatic compaction.
+				if (!pinQualityCompatible(model, currentModel)) return false;
 				const candidateBand = modelQualityBand(model.id, model.provider);
 				const candidateExceptional = apexIdentity(model.id);
 				// Cursor's Fable-named aliases are deliberately uncalibrated. A user may select one
@@ -6948,8 +6875,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// preferLatestModel still upgrades a known older sibling (gpt-5.4 → gpt-5.5)
 				// on a healthy account. An unranked catalog leftover (claude-4-sonnet beating
 				// grok only because it sorts first) must never steal the user's model.
+				const pinRepresentative = sameModelIdentity(pinnedModelForProvider(flagshipPick.provider), flagshipPick.id);
 				const upgrade =
 					config.preferLatestModel &&
+					!pinRepresentative &&
 					idRank !== Number.MAX_SAFE_INTEGER &&
 					flagRank < idRank;
 				pick = upgrade ? flagshipPick : identityPick;
@@ -7201,6 +7130,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			waitForQuotaRecovery?: boolean;
 		} = {},
 	) {
+		if (!isAccountChatModel(failedModel) || (ctx.model && !isAccountChatModel(ctx.model))) return false;
 		if (!options.manual && (isFailoverExempt(failedModel?.provider) || isFailoverExempt(ctx.model?.provider))) return false;
 		const switchEpoch = chainEpoch;
 		if (!automaticFailoverEnabled() || !failedModel?.provider || !failedModel?.id)
@@ -7512,6 +7442,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	async function ensureReadyModel(ctx: any, reason: string) {
+		if (ctx.model && !isAccountChatModel(ctx.model)) return true;
 		// The launch candidate is authoritative in a pi-subagents child. Let the
 		// request produce its real error so the parent runner can advance its own
 		// fallbackModels chain instead of starting a competing router here.
@@ -9320,9 +9251,84 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return true;
 	}
 
+	function modelPinLines(ctx: any): string[] {
+		const entries = Object.entries(config.pinnedModels).sort(([a], [b]) => a.localeCompare(b));
+		if (!entries.length) return ["  none — /multi-account pin <provider/model>"];
+		const models = [...ctx.modelRegistry.getAll(), ...[...hiddenProviderModels.values()].flat()];
+		const now = Date.now();
+		return entries.map(([scope, id]) => {
+			const matching = models.filter((model: any) => accountGroup(model.provider, config.qwenProvider) === scope &&
+				sameModelIdentity(model.id, id) && isAccountChatModel(model));
+			const usable = matching.filter((model: any) => !isInvalidated(model.provider) && providerHasUsableAuth(ctx, model.provider));
+			const sourceBand = modelQualityBand(ctx.model?.id, ctx.model?.provider);
+			const compatible = usable.filter((model: any) => {
+				const band = modelQualityBand(model.id, model.provider);
+				if (sourceBand === "apex") return band === "apex" && explicitlyAllowsPaidApexFallback(model, ctx.model);
+				return band !== "apex" && (!sourceBand || band === sourceBand) && (!apexIdentity(model.id) || sameModelIdentity(model.id, ctx.model?.id));
+			});
+			const free = compatible.filter((model: any) => providerRecoveryAt(model.provider, now) <= now &&
+				(exhaustedUntilByModel.get(`${model.provider}/${model.id}`) ?? 0) <= now);
+			const status = !matching.length ? "missing from catalog" : !usable.length ? "no usable account" :
+				!compatible.length ? "incompatible with current quality band" : !free.length ? "cooling" : "preference available";
+			return `  ${scope}: ${id} — ${status}`;
+		});
+	}
+
 	async function handleCommand(args: string, ctx: any) {
-		const [commandRaw, arg1] = args.trim().split(/\s+/);
+		const parts = args.trim().split(/\s+/);
+		const [commandRaw, arg1] = parts;
 		const command = (commandRaw || "status").toLowerCase();
+
+		if (command === "pins") {
+			if (parts.length > 2 || (arg1 && arg1 !== "list")) {
+				ctx.ui.notify("pi-multi-account: usage: /multi-account pins [list]", "warning");
+				return;
+			}
+			ctx.ui.notify(["pi-multi-account model pins (routing preferences, not foreground selections):", ...modelPinLines(ctx),
+				"Exact siblings, authentication, health and quality checks still apply. Other sessions adopt edits on reload/restart."].join("\n"), "info");
+			return;
+		}
+
+		if (command === "pin" || command === "unpin") {
+			const parsed = command === "pin" ? parseTarget(arg1) : undefined;
+			const provider = command === "pin" ? parsed?.provider : arg1;
+			if (parts.length !== 2 || !provider || !validModelPinScope(provider) ||
+				(command === "pin" && (!parsed?.modelId || /\s/.test(parsed.modelId)))) {
+				ctx.ui.notify("pi-multi-account: usage: /multi-account pin <provider/model> | unpin <provider-or-family> | pins [list]", "warning");
+				return;
+			}
+			if (subagentChild || sessionClosed || !ctx.isIdle()) {
+				ctx.ui.notify("pi-multi-account: change model pins from an idle live parent session; no preference was saved", "warning");
+				return;
+			}
+			const epoch = chainEpoch;
+			const selected = ctx.model ? ref(ctx.model.provider, ctx.model.id) : undefined;
+			const session = ctx.sessionManager?.getSessionId?.();
+			const canCommit = () => !subagentChild && !sessionClosed && ctx.isIdle() && epoch === chainEpoch &&
+				(ctx.model ? ref(ctx.model.provider, ctx.model.id) : undefined) === selected && ctx.sessionManager?.getSessionId?.() === session;
+			const scope = accountGroup(provider, config.qwenProvider);
+			const modelId = parsed?.modelId;
+			const exact = modelId ? findModelIncludingHidden(ctx, provider, modelId) : undefined;
+			const known = modelId ? [exact, ...ctx.modelRegistry.getAll(), ...[...hiddenProviderModels.values()].flat()].filter((model: any) =>
+				model && accountGroup(model.provider, config.qwenProvider) === scope && sameModelIdentity(model.id, modelId)) : [];
+			if ((exact && !isAccountChatModel(exact)) || (known.length > 0 && !known.some(isAccountChatModel))) {
+				ctx.ui.notify("pi-multi-account: only account chat models can be pinned; virtual/image/classifier models remain host-owned", "warning");
+				return;
+			}
+			try {
+				const pins = persistModelPin(CONFIG_PATH, scope, modelId, canCommit);
+				config = { ...config, pinnedModels: pins };
+				claimUserControl("model pin preference changed");
+				logEvent("model_pin_set", { scope, model: modelId ?? null });
+				ctx.ui.notify(command === "unpin"
+					? `pi-multi-account: removed model pin for ${scope}; the underlying preferredModels/catalog order is unchanged`
+					: `pi-multi-account: pinned ${scope}/${modelId} across sibling accounts.${known.length ? "" : " Saved but currently absent; inactive until the catalog supplies it."} Current model was not changed; select a cheaper tier explicitly. Other sessions adopt this preference on reload/restart.`,
+					known.length || command === "unpin" ? "info" : "warning");
+			} catch {
+				ctx.ui.notify("pi-multi-account: model pin was not saved; check config syntax, permissions/lock and session ownership. Runtime preference is unchanged", "error");
+			}
+			return;
+		}
 
 		if (command === "log" || command === "logs" || command === "debug") {
 			// Show the diagnostic black box so a misbehaviour can be reported precisely.
@@ -9585,7 +9591,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			const target = parsed.modelId ? `${parsed.provider}/${parsed.modelId}` : parsed.provider;
 			const field = parsed.modelId ? "excludedModels" : "excludedProviders";
 			try {
-				const saved = mutateConfigFile<ProviderFailoverConfig>(CONFIG_PATH, (raw) => {
+				const saved = mutateConfigFile(CONFIG_PATH, (raw) => {
 					const previous = normalizeExcludedTargets(raw[field], !!parsed.modelId);
 					const next = exclude ? [...new Set([...previous, target])] : previous.filter((entry) => entry !== target);
 					return { ...raw, [field]: next };
@@ -9678,14 +9684,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			configuredFallbacks = [];
 			config = { ...config, fallbacks: [] };
 			try {
-				const raw = existsSync(CONFIG_PATH)
-					? JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
-					: {};
-				raw.fallbacks = [];
-				writeFileSync(CONFIG_PATH, `${JSON.stringify(raw, null, "\t")}\n`, {
-					encoding: "utf8",
-					mode: 0o600,
-				});
+				mutateConfigFile(CONFIG_PATH, () => ({ fallbacks: [] }));
 			} catch {
 				// non-fatal: in-memory state is still cleared
 			}
@@ -9907,7 +9906,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				? `${parsed.provider}/${parsed.modelId}`
 				: parsed.provider;
 			const candidates = resolveTargets(ctx, resolvedTarget, ctx.model, true).filter(
-				(model: any) => providerHasUsableAuth(ctx, model.provider),
+				(model: any) => providerHasUsableAuth(ctx, model.provider) &&
+					(parsed.modelId !== undefined || pinQualityCompatible(model, ctx.model)),
 			);
 			if (candidates.length === 0) {
 				const hasAuth = providerHasUsableAuth(ctx, parsed.provider);
@@ -10052,14 +10052,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			onlyActiveModels = next2;
 			config = { ...config, onlyActive: next2 };
 			try {
-				const raw = existsSync(CONFIG_PATH)
-					? JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
-					: {};
-				raw.onlyActive = next2;
-				writeFileSync(CONFIG_PATH, `${JSON.stringify(raw, null, "\t")}\n`, {
-					encoding: "utf8",
-					mode: 0o600,
-				});
+				mutateConfigFile(CONFIG_PATH, () => ({ onlyActive: next2 }));
 			} catch {
 				// non-fatal: the in-memory flag still applies for this session
 			}
@@ -10118,14 +10111,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 			config = { ...config, providerPriority: next };
 			try {
-				const raw = existsSync(CONFIG_PATH)
-					? JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
-					: {};
-				raw.providerPriority = next;
-				writeFileSync(CONFIG_PATH, `${JSON.stringify(raw, null, "\t")}\n`, {
-					encoding: "utf8",
-					mode: 0o600,
-				});
+				mutateConfigFile(CONFIG_PATH, () => ({ providerPriority: next }));
 			} catch {
 				// non-fatal: the ladder still applies for this session
 			}
@@ -10303,7 +10289,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// list below, `switch` was effectively undiscoverable and `next` pressed repeatedly
 				// was the only way anyone found to reach a chosen account.
 				`Switch accounts: /multi-account best — jump straight to an account that can work now · /multi-account switch <provider> — e.g. /multi-account switch ${rotation.find((p) => p !== ctx.model?.provider) ?? rotation[0] ?? "<provider>"} · /multi-account next steps through the rotation in order`,
-				`Other commands: status | accounts [refresh] | best | priority [...] | limits [refresh] | models | pick | save-default | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | exclude <provider-id|provider-id/model-id> | include <provider-id|provider-id/model-id> | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
+				`Model pins: ${Object.entries(config.pinnedModels).map(([scope, id]) => `${scope}/${id}`).join(", ") || "none"} · /multi-account pins to inspect`,
+				`Other commands: status | accounts [refresh] | best | priority [...] | limits [refresh] | models | pick | pin <provider/model> | unpin <provider-or-family> | pins [list] | save-default | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | exclude <provider-id|provider-id/model-id> | include <provider-id|provider-id/model-id> | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
 			].join("\n"),
 			"info",
 		);
@@ -10383,6 +10370,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const models = ids.map((m) =>
 			family === "ollama" ? ollamaModelDef(m, baseId) : qwenModelDef(m, baseId),
 		);
+		models.push(...configuredOperationModels(baseId));
 		pi.registerProvider(baseId, {
 			name: family === "ollama" ? "Ollama" : "Alibaba/Qwen",
 			baseUrl,
@@ -11312,8 +11300,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// An existing child-facing placeholder (possibly published by another root)
 	// must also stay on its canonical loopback, even when this instance's proxy is off.
 	function numberedAnthropicBaseUrl(id: string): string {
+		const raw = readAuthFileRaw()[id];
+		if (raw?.type === "api_key" && !isChildFacingPlaceholderForSlot(raw, id)) return "https://api.anthropic.com";
 		if (typeof slotProxyPort === "number") return publishedRouteFor(slotProxyPort, id);
-		if (isChildFacingPlaceholderForSlot(readAuthFileRaw()[id], id)) return publishedRouteFor(SLOT_PROXY_PORT, id);
+		if (isChildFacingPlaceholderForSlot(raw, id)) return publishedRouteFor(SLOT_PROXY_PORT, id);
 		return "https://api.anthropic.com";
 	}
 
@@ -11337,6 +11327,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * the canonical loopback instead, even if this sibling disabled its own proxy.
 	 */
 	function numberedCodexBaseUrl(id: string): string {
+		const raw = readAuthFileRaw()[id];
+		if (raw?.type === "api_key" && !isChildFacingPlaceholderForSlot(raw, id)) return "https://chatgpt.com/backend-api";
 		if (typeof slotProxyPort === "number") return publishedRouteFor(slotProxyPort, id);
 		if (!config.childProxy && !isChildFacingPlaceholderForSlot(readAuthFileRaw()[id], id)) {
 			return "https://chatgpt.com/backend-api";
@@ -11360,7 +11352,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		let entry = readAuthFile()[slotId];
 		if (!entry) return undefined;
 		if (entry.type !== "oauth" || typeof entry.access !== "string") return entry;
-		const expiry = jwtExpMs(entry.access);
+		const expiry = oauthExpiryMs(entry);
 		// A minute of slack: a token that expires mid-flight fails the child's whole request, and
 		// refreshing one turn early costs nothing.
 		if (expiry !== undefined && expiry - 60_000 <= Date.now()) {
@@ -11397,10 +11389,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		const parsed = parseProxyPath(req.url ?? "");
-		const presentedSecret =
-			parsed && typeof readAuthFile()[parsed.slotId]?.access === "string"
-				? readAuthFile()[parsed.slotId]?.access
-				: undefined;
+		const presentedEntry = parsed ? readAuthFile()[parsed.slotId] : undefined;
+		const presentedSecret = presentedEntry?.type === "oauth" ? presentedEntry.access :
+			presentedEntry?.type === "api_key" ? presentedEntry.key : undefined;
 		const verdict = admitRequest({
 			rawUrl: req.url ?? "",
 			headers: req.headers ?? {},
@@ -11433,9 +11424,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		let body: Buffer | undefined =
 			req.method === "GET" || req.method === "HEAD" ? undefined : await readRequestBody(req);
 		if (body && verdict.route.family === "anthropic" && credential?.type === "oauth") {
-			// The same shaping the in-process path applies: without it Anthropic rejects a
-			// subscription token outright. Done here because the child cannot do it — it has no
-			// idea it is talking to a proxy.
+			// The extension-owned billing shaping also applies to bare children. Their native
+			// host supplies OAuth identity/tool mapping through the token-shaped placeholder,
+			// but does not load this extension's billing-header maintenance.
 			try {
 				const parsed = JSON.parse(body.toString("utf8"));
 				const reshaped = shapeAnthropicOAuthPayload(parsed);
@@ -11445,11 +11436,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 		}
 
+		if (res.destroyed) return;
+		const upstreamAbort = new AbortController();
+		const callerClosed = () => {
+			if (!res.writableFinished) upstreamAbort.abort();
+		};
+		res.once("close", callerClosed);
 		try {
 			const upstream = await fetch(shaped.url, {
 				method: req.method ?? "POST",
 				headers: shaped.headers,
 				body: body && body.length ? new Uint8Array(body) : undefined,
+				signal: upstreamAbort.signal,
 			});
 			const outgoing: Record<string, string> = {};
 			upstream.headers.forEach((value, name) => {
@@ -11461,7 +11459,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (upstream.body) {
 				await new Promise<void>((resolve) => {
 					const stream = Readable.fromWeb(upstream.body as any);
-					stream.on("error", () => resolve());
+					stream.on("error", () => { res.destroy(); resolve(); });
 					res.on("close", () => resolve());
 					stream.pipe(res);
 					res.on("finish", () => resolve());
@@ -11469,11 +11467,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			} else {
 				res.end();
 			}
-			logEvent("slot_proxy_forwarded", {
+			if (!upstreamAbort.signal.aborted) logEvent("slot_proxy_forwarded", {
 				slot: verdict.route.slotId,
 				status: upstream.status,
 			});
 		} catch (error) {
+			// A caller cancellation is not an upstream/provider failure or a quota verdict.
+			if (upstreamAbort.signal.aborted || res.destroyed) return;
 			const reason = error instanceof Error ? error.message : String(error);
 			logEvent("slot_proxy_upstream_failed", { slot: verdict.route.slotId, reason });
 			if (!res.headersSent) {
@@ -11482,6 +11482,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			} else {
 				res.end();
 			}
+		} finally {
+			res.off("close", callerClosed);
 		}
 	}
 
@@ -11740,12 +11742,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		for (const id of slots) {
 			const family = proxyFamilyOf(id);
 			if (!family) continue;
-			const baseUrl = publishedRouteFor(port, id);
+			const oauth = parent[id]?.type === "oauth";
+			const baseUrl = oauth ? publishedRouteFor(port, id) :
+				family === "anthropic" ? "https://api.anthropic.com" : "https://chatgpt.com/backend-api";
 			if (family === "anthropic") {
 				provisionNativeSlot(id, {
 					api: "anthropic-messages",
 					baseUrl,
-					apiKey: placeholderKeyFor(family),
+					apiKey: oauth ? placeholderKeyFor(family) : undefined,
 					models: DEFAULT_ANTHROPIC_MODELS.map((modelId) => ({
 						...anthropicModelDef(modelId, id),
 						baseUrl,
@@ -11766,7 +11770,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				provisionNativeSlot(id, {
 					api: "openai-codex-responses",
 					baseUrl,
-					apiKey: placeholderKeyFor(family),
+					apiKey: oauth ? placeholderKeyFor(family) : undefined,
 					models,
 				});
 			}
@@ -12641,6 +12645,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	});
 
 	safeOn("message_end", async (event, ctx) => {
+		if (!isAccountChatModel(ctx.model)) return;
 		const errorEpoch = chainEpoch;
 		const staleError = () => sessionClosed || errorEpoch !== chainEpoch || userAbortedChain || ctx.signal?.aborted;
 		const message = (event as any).message;
@@ -12860,6 +12865,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	});
 
 	safeOn("agent_end", async (event, ctx) => {
+		if (!isAccountChatModel(ctx.model)) return;
 		if (!automaticFailoverEnabled()) return;
 		const messages = (event as any).messages ?? [];
 		const stop = lastAssistantStopReason(messages);

@@ -243,6 +243,7 @@ export function cleanupCursorControllerSession(sessionId: string): void {
 
 export async function refreshCursorCredentials(
 	refreshToken: string,
+	signal?: AbortSignal,
 ): Promise<{ access: string; refresh: string; expires: number }> {
 	const entry = join(getCursorProviderRoot(), "auth.ts");
 	if (!existsSync(entry)) {
@@ -251,7 +252,8 @@ export async function refreshCursorCredentials(
 	const mod = (await import(/* @vite-ignore */ loadSpecifier(entry))) as {
 		refreshCursorToken: (
 			token: string,
+			signal?: AbortSignal,
 		) => Promise<{ access: string; refresh: string; expires: number }>;
 	};
-	return mod.refreshCursorToken(refreshToken);
+	return mod.refreshCursorToken(refreshToken, signal);
 }
