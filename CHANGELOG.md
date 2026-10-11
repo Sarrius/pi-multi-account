@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [1.25.0] — Unreleased
 
+### Added
+
+- Native new OpenAI ChatGPT OAuth accounts (#92) on hosts exposing the public native Provider contract (tested on Pi 0.99.2, 1.0.0 and 1.1.0): distinct `openai-account-N` login/discovery, host-owned device UUID and issued client/scopes, native Responses chat catalogs, model pins/quality/effort and guarded refresh. `add openai` selects this family; `add codex` remains legacy. Older supported hosts remain loadable but do not advertise new OAuth support; no legacy credential migration or runtime upgrade.
+- Separate parent-owned Responses child routes with non-secret placeholders, native image input/tool streaming and result replay, caller cancellation and exact recovery/teardown. New aliases refuse stored/ambient paid keys; crossing to base OpenAI metered access requires an explicit fallback target. Auth derivation binds the endpoint and rejects incompatible host-model composition before bearer dispatch; alias/proxy payload shaping preserves native subscription field restrictions. Direct-grant quota remains unknown and never uses legacy Codex endpoints. Fresh native-host/offline-child tests prove mechanism behavior, not live provider login or availability.
+
 ### Fixed
 
 - Persist actual inference-refusal evidence across aliases and restarts. Positive quota metadata cannot erase the refusal during bounded retry backoff; provider reset estimates and next recheck times are distinct. A completed, non-error inference clears the evidence; HTTP 200 at stream start, OAuth refresh and absent completion markers do not.
@@ -25,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Compatibility
 
-- Include Pi **1.1.0** in the native host test matrix. General Pi 1.x compatibility does not implement the new `openai` ChatGPT multi-account feature: #92 remains accepted and open with a distinct provider/auth/transport/usage acceptance plan in `docs/openai-chatgpt-accounts.md`. Legacy Codex credentials and aliases are not migrated.
+- Include Pi **1.1.0** in the native host test matrix. New `openai` ChatGPT multi-account support is separately capability-gated; setup, billing isolation, unknown usage and deterministic acceptance are documented in `docs/openai-chatgpt-accounts.md`. Legacy Codex credentials and aliases are not migrated.
 
 
 ## [1.24.0] — 2026-10-03

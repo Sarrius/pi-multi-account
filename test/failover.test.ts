@@ -637,9 +637,12 @@ function setup(opts: {
 			},
 		},
 		registerProvider: (
-			name: string,
+			nameOrNative: string | any,
 			providerConfig?: { models?: any[]; baseUrl?: string },
 		) => {
+			const native = typeof nameOrNative === "object" ? nameOrNative : undefined;
+			const name = native?.id ?? nameOrNative;
+			if (native) providerConfig = { ...native, models: native.getModels() };
 			known.add(name);
 			providerConfigs.set(name, providerConfig);
 			rec.registrations.push({
@@ -12395,6 +12398,7 @@ test("/multi-account priority distinguishes reset from clear", async () => {
 	assert.deepEqual(raw.providerPriority, [
 		"anthropic",
 		"openai-codex",
+		"openai",
 		"kimi-coding",
 		"cursor",
 		"qwen",
@@ -14623,4 +14627,94 @@ test("quota QA: an unknown route is eligible, not claimed ready", async () => {
 		assert.doesNotMatch(t.rec.notifies.at(-1)!, /\bready\b/i);
 		assert.match(t.rec.notifies.at(-1)!, /unverified|unknown/i);
 	} finally { await t.fire("session_shutdown"); }
+});
+
+const { builtinProviders: nativeProviders } = await import("@earendil-works/pi-ai/providers/all");
+const { supportsOpenAIChatGPT } = await import("../openai-chatgpt.ts");
+const hasNewOpenAI = nativeProviders().some(provider => supportsOpenAIChatGPT(provider));
+const directOpenAI = (tag: string) => ({ type: "oauth" as const, access: `direct-${tag}`, refresh: `direct-refresh-${tag}`,
+	expires: 4102444800000, clientId: `issued-${tag}`, scopes: ["openid", "chatgpt.tokens.use.direct"] });
+
+test("issue92: the running host gates new login without relabeling Codex", async () => {
+	const t = setup({ accounts: {}, config: { childProxy: false } });
+	try {
+		await t.command("add openai");
+		assert.equal(t.providerConfigs.has("openai-account-2"), hasNewOpenAI);
+		assert.equal(t.providerConfigs.has("openai-codex-account-2"), true);
+		assert.match(t.rec.notifies.at(-1)!, hasNewOpenAI ? /select openai-account-2/ : /lacks native new OpenAI/);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("issue92: subscription aliases discover with other providers disabled and preserve legacy identity", { skip: !hasNewOpenAI }, async () => {
+	const shared = { ...directOpenAI("one"), accountId: "same-real-workspace" };
+	const t = setup({ accounts: { openai: shared, "openai-account-2": directOpenAI("two"),
+		"openai-codex": { ...shared, clientId: undefined, scopes: undefined } } as Account,
+		current: { provider: "openai", id: "gpt-6.1-sol" }, config: { includeOtherProviders: false, childProxy: false, onlyActive: true } });
+	try {
+		await t.command("status");
+		assert.match(t.rec.notifies.at(-1)!, /openai-account-2/);
+		assert.match(t.rec.notifies.at(-1)!, /openai-codex/);
+		assert.equal(t.providerConfigs.get("openai-account-2").auth.oauth.isSubscription, true);
+		assert.equal(t.providerConfigs.get("openai-account-2").api, undefined, "native Provider, not legacy config");
+		await t.command("switch openai-account-2/gpt-6.1-sol");
+		assert.equal(t.rec.setModels.at(-1), "openai-account-2/gpt-6.1-sol");
+		assert.equal(t.providerConfigs.get("openai-account-2").auth.oauth.isSubscription, true);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("issue92: new OAuth failover preserves model pin, effort and exclusions without quota fiction", { skip: !hasNewOpenAI }, async () => {
+	const t = setup({ accounts: { "openai-account-2": directOpenAI("two"), "openai-account-3": directOpenAI("three"), "openai-account-4": directOpenAI("four") } as Account,
+		current: { provider: "openai-account-2", id: "gpt-6.1-sol" }, thinkingLevel: "max",
+		config: { childProxy: false, includeOtherProviders: false, showUsage: true, pinnedModels: { openai: "gpt-6.1-sol" }, excludedProviders: ["openai-account-4"] } });
+	const originalFetch = globalThis.fetch; let probes = 0;
+	globalThis.fetch = (async () => { probes++; throw new Error("New OAuth has no verified quota endpoint"); }) as typeof fetch;
+	try {
+		await t.command("accounts refresh");
+		assert.equal(probes, 0);
+		assert.match(t.rec.notifies.at(-1)!, /unknown|unverified/i);
+		await finishError(t, "openai-account-2", "gpt-6.1-sol", "usage_limit_reached");
+		assert.equal(t.rec.setModels.at(-1), "openai-account-3/gpt-6.1-sol");
+		assert.equal(t.thinkingLevel(), "max");
+		assert.equal(probes, 0);
+	} finally { globalThis.fetch = originalFetch; await t.fire("session_shutdown"); }
+});
+
+for (const consent of [false, true]) test(`issue92: new subscription does not cross into a paid OpenAI key without explicit fallback (consent=${consent})`, { skip: !hasNewOpenAI }, async () => {
+	const t = setup({ accounts: { "openai-account-2": directOpenAI("two"), "openai-account-3": { type: "api_key", key: "not-a-subscription" }, openai: { type: "api_key", key: "paid-key" } } as Account,
+		current: { provider: "openai-account-2", id: "gpt-6.1-sol" },
+		hostModelsByProvider: { openai: ["gpt-6.1-sol"] },
+		config: { childProxy: false, includeOtherProviders: true, autoContinue: false, fallbacks: consent ? ["openai/gpt-6.1-sol"] : [] } });
+	try {
+		await finishError(t, "openai-account-2", "gpt-6.1-sol", "usage_limit_reached");
+		assert.deepEqual(t.rec.setModels, consent ? ["openai/gpt-6.1-sol"] : []);
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8")).openai.key, "paid-key");
+	} finally { await t.fire("session_shutdown"); }
+});
+
+for (const shadowed of [false, true]) test(`issue92: native refresh persists the issued client/scopes under the guarded lease (shadowed=${shadowed})`, { skip: !hasNewOpenAI }, async () => {
+	const provider = "openai-account-2", original = directOpenAI("two");
+	writeProxyOAuthSidecar(shadowed ? { [provider]: original } : {});
+	const placeholder = childFacingAuthEntryForSlot(provider)!;
+	const t = setup({ accounts: { [provider]: shadowed ? placeholder : original } as Account,
+		current: { provider, id: "gpt-6.1-sol" }, hostAuthStorage: "pi-0.84",
+		config: { childProxy: false, autoContinue: false } });
+	const oldFetch = globalThis.fetch; let exchanges = 0;
+	globalThis.fetch = (async (url: any, init: any) => {
+		assert.equal(String(url), "https://auth.openai.com/api/accounts/oauth/token");
+		exchanges++;
+		assert.equal(init.body.get("client_id"), original.clientId);
+		assert.equal(init.body.get("refresh_token"), original.refresh);
+		assert.equal(init.body.get("resource"), "https://api.openai.com/v1");
+		assert.ok(init.signal instanceof AbortSignal);
+		return new Response(JSON.stringify({ access_token: "rotated-direct", refresh_token: "rotated-direct-refresh", scope: original.scopes.join(" "), expires_in: 3600 }));
+	}) as typeof fetch;
+	try {
+		await finishError(t, provider, "gpt-6.1-sol", "401 authentication token has been invalidated");
+		assert.equal(exchanges, 1);
+		const stored = shadowed ? readProxyOAuthSidecar()[provider] : JSON.parse(readFileSync(AUTH, "utf8"))[provider];
+		assert.equal(stored.access, "rotated-direct");
+		assert.equal(stored.clientId, original.clientId);
+		assert.deepEqual(stored.scopes, original.scopes);
+		if (shadowed) assert.deepEqual(JSON.parse(readFileSync(AUTH, "utf8"))[provider], placeholder);
+	} finally { globalThis.fetch = oldFetch; await t.fire("session_shutdown"); writeProxyOAuthSidecar({}); }
 });

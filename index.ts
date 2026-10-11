@@ -29,6 +29,7 @@ import { createPayloadStream } from "./provider-payload-stream.ts";
 import { mutateProxyAuth, mutateProxyAuthAsync } from "./auth-file-transaction.ts";
 import { mergeStateDeltas, mutateStateFile } from "./state-file-transaction.ts";
 import { normalizeModelPins, persistModelPin, validModelPinScope } from "./model-pins.ts";
+import { assertOpenAIChatGPTConfiguration, cloneOpenAIChatGPTProvider, isOpenAIChatGPTCredential, OPENAI_CHATGPT_URL, supportsOpenAIChatGPT } from "./openai-chatgpt.ts";
 import { mutateConfigFile } from "./config-file-transaction.ts";
 import { createHash } from "node:crypto";
 import {
@@ -70,6 +71,7 @@ import {
 	proxyFamilyFor,
 	publishedRouteFor,
 	shapeUpstreamRequest,
+	shapeOpenAIChatGPTPayload,
 	type ProxyFamily,
 	type ProxyRoute,
 } from "./slot-proxy.ts";
@@ -151,6 +153,8 @@ type PiAiOauthBridge = {
 		refresh: (credentials: any, signal: AbortSignal) => Promise<any>;
 		getApiKey: (credentials: any) => string;
 	};
+	/** Optional native Provider. Never flatten its LoginOptions into legacy callbacks. */
+	openai?: any;
 	/** xAI subscription OAuth exists only in pi-ai's provider-factories era. */
 	xai?: {
 		refresh: (credentials: any, signal: AbortSignal) => Promise<any>;
@@ -229,6 +233,7 @@ function adaptProviderFactories(): PiAiOauthBridge | undefined {
 			login: (callbacks) => anthropicOauth.login(toAuthInteraction(callbacks)),
 			refresh: (credentials, signal) => anthropicOauth.refresh(credentials, signal),
 		},
+		openai: providers.find(provider => supportsOpenAIChatGPT(provider)),
 		codex: {
 			// The flag is gone from the new shape; both eras of pi-ai's Codex flow use a
 			// local callback server, and Pi only reads this to decide how to present login.
@@ -325,6 +330,7 @@ type ModelRef = `${string}/${string}`;
 type ProviderFamily =
 	| "anthropic"
 	| "openai-codex"
+	| "openai"
 	| "kimi-coding"
 	| "qwen"
 	| "ollama"
@@ -838,9 +844,14 @@ type NativeModelEntry = {
 		output: number;
 		cacheRead: number;
 		cacheWrite: number;
+		tiers?: unknown[];
 	};
 	contextWindow?: number;
 	maxTokens?: number;
+	inputLimits?: Record<string, unknown>;
+	promptCache?: Record<string, unknown>;
+	samplingParams?: Record<string, unknown>;
+	samplingParamsByThinkingLevel?: Record<string, unknown>;
 	compat?: Record<string, unknown>;
 };
 
@@ -901,8 +912,12 @@ function nativeModelEntry(model: unknown): NativeModelEntry | undefined {
 				output: cost.output,
 				cacheRead: cost.cacheRead,
 				cacheWrite: cost.cacheWrite,
+				...(Array.isArray(cost.tiers) ? { tiers: cost.tiers } : {}),
 			};
 		}
+	}
+	for (const key of ["inputLimits", "promptCache", "samplingParams", "samplingParamsByThinkingLevel"] as const) {
+		if (rec[key] && typeof rec[key] === "object" && !Array.isArray(rec[key])) entry[key] = rec[key] as Record<string, unknown>;
 	}
 	if (typeof rec.contextWindow === "number") entry.contextWindow = rec.contextWindow;
 	if (typeof rec.maxTokens === "number") entry.maxTokens = rec.maxTokens;
@@ -1581,6 +1596,7 @@ export function preserveInterruptedTurns(messages: any[]): any[] {
 const DEFAULT_PROVIDER_ORDER: ProviderFamily[] = [
 	"anthropic",
 	"openai-codex",
+	"openai",
 	"kimi-coding",
 	"cursor",
 	"qwen",
@@ -1842,6 +1858,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 			(f): f is ProviderFamily =>
 				f === "anthropic" ||
 				f === "openai-codex" ||
+				f === "openai" ||
 				f === "kimi-coding" ||
 				f === "cursor" ||
 				f === "qwen" ||
@@ -2086,6 +2103,8 @@ type AuthEntry = {
 	expires?: number;
 	key?: string;
 	accountId?: string;
+	clientId?: string;
+	scopes?: string[];
 };
 
 function readAuthFileRaw(): Record<string, AuthEntry> {
@@ -2365,7 +2384,11 @@ function codexWorkspaceMembershipIdentity(entry: AuthEntry): string | undefined 
  *     so this only catches the literal same-token case. Two separate logins of the same Anthropic
  *     account are not deterministically identifiable from auth.json alone.
  */
-function accountIdentity(entry: AuthEntry): string | undefined {
+function accountIdentity(entry: AuthEntry, providerId?: string): string | undefined {
+	if (/^openai(?:-account-\d+)?$/.test(providerId ?? "") && isOpenAIChatGPTCredential(entry)) {
+		const identity = accountIdentity(entry);
+		return identity ? `openai-subscription:${identity}` : undefined;
+	}
 	const codexMembership = codexWorkspaceMembershipIdentity(entry);
 	if (codexMembership) return codexMembership;
 	if (typeof entry.accountId === "string" && entry.accountId.length > 0)
@@ -2406,11 +2429,11 @@ function rejectDuplicateLogin<T extends AuthEntry>(
 	providerId: string,
 	credentials: T,
 ): T {
-	const identity = accountIdentity(credentials);
+	const identity = accountIdentity(credentials, providerId);
 	if (!identity) return credentials;
 	const duplicate = Object.entries(readAuthFile()).find(
 		([existingId, entry]) =>
-			existingId !== providerId && accountIdentity(entry) === identity,
+			existingId !== providerId && accountIdentity(entry, existingId) === identity,
 	);
 	if (duplicate) {
 		throw new Error(
@@ -2457,7 +2480,8 @@ const FAMILY_KEYWORDS = new Set([
 
 function parseFamilyArg(raw: string | undefined): ProviderFamily | undefined {
 	const familyRaw = (raw || "").toLowerCase();
-	if (familyRaw === "codex" || familyRaw === "openai") return "openai-codex";
+	if (familyRaw === "codex" || familyRaw === "openai-codex") return "openai-codex";
+	if (familyRaw === "openai" || familyRaw === "chatgpt-direct") return "openai";
 	if (familyRaw === "anthropic" || familyRaw === "claude") return "anthropic";
 	if (familyRaw === "ollama") return "ollama";
 	if (familyRaw === "qwen" || familyRaw === "alibaba") return "qwen";
@@ -2513,6 +2537,8 @@ function classifyProvider(
 		return "anthropic";
 	if (id === CODEX_BASE || /^openai-codex-account-\d+$/.test(id))
 		return "openai-codex";
+	if (/^openai-account-\d+$/.test(id) || (id === "openai" && readAuthFile()[id]?.type === "oauth"))
+		return "openai"; // Base API keys retain the metered/unmanaged billing policy.
 	if (
 		id === qwenProvider ||
 		new RegExp(`^${escapeRegex(qwenProvider)}-account-\\d+$`).test(id) ||
@@ -2550,6 +2576,8 @@ function slotId(
 			? ANTHROPIC_BASE
 			: family === "openai-codex"
 				? CODEX_BASE
+				: family === "openai"
+					? "openai"
 				: family === "kimi-coding"
 					? "kimi-coding"
 					: family === "qwen"
@@ -2808,7 +2836,9 @@ function oauthCredentialChanged(before: any, after: any): boolean {
 		before?.access !== after?.access ||
 		before?.refresh !== after?.refresh ||
 		before?.expires !== after?.expires ||
-		before?.accountId !== after?.accountId
+		before?.accountId !== after?.accountId ||
+		before?.clientId !== after?.clientId ||
+		JSON.stringify(before?.scopes) !== JSON.stringify(after?.scopes)
 	);
 }
 
@@ -3883,6 +3913,36 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// use the cached host adapter. An unusable OAuth factory remains non-fatal:
 	// API-key accounts keep working and session start reports unavailable OAuth.
 	const oauthUnavailable = piAiOauthUnavailableReason();
+	const nativeOpenAI = tryLoadPiAiOauth()?.openai;
+	const openaiSlotModels = new Map<string, readonly any[]>();
+	const openaiSlotSignatures = new Map<string, string>();
+	let openaiModelOrder: string[] = [];
+	let openaiHostContext: any;
+	function openaiCatalogFromHost(ctx?: any): any[] {
+		openaiHostContext = ctx ?? openaiHostContext;
+		const host = (ctx?.modelRegistry?.getAll?.() ?? []).filter((model: any) =>
+			model.provider === "openai" && model.api === "openai-responses" && (!model.type || model.type === "chat"));
+		return host.length ? host : nativeOpenAI?.getModels() ?? [];
+	}
+	function registerOpenAISlot(id: string, baseUrl: string, models?: readonly any[]) {
+		if (!nativeOpenAI) return;
+		const clone = cloneOpenAIChatGPTProvider(nativeOpenAI, id, baseUrl,
+			credential => rejectDuplicateLogin(id, credential), models, () => {
+				const configured = existsSync(MODELS_CONFIG_PATH) ? JSON.parse(readFileSync(MODELS_CONFIG_PATH, "utf8"))?.providers?.[id] : undefined;
+				assertOpenAIChatGPTConfiguration(configured, id, baseUrl, openaiHostContext?.modelRegistry?.getAll?.() ?? []);
+			});
+		openaiSlotModels.set(id, clone.getModels());
+		openaiSlotSignatures.set(id, JSON.stringify(models ?? nativeOpenAI.getModels()));
+		openaiModelOrder = [...(models ?? nativeOpenAI.getModels())].sort(compareCodexModelStrength).map((model: any) => String(model.id));
+		// The object overload is used only after the native OAuth capability check.
+		// Older host declarations expose only the legacy two-argument overload.
+		(pi.registerProvider as any)(clone);
+	}
+	function registerSlotModels(provider: string, models: any[]) {
+		if (/^openai-account-\d+$/.test(provider) && nativeOpenAI) {
+			registerOpenAISlot(provider, numberedOpenAIBaseUrl(provider), models);
+		} else pi.registerProvider(provider, { models } as any);
+	}
 	let subagentChild = isSubagentChildProcess();
 	let hostOwnsSessionModel = false;
 	let startupModel: { provider: string; id: string } | undefined;
@@ -3981,7 +4041,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const models = hiddenProviderModels.get(provider);
 		if (!models) return;
 		try {
-			pi.registerProvider(provider, { models } as any);
+			registerSlotModels(provider, models);
 			hiddenProviderModels.delete(provider);
 		} catch (error) {
 			logEvent("only_active_restore_failed", {
@@ -4847,7 +4907,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 		const family = classifyProvider(provider, config.qwenProvider);
 		try {
-			if (!["anthropic", "openai-codex", "cursor"].includes(family ?? "") && provider !== "xai")
+			if (!(["anthropic", "openai-codex", "cursor"].includes(family ?? "") ||
+				(family === "openai" && nativeOpenAI && isOpenAIChatGPTCredential(entry))) && provider !== "xai")
 				return { status: "unsupported" };
 			const signal = AbortSignal.timeout(30_000);
 			// Fail closed if the host declines its credential transaction at all.
@@ -4881,6 +4942,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						? await requirePiAiOauth().anthropic.refresh(current as any, transactionSignal)
 						: family === "openai-codex"
 							? await requirePiAiOauth().codex.refresh(current as any, transactionSignal)
+							: family === "openai"
+								? await nativeOpenAI.auth.oauth.refresh(current, transactionSignal)
 							: family === "cursor"
 								? await refreshCursorCredentials(current.refresh!, transactionSignal)
 								: await requirePiAiOauth().xai?.refresh(current as any, transactionSignal);
@@ -6178,6 +6241,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const byFamily: Record<ProviderFamily, string[]> = {
 			anthropic: [],
 			"openai-codex": [],
+			openai: [],
 			"kimi-coding": [],
 			cursor: [],
 			qwen: [],
@@ -6190,6 +6254,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (family === "qwen" && !config.includeQwen) continue;
 			if (family === "ollama" && !config.includeOllama) continue;
 			if (family === "cursor" && !config.includeCursor) continue;
+			if (family === "openai" && (!nativeOpenAI || !isOpenAIChatGPTCredential(entry))) continue;
 			if (!isEntryUsable(entry)) continue;
 			if (isInvalidated(id)) continue;
 			byFamily[family].push(id);
@@ -6203,7 +6268,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		for (const family of order) {
 			const ids = byFamily[family].sort((a, b) => slotIndex(a) - slotIndex(b));
 			for (const id of ids) {
-				const identity = accountIdentity(auth[id]);
+				const identity = accountIdentity(auth[id], id);
 				if (identity && seenIdentity.has(identity)) continue; // same account in two slots
 				if (identity) seenIdentity.add(identity);
 				result.push(id);
@@ -6280,7 +6345,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		)) {
 			const family = classifyProvider(id, config.qwenProvider);
 			if (!family || !isEntryUsable(auth[id])) continue;
-			const identity = accountIdentity(auth[id]);
+			const identity = accountIdentity(auth[id], id);
 			if (!identity) continue;
 			const primary = primaryByIdentity.get(identity);
 			if (primary) duplicates.push({ duplicate: id, primary });
@@ -6389,6 +6454,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const families: ProviderFamily[] = [
 			"anthropic",
 			"openai-codex",
+			...(nativeOpenAI ? (["openai"] as const) : []),
 			"kimi-coding",
 			...(cursorAvailable ? (["cursor"] as const) : []),
 			"ollama",
@@ -6410,6 +6476,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (
 				family === "anthropic" ||
 				family === "openai-codex" ||
+				family === "openai" ||
 				family === "kimi-coding" ||
 				family === "cursor"
 			) {
@@ -6430,6 +6497,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// Once the host registry is reachable its models must be folded in, so those slots
 				// are re-registered whenever the host set changes rather than skipped forever.
 				if (registeredSlots.has(id)) {
+					if (family === "openai") {
+						const models = openaiCatalogFromHost(ctx);
+						if (openaiSlotSignatures.get(id) === JSON.stringify(models)) continue;
+						registerOpenAISlot(id, numberedOpenAIBaseUrl(id), models);
+						continue;
+					}
 					if (!ctx || (family !== "ollama" && family !== "qwen")) continue;
 					const base = family === "ollama" ? OLLAMA_BASE : config.qwenProvider;
 					const signature = hostModelIdsFor(ctx, base).join(",");
@@ -6453,6 +6526,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 							: undefined,
 						numberedCodexBaseUrl(id),
 					);
+				} else if (family === "openai") {
+					registerOpenAISlot(id, numberedOpenAIBaseUrl(id), openaiCatalogFromHost(ctx));
 				} else if (family === "kimi-coding") {
 					const kimiModels = [
 						...new Set([...DEFAULT_KIMI_MODELS, ...hostModelIdsFor(ctx, KIMI_BASE)]),
@@ -6611,7 +6686,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				: parsed.provider;
 			if (seenTargets.has(normalized)) continue;
 			const entry = auth[parsed.provider];
-			const identity = entry ? accountIdentity(entry) : undefined;
+			const identity = entry ? accountIdentity(entry, parsed.provider) : undefined;
 			if (identity && seenAccounts.has(identity)) continue;
 			seenTargets.add(normalized);
 			if (identity) seenAccounts.add(identity);
@@ -6624,6 +6699,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function providerHasUsableAuth(ctx: any, provider: string) {
 		const entry = readAuthFile()[provider];
+		if (classifyProvider(provider, config.qwenProvider) === "openai") {
+			return !!nativeOpenAI && isOpenAIChatGPTCredential(entry) && isEntryUsable(entry);
+		}
 		if (entry) return isEntryUsable(entry);
 		try {
 			return (
@@ -6643,11 +6721,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (!family) return [];
 		const configured = config.preferredModels[family];
 		if (configured && configured.length > 0) return configured;
-		const defaults =
+		const defaults: string[] =
 			family === "anthropic"
 				? registryAnthropicModelOrder.length > 0
 					? registryAnthropicModelOrder
 					: DEFAULT_ANTHROPIC_MODELS
+				: family === "openai"
+					? openaiModelOrder
 				: family === "openai-codex"
 					? discoveredCodexModelOrder.length > 0
 						? discoveredCodexModelOrder
@@ -6762,6 +6842,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const provider = String(model?.provider ?? "");
 		const base = baseProviderId(provider);
 		if (base !== "openai" && base !== "openrouter") return true;
+		if (base === "openai" && nativeOpenAI && isOpenAIChatGPTCredential(readAuthFile()[provider])) return true;
 		// Manually selecting a paid provider is authority for that provider in this session, but not
 		// for a different billing pool. A configured fallback target is the persistent opt-in path.
 		if (provider === currentModel?.provider) return true;
@@ -6825,6 +6906,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			const sourceBand = modelQualityBand(currentModel?.id, currentModel?.provider);
 			const sourceExceptional = apexIdentity(currentModel?.id);
 			models = models.filter((model: any) => {
+				// The dual-auth base provider is not a subscription sibling when it
+				// holds a paid key. Generic discovery/priority/pins are not billing consent.
+				const sourceSubscription = /^openai-account-\d+$/.test(currentModel?.provider ?? "") ||
+					isOpenAIChatGPTCredential(readAuthFile()[currentModel?.provider]);
+				if (sourceSubscription && baseProviderId(model.provider) === "openai" &&
+					!isOpenAIChatGPTCredential(readAuthFile()[model.provider]) &&
+					!configuredFallbacks.some(target => parseTarget(target)?.provider === model.provider)) return false;
 				// A preference is not tier consent, including routed automatic compaction.
 				if (!pinQualityCompatible(model, currentModel)) return false;
 				const candidateBand = modelQualityBand(model.id, model.provider);
@@ -7415,6 +7503,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	async function avoidAccidentalDirectApi(ctx: any): Promise<boolean> {
+		if (isOpenAIChatGPTCredential(readAuthFile()["openai"])) return true;
 		if (!accidentalDirectStartup || ctx.model?.provider !== "openai" ||
 			ctx.model?.id !== "gpt-5.5" || subagentChild) return true;
 		// Pi's built-in fallback is healthy if the user chose it, but a missing saved
@@ -9530,6 +9619,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				return;
 			}
 			const id = slotId(family, n, config.qwenProvider);
+			if (family === "openai" && !nativeOpenAI) {
+				ctx.ui.notify("pi-multi-account: this Pi host lacks native new OpenAI ChatGPT OAuth; use a host exposing that provider contract. Legacy Codex is separate and unchanged.", "warning");
+				return;
+			}
 			if (family === "cursor" && !isCursorProviderInstalled()) {
 				// Asked for by name → this is exactly when the clone instruction is useful.
 				await refreshCursorSlots(auth, ctx, true);
@@ -9539,6 +9632,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (
 				family === "anthropic" ||
 				family === "openai-codex" ||
+				family === "openai" ||
 				family === "kimi-coding" ||
 				family === "cursor"
 			) {
@@ -11235,6 +11329,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					? (cached as Array<Record<string, unknown>>) : undefined, baseUrl);
 			} else if (family === "anthropic") {
 				registerAnthropicSlot(pi, id, DEFAULT_ANTHROPIC_MODELS, baseUrl);
+			} else if (family === "openai") {
+				registerOpenAISlot(id, `${baseUrl}/v1`, openaiSlotModels.get(id));
 			}
 		}
 		return true;
@@ -11336,6 +11432,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return publishedRouteFor(SLOT_PROXY_PORT, id);
 	}
 
+	function numberedOpenAIBaseUrl(id: string): string {
+		if (!config.childProxy && !isChildFacingPlaceholderForSlot(readAuthFileRaw()[id], id) && slotProxyPort === undefined) return OPENAI_CHATGPT_URL;
+		return `${publishedRouteFor(slotProxyPort ?? SLOT_PROXY_PORT, id)}/v1`;
+	}
+
 	function restoreChildFacingAuth(): void {
 		try { mutateProxyAuth(AUTH_PATH, PROXY_OAUTH_PATH, applyRestoreAll, "restore"); }
 		catch { logEvent("auth_publication_deferred", { operation: "restore" }); }
@@ -11433,6 +11534,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				if (reshaped && reshaped !== parsed) body = Buffer.from(JSON.stringify(reshaped));
 			} catch {
 				// Not JSON, or not a messages payload — forward exactly as received.
+			}
+		}
+
+		if (body?.length && verdict.route.family === "openai") {
+			try {
+				body = Buffer.from(JSON.stringify(shapeOpenAIChatGPTPayload(JSON.parse(body.toString("utf8")))));
+			} catch {
+				res.writeHead(400, { "content-type": "application/json" });
+				res.end(JSON.stringify({ error: { message: "native ChatGPT Responses requires a JSON object" } }));
+				return;
 			}
 		}
 
@@ -11691,7 +11802,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				...registeredSlots,
 				...Object.keys(parent).filter((id) => proxyFamilyOf(id) !== undefined),
 			]),
-		].filter((id) => proxyFamilyOf(id) !== undefined && isEntryUsable(parent[id]));
+		].filter((id) => proxyFamilyOf(id) !== undefined && isEntryUsable(parent[id]) &&
+			(proxyFamilyOf(id) !== "openai" || (!!nativeOpenAI && isOpenAIChatGPTCredential(parent[id]))));
 		if (slots.length === 0) {
 			if (ownsSharedChildPublication()) {
 				// Keep OAuth in the parent-only sidecar while any root is active, even
@@ -11744,7 +11856,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (!family) continue;
 			const oauth = parent[id]?.type === "oauth";
 			const baseUrl = oauth ? publishedRouteFor(port, id) :
-				family === "anthropic" ? "https://api.anthropic.com" : "https://chatgpt.com/backend-api";
+				family === "anthropic" ? "https://api.anthropic.com" :
+				family === "openai" ? OPENAI_CHATGPT_URL : "https://chatgpt.com/backend-api";
 			if (family === "anthropic") {
 				provisionNativeSlot(id, {
 					api: "anthropic-messages",
@@ -11754,6 +11867,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						...anthropicModelDef(modelId, id),
 						baseUrl,
 					})),
+				});
+			} else if (family === "openai") {
+				const nativeBaseUrl = `${publishedRouteFor(port, id)}/v1`;
+				registerOpenAISlot(id, nativeBaseUrl, openaiCatalogFromHost(ctx));
+				provisionNativeSlot(id, {
+					api: "openai-responses", baseUrl: nativeBaseUrl,
+					apiKey: placeholderKeyFor(family),
+					models: openaiSlotModels.get(id)?.map((model: any) => ({ ...model, baseUrl: nativeBaseUrl })) ?? [],
 				});
 			} else {
 				const cached = codexModelCatalogByProvider.get(id)?.models as

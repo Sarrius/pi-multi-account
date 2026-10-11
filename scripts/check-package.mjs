@@ -17,7 +17,7 @@ const names = packed[0].files.map((file) => file.path);
 const forbidden = /(^|\/)(?:test|tests|scripts|\.github|node_modules|evidence|patches)(?:\/|$)|(?:^|\/)(?:auth\.json|.*\.sqlite(?:-wal|-shm)?|.*\.sock|.*\.log|.*\.tgz)$/i;
 const leaked = names.filter((name) => forbidden.test(name));
 if (leaked.length) throw new Error(`Refusing non-public package artifacts: ${leaked.join(", ")}`);
-for (const required of ["package.json", "README.md", "CHANGELOG.md", "LICENSE", "SECURITY.md", "index.ts"]) {
+for (const required of ["package.json", "README.md", "CHANGELOG.md", "LICENSE", "SECURITY.md", "index.ts", "openai-chatgpt.ts", "docs/openai-chatgpt-accounts.md"]) {
 	if (!names.includes(required)) throw new Error(`npm package is missing ${required}`);
 }
 if (!Number.isSafeInteger(packed[0].unpackedSize) || packed[0].unpackedSize > 2 * 1024 * 1024) {
