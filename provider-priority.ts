@@ -31,7 +31,7 @@
  * ## The ladder
  *
  * A flat, ordered list of provider GROUPS. A group is a managed family (`anthropic`,
- * `openai-codex`, `kimi-coding`, `cursor`, `qwen`, `ollama`) or the base id of anything else the
+ * `openai-codex`, native subscription `openai`, `kimi-coding`, `cursor`, `qwen`, `ollama`) or the base id of anything else the
  * user is logged in to (`openrouter`, `zai`, `minimax`, …) — numbered rotation slots of the same
  * account (`openai-codex-account-3`) all collapse to one group, because preferring one slot over
  * its sibling is rotation's job, not the ladder's.
@@ -55,10 +55,11 @@
  * cooldown, and the account drops out of the candidate list on its own.
  */
 
-/** Groups this extension manages directly: OAuth refresh, quota telemetry, live catalogue. */
+/** Managed routing groups; not all have verified quota telemetry. OpenAI billing modes stay distinct. */
 export const MANAGED_GROUPS = [
   "anthropic",
   "openai-codex",
+  "openai",
   "kimi-coding",
   "cursor",
   "qwen",
@@ -68,7 +69,7 @@ export const MANAGED_GROUPS = [
 /**
  * The ladder shipped by default.
  *
- * Flat-rate subscriptions with real quota telemetry first, strongest coding models earliest;
+ * Subscription groups first, strongest coding models earliest (new OpenAI quota is unknown);
  * then the cheap/local tier; then — by omission — everything else, which is where per-token
  * billing lands. It is the same sequence rotation already used as its final tiebreak, promoted
  * to a stated policy so the cross-family hop stops being decided by whatever the telemetry
@@ -77,6 +78,7 @@ export const MANAGED_GROUPS = [
 export const DEFAULT_PROVIDER_PRIORITY: string[] = [
   "anthropic",
   "openai-codex",
+  "openai",
   "kimi-coding",
   "cursor",
   "qwen",
@@ -92,6 +94,7 @@ const ALIASES: Record<string, string> = {
   chatgpt: "openai-codex",
   gpt: "openai-codex",
   openaicodex: "openai-codex",
+  chatgptdirect: "openai",
   kimi: "kimi-coding",
   k3: "kimi-coding",
   moonshot: "kimi-coding",
