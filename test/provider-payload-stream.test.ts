@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createPayloadStream, cursorPayloadStream } from "../provider-payload-stream.ts";
+import { createPayloadStream, cursorPayloadStream, shapeCursorPayload } from "../provider-payload-stream.ts";
 
 test("provider payload wrapper composes async caller replacement and forwards stream controls unchanged", async () => {
 	const controller = new AbortController();
@@ -48,6 +48,25 @@ test("cancellation during lazy initialization reaches one shared native stream",
 	assert.equal(await stream.result(), result);
 	assert.equal(events[0].reason, "aborted");
 	assert.equal(starts, 1);
+});
+
+test("Cursor provider's native HTTP serializer carries explicit tool errors rather than guessing from text", async () => {
+	let body:any;
+	const model={api:"openai-completions",provider:"cursor",id:"fixture",baseUrl:"https://fixture.invalid/v1",reasoning:false,input:["text"],contextWindow:10000,maxTokens:100,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}};
+	const assistant={role:"assistant",api:model.api,provider:model.provider,model:model.id,content:[{type:"toolCall",id:"r1",name:"read",arguments:{path:"missing"}}],stopReason:"toolUse",usage:{input:1,output:1,cacheRead:0,cacheWrite:0,totalTokens:2,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},timestamp:0};
+	const stream=cursorPayloadStream(model,{messages:[{role:"user",content:"TASK_A",timestamp:0},assistant,{role:"toolResult",toolCallId:"r1",toolName:"read",content:[{type:"text",text:"explicit failure"}],isError:true,timestamp:0}]},{apiKey:"fixture",sessionId:"owner",cwd:"/project/a",maxRetries:0,fetch:async (_url:any,init:any)=>{body=JSON.parse(init.body);return new Response(JSON.stringify({error:{message:"fixture finished"}}),{status:400});}});
+	await stream.result();assert.equal(body.pi_cwd,"/project/a");assert.equal(body.messages.find((message:any)=>message.role==="tool").pi_tool_error,true);
+	const ambiguous=shapeCursorPayload({messages:[{role:"tool",tool_call_id:"duplicate",content:"not evidence"}]},{},{messages:[{role:"toolResult",toolCallId:"duplicate",isError:true},{role:"toolResult",toolCallId:"duplicate",isError:false}]});
+	assert.equal(ambiguous.messages[0].pi_tool_error,undefined,"duplicate ids must not borrow another execution's outcome");
+});
+
+test("Cursor outcome forwarding matches the host's pipe-id normalization without sibling collisions", async () => {
+	for(const ids of [["shared|item+one","shared|item/two"],["long-call|"+"a".repeat(300),"long-call|"+"b".repeat(300)]]){
+		let body:any;const model:any={api:"openai-completions",provider:"cursor",id:"fixture",baseUrl:"https://fixture.invalid/v1",reasoning:false,input:["text"],contextWindow:10000,maxTokens:100,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}};
+		const assistant={role:"assistant",api:model.api,provider:model.provider,model:model.id,content:ids.map(id=>({type:"toolCall",id,name:"read",arguments:{path:"fixture"}})),stopReason:"toolUse",usage:{input:1,output:1,cacheRead:0,cacheWrite:0,totalTokens:2,cost:{}},timestamp:0};
+		const stream=cursorPayloadStream(model,{messages:[{role:"user",content:"TASK_A",timestamp:0},assistant,...ids.map((id,index)=>({role:"toolResult",toolCallId:id,toolName:"read",content:[{type:"text",text:"fixture"}],isError:index===0,timestamp:0}))]},{apiKey:"fixture",maxRetries:0,fetch:async (_url:any,init:any)=>{body=JSON.parse(init.body);return new Response(JSON.stringify({error:{message:"fixture finished"}}),{status:400});}});
+		await stream.result();const messages=body.messages.filter((message:any)=>message.role==="tool");assert.equal(messages.length,2);assert.notEqual(messages[0].tool_call_id,messages[1].tool_call_id);assert.deepEqual(messages.map((message:any)=>message.pi_tool_error),[true,false]);
+	}
 });
 
 test("Cursor public provider stream keeps independent sessions isolated without host events", async () => {

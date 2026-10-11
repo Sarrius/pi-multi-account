@@ -6,6 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import {
 	existsSync,
@@ -340,6 +341,8 @@ function setup(opts: {
 	omitSendUserMessage?: boolean;
 	/** Reject this many prompt-injection attempts before accepting one. */
 	sendUserMessageRejects?: number;
+	/** Reject queued custom-message submissions asynchronously. */
+	sendMessageRejects?: number;
 	/** Models the HOST (Pi) itself publishes for the base Codex provider. */
 	hostCodexModels?: string[];
 	/** Optional exact host catalog by provider, used for cross-family/apex routing tests. */
@@ -620,6 +623,7 @@ function setup(opts: {
 	};
 
 	let sendUserMessageRejects = opts.sendUserMessageRejects ?? 0;
+	let sendMessageRejects = opts.sendMessageRejects ?? 0;
 	const pi: any = {
 		events: {
 			on: (name: string, handler: (payload: any) => void) => {
@@ -700,6 +704,10 @@ function setup(opts: {
 		},
 		sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
 			rec.customMessages.push({ message, options });
+			if (sendMessageRejects > 0) {
+				sendMessageRejects--;
+				return Promise.reject(new Error("Host rejected queued custom message"));
+			}
 			return Promise.resolve();
 		},
 		continueAgent: async (options?: Record<string, unknown>) => {
@@ -1529,7 +1537,7 @@ test(
 				const headers = new Headers(init?.headers);
 				assert.equal(headers.get("x-userid"), "xai-user-123");
 				if (billingRequests === 1) return new Response("{}", { status: 401 });
-				assert.equal(headers.get("Authorization"), `Bearer ${freshAccess}`);
+				assert.equal(headers.get("Authorization"), `Bearer ${winnerAccess}`);
 				return new Response(
 					JSON.stringify({
 						config: {
@@ -1596,12 +1604,12 @@ test(
 			assert.equal(billingRequests, 2, "the 401 must be retried with fresh OAuth");
 			assert.equal(
 				refreshRequests,
-				2,
-				"invalid_grant must retry with the refresh token another session stored",
+				1,
+				"invalid_grant must adopt the actual newer login, not spend its refresh token again",
 			);
 			const stored = JSON.parse(readFileSync(AUTH, "utf8")).xai;
-			assert.equal(stored.access, freshAccess);
-			assert.equal(stored.refresh, "rotated-xai-refresh");
+			assert.equal(stored.access, winnerAccess);
+			assert.equal(stored.refresh, "winner-refresh");
 			assert.ok(
 				t.rec.statuses.some(
 					({ value }) =>
@@ -2963,15 +2971,17 @@ test("all-limited recovery polls provider availability even when the footer is h
 			showUsage: false,
 			resumeAfterAllAccountsRecover: true,
 			cooldownMs: 60_000,
+			maxRecheckIntervalMs: 1000,
 			pendingPollMs: 25,
 		},
 	});
 	try {
 		await finishError(t, "openai-codex", "gpt-5.5", "429 rate limit");
 		assert.ok(t.readState().pendingFrom, "a long estimated cooldown must leave a live wake");
-		await wait(1200);
+		assert.equal(t.rec.continueCalls.length, 0, "allowed metadata cannot skip the real refusal's backoff");
+		await wait(1250);
 		assert.ok(probes > 0, "quota recovery must probe independently of footer visibility");
-		assert.equal(t.rec.continueCalls.length, 1, "fresh allowed=true must wake the task promptly");
+		assert.equal(t.rec.continueCalls.length, 1, "after the bounded retry fence expires, allowed metadata permits one recheck");
 	} finally {
 		globalThis.fetch = originalFetch;
 		await t.fire("session_shutdown");
@@ -3438,19 +3448,19 @@ test("resume fires on whichever account recovers first, not rotation order", asy
 	);
 });
 
-test("a long over-estimated cooldown is corrected by fresh usage and resumes", async () => {
+test("a long forecast is rechecked after refusal backoff, never immediately from quota metadata", async () => {
 	const now = Date.now();
 	const t = setup({
 		accounts: ONE_ACCOUNT,
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
-		config: { pendingPollMs: 150 },
+		config: { pendingPollMs: 150, maxRecheckIntervalMs: 1000 },
 		seedState: {
 			stateVersion: 5,
 			exhaustedUntilByProvider: {},
 			exhaustedUntilByModel: {},
 			lastProbeAtByProvider: {},
 			invalidatedByProvider: {},
-			// Fresh usage says the 5h window is empty — the account is actually free again.
+			// A fresh empty usage window is metadata, not proof that an inference refusal recovered.
 			usageByProvider: {
 				anthropic: {
 					provider: "anthropic",
@@ -3465,19 +3475,13 @@ test("a long over-estimated cooldown is corrected by fresh usage and resumes", a
 	await t.fire("session_start");
 	// 429 with no reset hint → recorded cooldown defaults to a long (6h) estimate.
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
-	assert.equal(
-		t.rec.continueCalls.length,
-		1,
-		"usage reconciliation should resume immediately on the same account",
-	);
-	assert.equal(t.rec.sent.length, 0);
-	// Without reconciliation this would sleep ~6h; usage shows recovery, so the next poll resumes.
-	await wait(450);
-	assert.equal(
-		t.rec.continueCalls.length,
-		1,
-		"must resume once fresh usage shows the account recovered",
-	);
+	try {
+		assert.equal(t.rec.continueCalls.length, 0, "an actual refusal outranks this quota forecast during backoff");
+		assert.equal(t.rec.sent.length, 0);
+		// Do not wait the six-hour forecast, but do not hot-loop on a percentage either.
+		await wait(1250);
+		assert.equal(t.rec.continueCalls.length, 1, "permit exactly one same-route recheck after bounded backoff");
+	} finally { await t.fire("session_shutdown"); }
 });
 
 test("a session limit the usage window can't see is not hot-retried every second", async () => {
@@ -4088,6 +4092,61 @@ test("shared proxy survives either independent-root shutdown order", async () =>
 	}
 });
 
+for (const foreignOwner of [false, true])
+test(`same-session replacement clears only the superseded root's pending marker (foreign=${foreignOwner})`, async () => {
+	const original = setup({ accounts: ONE_ACCOUNT, piWebHost: true,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { childProxy: false, cooldownMs: 60000, probeCooldownMs: 60000 } });
+	original.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "pending-reload" };
+	await original.fire("session_start");
+	await finishError(original, "anthropic", "claude-opus-4-8", "429 rate limit");
+	const parked = original.readState();
+	assert.ok(parked.pendingOwner && parked.pendingFrom, "precondition: original owns pending work");
+	if (foreignOwner) {
+		parked.pendingOwner = "another-live-root";
+		writeFileSync(STATE, JSON.stringify(parked));
+	}
+	const replacement = setup({ accounts: ONE_ACCOUNT, reuseSlotProxyPort: true, piWebHost: true, seedState: parked,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { childProxy: false, cooldownMs: 60000, probeCooldownMs: 60000 } });
+	replacement.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "pending-reload" };
+	try {
+		await replacement.fire("session_start");
+		assert.equal(replacement.readState().pendingOwner, foreignOwner ? "another-live-root" : undefined,
+			"remove an owned zombie but never another live root's marker");
+		assert.equal(replacement.rec.continueCalls.length, 0, "replacement must not revive a previous instance's work");
+		assert.equal(original.rec.continueCalls.length, 0);
+	} finally {
+		await original.fire("session_shutdown");
+		await replacement.fire("session_shutdown");
+	}
+});
+
+test("two interactive roots keep quota continuation owned by the original live session", async () => {
+	const config = { childProxy: false, cooldownMs: 1000, probeCooldownMs: 1000 };
+	const first = setup({ accounts: ONE_ACCOUNT, piWebHost: true,
+		current: { provider: "anthropic", id: "claude-opus-4-8" }, config });
+	first.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "quota-owner-a" };
+	await first.fire("session_start");
+	await finishError(first, "anthropic", "claude-opus-4-8", "429 rate limit");
+	const parked = first.readState();
+	assert.ok(parked.pendingOwner);
+	const second = setup({ accounts: ONE_ACCOUNT, reuseSlotProxyPort: true, piWebHost: true, seedState: parked,
+		current: { provider: "anthropic", id: "claude-opus-4-8" }, config });
+	second.ctx.sessionManager = { getBranch: () => [], getSessionId: () => "quota-owner-b" };
+	try {
+		await second.fire("session_start");
+		assert.equal(second.readState().pendingOwner, parked.pendingOwner);
+		await wait(1250);
+		assert.equal(first.rec.continueCalls.length, 1, "only the session that parked the task resumes it");
+		assert.equal(second.rec.continueCalls.length, 0);
+		assert.equal(second.rec.sent.length, 0);
+	} finally {
+		await first.fire("session_shutdown");
+		await second.fire("session_shutdown");
+	}
+});
+
 test("same-session rehydrate takes over failover without releasing shared proxy", async () => {
 	rmSync(MODELS, { force: true });
 	const accounts: Account = {
@@ -4376,6 +4435,122 @@ test("manual model selection adopts host per-model thinking defaults in auto mod
 	await t.fire("agent_start");
 	assert.equal(t.thinkingLevel(), "high");
 	await t.fire("session_shutdown");
+});
+
+test("fresh terminal Pi inherits the latest successful model across project sessions", async () => {
+	const latest = { provider: "openai-codex-account-8", id: "gpt-6-sol", at: Date.now() - 1000 };
+	const t = setup({
+		independentRoots: true,
+		accounts: {
+			openai: { type: "api_key", key: "fixture-only" },
+			"openai-codex-account-8": { type: "oauth", access: "codex", refresh: "refresh", accountId: "codex-8" },
+		},
+		current: { provider: "openai", id: "gpt-5.5" },
+		hostModelsByProvider: { "openai-codex-account-8": ["gpt-6-sol"] },
+		settings: { defaultProvider: "kimi-coding-account-2", defaultModel: "k3" },
+		seedState: { stateVersion: 5, lastSuccessfulModel: latest },
+		config: { followLastSuccessfulModel: true, includeCursor: false, childProxy: false, autoDiscoverModels: false, fallbacks: ["openai-codex-account-8"] },
+	});
+	t.ctx.cwd = AGENT_DIR;
+	t.ctx.mode = "tui";
+	// Real Pi creates these bootstrap entries before emitting session_start.
+	t.ctx.sessionManager = { getHeader: () => ({ timestamp: new Date().toISOString() }), getBranch: () => [
+		{ type: "model_change", provider: "openai", modelId: "gpt-5.5" },
+		{ type: "thinking_level_change", thinkingLevel: "high" },
+	] };
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, { provider: latest.provider, id: latest.id });
+	const answer = { role: "assistant", provider: latest.provider, model: latest.id, stopReason: "stop" };
+	await t.fire("agent_end", { messages: [answer] });
+	assert.equal(t.readState().lastSuccessfulModel.id, "gpt-6-sol");
+	const settings = JSON.parse(readFileSync(SETTINGS, "utf8"));
+	assert.equal(settings.defaultProvider, latest.provider);
+	assert.equal(settings.defaultModel, latest.id);
+});
+
+test("resumed terminal Pi preserves its own selected model over global recency", async () => {
+	const t = setup({
+		independentRoots: true,
+		accounts: { anthropic: { type: "oauth", access: "a", refresh: "r" } },
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedState: { stateVersion: 5, lastSuccessfulModel: { provider: "openai-codex-account-8", id: "gpt-6-sol", at: Date.now() } },
+		config: { followLastSuccessfulModel: true, includeCursor: false, childProxy: false },
+	});
+	t.ctx.mode = "tui";
+	t.ctx.sessionManager = { getBranch: () => [
+		{ type: "model_change", provider: "anthropic", modelId: "claude-opus-4-8" },
+		{ type: "message", message: { role: "user" } },
+	] };
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, { provider: "anthropic", id: "claude-opus-4-8" });
+});
+
+test("a resumed empty session retains its own model, not the cross-project recency", async () => {
+	const t = setup({
+		independentRoots: true,
+		accounts: { anthropic: { type: "oauth", access: "a", refresh: "r" } },
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedState: { stateVersion: 5, lastSuccessfulModel: { provider: "openai-codex-account-8", id: "gpt-6-sol", at: Date.now() } },
+		config: { followLastSuccessfulModel: true, includeCursor: false, childProxy: false },
+	});
+	t.ctx.mode = "tui";
+	t.ctx.sessionManager = { getHeader: () => ({ timestamp: new Date(Date.now() - 60_000).toISOString() }), getBranch: () => [
+		{ type: "model_change", provider: "anthropic", modelId: "claude-opus-4-8" },
+	] };
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, { provider: "anthropic", id: "claude-opus-4-8" });
+});
+
+test("global last-successful startup policy is off unless explicitly enabled", async () => {
+	const t = setup({
+		independentRoots: true,
+		accounts: { openai: { type: "api_key", key: "fixture-only" } },
+		current: { provider: "openai", id: "gpt-5.5" },
+		settings: { defaultProvider: "openai", defaultModel: "gpt-5.5" },
+		seedState: { stateVersion: 5, lastSuccessfulModel: { provider: "anthropic", id: "claude-opus-4-8", at: Date.now() } },
+		config: { includeCursor: false, childProxy: false },
+	});
+	t.ctx.mode = "tui";
+	t.ctx.sessionManager = { getHeader: () => ({ timestamp: new Date().toISOString() }), getBranch: () => [] };
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, { provider: "openai", id: "gpt-5.5" });
+	await t.fire("agent_end", { messages: [{ role: "assistant", provider: "openai", model: "gpt-5.5", stopReason: "stop" }] });
+	assert.equal(t.readState().lastSuccessfulModel.provider, "anthropic");
+	assert.equal(JSON.parse(readFileSync(SETTINGS, "utf8")).defaultProvider, "openai");
+});
+
+test("explicit CLI model wins over opt-in global last-successful startup preference", async () => {
+	const t = setup({
+		independentRoots: true,
+		accounts: { openai: { type: "api_key", key: "fixture-only" } },
+		current: { provider: "openai", id: "gpt-5.5" },
+		cliArgs: ["--model", "openai/gpt-5.5"],
+		settings: { defaultProvider: "kimi-coding-account-2", defaultModel: "k3" },
+		seedState: { stateVersion: 5, lastSuccessfulModel: { provider: "anthropic", id: "claude-opus-4-8", at: Date.now() } },
+		config: { followLastSuccessfulModel: true, includeCursor: false, childProxy: false },
+	});
+	t.ctx.mode = "tui";
+	t.ctx.sessionManager = { getHeader: () => ({ timestamp: new Date().toISOString() }), getBranch: () => [] };
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, { provider: "openai", id: "gpt-5.5" });
+	assert.notDeepEqual(await t.input("explicit route"), { action: "handled" });
+});
+
+test("unavailable subscription preference blocks accidental direct OpenAI API fallback", async () => {
+	const t = setup({
+		independentRoots: true,
+		accounts: { openai: { type: "api_key", key: "fixture-only" } },
+		current: { provider: "openai", id: "gpt-5.5" },
+		settings: { defaultProvider: "kimi-coding-account-2", defaultModel: "k3" },
+		seedState: { stateVersion: 5, lastSuccessfulModel: { provider: "openai-codex-account-8", id: "gpt-6-sol", at: Date.now() } },
+		config: { followLastSuccessfulModel: true, includeCursor: false, childProxy: false, fallbacks: ["openai-codex-account-8"] },
+	});
+	t.ctx.mode = "tui";
+	t.ctx.sessionManager = { getBranch: () => [] };
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, { provider: "openai", id: "gpt-5.5" });
+	assert.deepEqual(await t.input("do not bill direct OpenAI"), { action: "handled" });
+	assert.equal(t.rec.sent.length, 0);
 });
 
 test("session_start restores lastUserModel after Pi falls back to anthropic/claude-opus-4-8", async () => {
@@ -5493,6 +5668,267 @@ test("remove <provider-id> deletes a specific slot from auth.json", async () => 
 	const auth = JSON.parse(readFileSync(AUTH, "utf8"));
 	assert.ok(!auth["openai-codex-account-2"]);
 	assert.ok(auth.anthropic);
+});
+
+for (const provider of ["opencode-go", "deepseek-account-2"]) {
+	test(`remove accepts the authenticated unmanaged provider ${provider}`, async () => {
+		const t = setup({ accounts: { ...ONE_ACCOUNT, [provider]: { type: "api_key", key: "fixture-key" } }, config: { childProxy: false } });
+		try {
+			await t.command(`remove ${provider}`);
+			const auth = JSON.parse(readFileSync(AUTH, "utf8"));
+			assert.equal(auth[provider], undefined);
+			assert.ok(auth.anthropic);
+			assert.match(t.rec.notifies.at(-1) ?? "", new RegExp(`removed ${provider}`));
+		} finally { await t.fire("session_shutdown"); }
+	});
+}
+
+for (const store of [
+	{ delete: async () => { throw new Error("Read-only credential store"); } },
+	{ modify: async () => { throw new Error("Deletion must not use modify"); } },
+]) {
+	test(`remove refuses an exposed ${"delete" in store ? "read-only" : "modify-only"} store without file-backed bypass`, async () => {
+		const t = setup({ accounts: { ...ONE_ACCOUNT, "opencode-go": { type: "api_key", key: "fixture-go" } }, config: { childProxy: false } });
+		try {
+			t.ctx.modelRegistry.authStorage = store;
+			const before = readFileSync(AUTH, "utf8");
+			await t.command("remove opencode-go");
+			assert.equal(readFileSync(AUTH, "utf8"), before);
+			assert.match(t.rec.notifies.at(-1) ?? "", /deletion could not be confirmed/);
+			assert.ok(!t.rec.notifies.some((message) => /removed opencode-go/.test(message)));
+		} finally { await t.fire("session_shutdown"); }
+	});
+}
+
+test("remove kimi resolves the highest numbered Kimi login", async () => {
+	const t = setup({ accounts: {
+		...ONE_ACCOUNT,
+		"kimi-coding": { type: "api_key", key: "fixture-kimi-1" },
+		"kimi-coding-account-2": { type: "api_key", key: "fixture-kimi-2" },
+		"kimi-coding-account-3": { type: "api_key", key: "fixture-kimi-3" },
+	}, config: { childProxy: false } });
+	try {
+		await t.command("remove kimi");
+		const auth = JSON.parse(readFileSync(AUTH, "utf8"));
+		assert.equal(auth["kimi-coding-account-3"], undefined);
+		assert.ok(auth["kimi-coding-account-2"]);
+		assert.ok(auth["kimi-coding"]);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("remove a model-qualified target never logs out its whole provider", async () => {
+	const t = setup({ accounts: { ...ONE_ACCOUNT, "opencode-go": { type: "api_key", key: "fixture-go" } }, config: { childProxy: false } });
+	try {
+		const before = readFileSync(AUTH, "utf8");
+		await t.command("remove opencode-go/glm-5.1");
+		assert.equal(readFileSync(AUTH, "utf8"), before);
+		assert.match(t.rec.notifies.at(-1) ?? "", /exclude opencode-go\/glm-5\.1/);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("missing Kimi login is distinguished from a remaining model catalog", async () => {
+	const t = setup({ accounts: ONE_ACCOUNT, config: { childProxy: false } });
+	try {
+		await t.command("remove kimi-coding-account-2");
+		assert.match(t.rec.notifies.at(-1) ?? "", /no stored credential.*kimi-coding-account-2/i);
+		assert.match(t.rec.notifies.at(-1) ?? "", /exclude/);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("provider exclusion persists across reload and rediscovery without deleting auth or models", async () => {
+	const t = setup({ accounts: { ...ONE_ACCOUNT, "opencode-go": { type: "api_key", key: "fixture-go" } },
+		current: { provider: "anthropic", id: "claude-opus-4-8" }, config: { childProxy: false, fallbacks: ["opencode-go"] } });
+	try {
+		const authBefore = readFileSync(AUTH, "utf8");
+		const modelsBefore = existsSync(MODELS) ? readFileSync(MODELS, "utf8") : undefined;
+		const registryBefore = t.ctx.modelRegistry.getAll();
+		await t.command("exclude opencode-go");
+		assert.deepEqual(JSON.parse(readFileSync(CONFIG, "utf8")).excludedProviders, ["opencode-go"]);
+		for (const command of ["status", "rediscover", "reload", "status"]) await t.command(command);
+		const status = t.rec.notifies.at(-1) ?? "";
+		assert.doesNotMatch(status.split("\n").find((line) => line.startsWith("Rotation (")) ?? "", /opencode-go/);
+		assert.match(status, /Excluded providers: opencode-go/);
+		await t.command("models");
+		assert.doesNotMatch(t.rec.notifies.at(-1) ?? "", /  opencode-go:/);
+		assert.equal(readFileSync(AUTH, "utf8"), authBefore);
+		assert.equal(existsSync(MODELS) ? readFileSync(MODELS, "utf8") : undefined, modelsBefore);
+		assert.deepEqual(t.ctx.modelRegistry.getAll(), registryBefore);
+		assert.deepEqual(t.rec.setModels, [], "excluding a destination must not switch the active route");
+		await t.command("include opencode-go");
+		assert.deepEqual(JSON.parse(readFileSync(CONFIG, "utf8")).excludedProviders, []);
+		await t.command("status");
+		assert.match((t.rec.notifies.at(-1) ?? "").split("\n").find((line) => line.startsWith("Rotation (")) ?? "", /opencode-go/);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("rotation exclusions dominate configured fallbacks in both discovery modes", async () => {
+	for (const autoDiscover of [true, false]) {
+		const t = setup({ accounts: { ...TWO_ACCOUNTS, "opencode-go": { type: "api_key", key: "fixture-go" } },
+			current: { provider: "anthropic", id: "claude-opus-4-8" }, config: {
+				childProxy: false, autoDiscover, excludedProviders: ["opencode-go"],
+				fallbacks: ["opencode-go/claude-opus-4-8", "openai-codex-account-2"],
+			} });
+		try {
+			await t.command("next");
+			assert.equal(t.ctx.model.provider, "openai-codex-account-2");
+		} finally { await t.fire("session_shutdown"); }
+	}
+});
+
+test("exact model exclusion preserves its provider and other accounts' same model", async () => {
+	const accounts = { ...ONE_ACCOUNT, "opencode-go": { type: "api_key", key: "fixture-go" }, "deepseek": { type: "api_key", key: "fixture-deepseek" } };
+	const t = setup({ accounts, current: { provider: "anthropic", id: "claude-opus-4-8" },
+		hostModelsByProvider: { "opencode-go": ["claude-opus-4-8", "claude-opus-4-5"], deepseek: ["claude-opus-4-8"] },
+		config: { childProxy: false, fallbacks: ["opencode-go/claude-opus-4-8", "opencode-go", "deepseek"] } });
+	try {
+		const authBefore = readFileSync(AUTH, "utf8");
+		await t.command("exclude opencode-go/claude-opus-4-8");
+		assert.deepEqual(JSON.parse(readFileSync(CONFIG, "utf8")).excludedModels, ["opencode-go/claude-opus-4-8"]);
+		await t.command("next");
+		assert.equal(t.ctx.model.provider, "opencode-go");
+		assert.equal(t.ctx.model.id, "claude-opus-4-5");
+		await t.command("next");
+		assert.equal(t.ctx.model.provider, "deepseek");
+		assert.equal(t.ctx.model.id, "claude-opus-4-8");
+		assert.equal(readFileSync(AUTH, "utf8"), authBefore);
+		await t.command("include opencode-go/claude-opus-4-8");
+		assert.deepEqual(JSON.parse(readFileSync(CONFIG, "utf8")).excludedModels, []);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("excluding a catalog-only Kimi account is reversible without a login", async () => {
+	const t = setup({ accounts: ONE_ACCOUNT, config: { childProxy: false } });
+	try {
+		const authBefore = readFileSync(AUTH, "utf8");
+		await t.command("exclude kimi-coding-account-2");
+		assert.deepEqual(JSON.parse(readFileSync(CONFIG, "utf8")).excludedProviders, ["kimi-coding-account-2"]);
+		assert.equal(readFileSync(AUTH, "utf8"), authBefore);
+		await t.command("include kimi-coding-account-2");
+		assert.deepEqual(JSON.parse(readFileSync(CONFIG, "utf8")).excludedProviders, []);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("explicit switch can still select an excluded provider without re-enabling its rotation", async () => {
+	const t = setup({ accounts: { ...ONE_ACCOUNT, "opencode-go": { type: "api_key", key: "fixture-go" } },
+		current: { provider: "anthropic", id: "claude-opus-4-8" }, config: { childProxy: false, excludedProviders: ["opencode-go"] } });
+	try {
+		await t.command("switch opencode-go");
+		assert.equal(t.ctx.model.provider, "opencode-go");
+		await t.command("status");
+		assert.doesNotMatch((t.rec.notifies.at(-1) ?? "").split("\n").find((line) => line.startsWith("Rotation (")) ?? "", /opencode-go/);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("exclusion config mutation retains fresh disk exclusions and unrelated settings", async () => {
+	const t = setup({ accounts: { ...ONE_ACCOUNT, "opencode-go": { type: "api_key", key: "fixture-go" } }, config: { childProxy: false } });
+	try {
+		const disk = JSON.parse(readFileSync(CONFIG, "utf8"));
+		writeFileSync(CONFIG, JSON.stringify({ ...disk, excludedProviders: ["deepseek"], futureSetting: { keep: true } }));
+		await t.command("exclude opencode-go");
+		await t.command("exclude opencode-go");
+		const saved = JSON.parse(readFileSync(CONFIG, "utf8"));
+		assert.deepEqual(saved.excludedProviders, ["deepseek", "opencode-go"]);
+		assert.deepEqual(saved.futureSetting, { keep: true });
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("exclusion save failure preserves malformed config and does not change runtime rotation", async () => {
+	const t = setup({ accounts: { ...ONE_ACCOUNT, "opencode-go": { type: "api_key", key: "fixture-go" } }, config: { childProxy: false } });
+	try {
+		writeFileSync(CONFIG, "{broken config");
+		await t.command("exclude opencode-go");
+		assert.equal(readFileSync(CONFIG, "utf8"), "{broken config");
+		assert.match(t.rec.notifies.at(-1) ?? "", /could not save.*unchanged/i);
+		await t.command("status");
+		assert.match((t.rec.notifies.at(-1) ?? "").split("\n").find((line) => line.startsWith("Rotation (")) ?? "", /opencode-go/);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("automatic quota failover skips excluded managed destinations", async () => {
+	const t = setup({ accounts: { ...TWO_ACCOUNTS, "opencode-go": { type: "api_key", key: "fixture-go" } },
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { childProxy: false, autoContinue: false, excludedProviders: ["openai-codex-account-2"] } });
+	try {
+		await finishError(t, "anthropic", "claude-opus-4-8", "429 quota exhausted");
+		assert.equal(t.ctx.model.provider, "opencode-go");
+		assert.ok(t.rec.setModels.every((route) => !route.startsWith("openai-codex-account-2/")));
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("routed compaction skips excluded provider and model destinations", async () => {
+	const t = setup({ accounts: { ...TWO_ACCOUNTS, "opencode-go": { type: "api_key", key: "fixture-go" }, deepseek: { type: "api_key", key: "fixture-deepseek" } },
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 3_600_000 }, compactionAuth: { ok: false },
+		config: { childProxy: false, excludedProviders: ["anthropic"], excludedModels: ["opencode-go/claude-opus-4-8"] } });
+	try {
+		await t.fire("session_before_compact", {
+			reason: "overflow", preparation: { messagesToSummarize: [], firstKeptEntryId: "e1", tokensBefore: 250000 },
+			signal: { aborted: false },
+		});
+		assert.deepEqual(t.rec.compactionAuthFor, ["deepseek/claude-opus-4-8"]);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("background fallback skips excluded preferred destinations but permits an explicit initial route", async () => {
+	const current = { provider: "anthropic", id: "claude-opus-4-8" };
+	const excluded = { provider: "opencode-go", id: "claude-opus-4-8" };
+	const t = setup({ accounts: { ...TWO_ACCOUNTS, [excluded.provider]: { type: "api_key", key: "fixture-go" } }, current,
+		config: { childProxy: false, excludedProviders: [excluded.provider] } });
+	try {
+		await t.fire("session_start");
+		const router = t.completionRouter();
+		assert.ok(router);
+		const initial = await router.select({ ...completionRequest("initial-explicit", 1, current), preferredModels: [excluded] });
+		assert.deepEqual(initial, { action: "route", model: excluded });
+		const refused = completionAttempt("fallback-exclusion", 1, current, { status: 429, errorMessage: "429 quota exhausted" });
+		await router.onAttempt?.(refused);
+		const fallback = await router.select({ ...completionRequest("fallback-exclusion", 2, current, [refused]), preferredModels: [excluded] });
+		assert.equal(fallback.action, "route");
+		assert.equal(fallback.model.provider, "openai-codex-account-2");
+		assert.deepEqual(t.ctx.model, current);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("model inclusion does not undo a separate provider exclusion", async () => {
+	const t = setup({ accounts: { ...ONE_ACCOUNT, "opencode-go": { type: "api_key", key: "fixture-go" } }, config: { childProxy: false } });
+	try {
+		await t.command("exclude opencode-go");
+		await t.command("exclude opencode-go/claude-opus-4-8");
+		await t.command("include opencode-go/claude-opus-4-8");
+		const saved = JSON.parse(readFileSync(CONFIG, "utf8"));
+		assert.deepEqual(saved.excludedProviders, ["opencode-go"]);
+		assert.deepEqual(saved.excludedModels, []);
+		assert.match(t.rec.notifies.at(-1) ?? "", /Provider opencode-go remains excluded/);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("invalid or ambiguous exclusion arguments do not mutate config", async () => {
+	const t = setup({ accounts: { ...ONE_ACCOUNT, "opencode-go": { type: "api_key", key: "fixture-go" } }, config: { childProxy: false } });
+	try {
+		const before = readFileSync(CONFIG, "utf8");
+		for (const command of ["exclude", "include", "exclude codex", "exclude unknown-provider", "exclude opencode-go deepseek", "exclude opencode-go/*", "include opencode-go/*"]) {
+			await t.command(command);
+			assert.equal(readFileSync(CONFIG, "utf8"), before, command);
+		}
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("busy config lock leaves exclusion unapplied and a later retry succeeds", async () => {
+	const lockfile = createRequire(import.meta.url)("proper-lockfile") as { lockSync(path: string, options: object): () => void };
+	const t = setup({ accounts: { ...ONE_ACCOUNT, "opencode-go": { type: "api_key", key: "fixture-go" } }, config: { childProxy: false } });
+	const before = readFileSync(CONFIG, "utf8");
+	const release = lockfile.lockSync(CONFIG, { realpath: false });
+	try {
+		await t.command("exclude opencode-go");
+		assert.equal(readFileSync(CONFIG, "utf8"), before);
+		assert.match(t.rec.notifies.at(-1) ?? "", /could not save.*unchanged/i);
+	} finally { release(); }
+	try {
+		await t.command("status");
+		assert.match((t.rec.notifies.at(-1) ?? "").split("\n").find((line) => line.startsWith("Rotation (")) ?? "", /opencode-go/);
+		await t.command("exclude opencode-go");
+		assert.deepEqual(JSON.parse(readFileSync(CONFIG, "utf8")).excludedProviders, ["opencode-go"]);
+	} finally { await t.fire("session_shutdown"); }
 });
 
 test("remove anthropic with only the base slot removes that credential", async () => {
@@ -7968,6 +8404,18 @@ test("cheap pins cannot demote frontier work but explicit cheap selection keeps 
 	await cheap.fire("session_shutdown");
 });
 
+test("issue 91: a pinned Grok 4.7 participates in frontier failover and provider-only switching", async () => {
+	for (const operation of ["failover", "switch"]) {
+		const t = setup({ accounts: { anthropic: { type: "oauth", access: "synthetic-anthropic", refresh: "synthetic-anthropic-refresh" }, xai: { type: "oauth", access: "synthetic-xai", refresh: "synthetic-xai-refresh" } },
+			current: { provider: "anthropic", id: "claude-opus-4-8" }, hostModelsByProvider: { xai: ["grok-4.6", "grok-4.7"] }, config: { pinnedModels: { xai: "grok-4.7" }, autoContinue: false, showUsage: false } });
+		try {
+			if (operation === "failover") await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+			else await t.command("switch xai");
+			assert.equal(t.rec.setModels.at(-1), "xai/grok-4.7", operation);
+		} finally { await t.fire("session_shutdown"); }
+	}
+});
+
 test("missing and model-cooled pins stay saved without bypassing availability", async () => {
 	for (const pin of ["gpt-future-sol", "gpt-5.4"]) {
 		const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, config: { pinnedModels: { "openai-codex": pin }, preferredModels: { "openai-codex": ["gpt-5.5", "gpt-5.4"] } },
@@ -9395,8 +9843,8 @@ test("accounts lists provider identity, quota and routing state without credenti
 	assert.match(table, /openai-codex-account-2\s+alice\s+alice@example\.com\s+plus/);
 	assert.match(table, /5h 80%/);
 	assert.match(table, /7d 50%/);
-	assert.match(table, /cooldown \d+m/);
-	assert.match(table, /\banthropic\b[\s\S]*\bready\b/);
+	assert.match(table, /retry backoff \d+m.*recheck, not recovery/);
+	assert.match(table, /\banthropic\b[\s\S]*eligible.*unverified/);
 	assert.doesNotMatch(table, /anthropic-secret|anthropic-refresh|codex-secret|codex-refresh|workspace-safe-id/);
 });
 
@@ -11369,6 +11817,99 @@ test("a context-guard compaction continues only after its completion callback", 
 	assert.match(t.rec.sent[0].prompt, /compacted automatically/i);
 });
 
+test("a late guard compaction keeps its continuation while the host is still compacting", async (context) => {
+	const t = setup({
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		compactSilent: true,
+		config: { compactionWatchdogMs: 30 },
+	});
+	try {
+		t.ctx.model.contextWindow = 272_000;
+		t.ctx.getSystemPrompt = () => "";
+		await t.fire("context", { messages: bigConversation(50) });
+		context.mock.timers.enable({ apis: ["setTimeout"] });
+		await t.fire("agent_settled", {});
+		assert.equal(t.rec.compacts.length, 1);
+		// Real Pi is not idle during compact(), unlike the old callback-less fixture.
+		t.setIdle(false);
+		context.mock.timers.tick(60);
+		await Promise.resolve();
+		assert.equal(t.rec.sent.length, 0, "the watchdog cannot overlap an active summary");
+		await t.fire("agent_settled", {});
+		assert.equal(t.rec.compacts.length, 1);
+		// The host emits session_compact while busy, then clears its compacting state
+		// before calling the initiating onComplete callback.
+		await t.fire("session_compact", { reason: "manual", willRetry: false });
+		t.setIdle(true);
+		const complete = t.rec.compacts[0].onComplete as (result: unknown) => void;
+		complete({ summary: "late summary" });
+		assert.equal(t.rec.sent.length, 1, "late success must still resume the original task");
+		complete({ summary: "duplicate callback" });
+		assert.equal(t.rec.sent.length, 1, "the same completion cannot dispatch twice");
+		assert.deepEqual(t.rec.setModels, [], "recovery must retain the selected route");
+	} finally {
+		await t.fire("session_shutdown");
+	}
+});
+
+test("an obsolete guard callback cannot settle a newer compaction request", async (context) => {
+	const t = setup({
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		compactSilent: true,
+		config: { compactionWatchdogMs: 30 },
+	});
+	try {
+		t.ctx.model.contextWindow = 272_000;
+		t.ctx.getSystemPrompt = () => "";
+		context.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+		await t.fire("context", { messages: bigConversation(50) });
+		await t.fire("agent_settled", {});
+		const oldComplete = t.rec.compacts[0].onComplete as (result: unknown) => void;
+		// Here the host really IS idle with a dropped callback, so bounded recovery
+		// remains legitimate. A subsequent request must own a different callback.
+		context.mock.timers.tick(60);
+		await Promise.resolve();
+		assert.equal(t.rec.sent.length, 1);
+		context.mock.timers.tick(120_001);
+		await t.fire("context", { messages: bigConversation(50) });
+		await t.fire("agent_settled", {});
+		assert.equal(t.rec.compacts.length, 2);
+		oldComplete({ summary: "obsolete result" });
+		assert.equal(t.rec.sent.length, 1, "the old request cannot dispatch the newer request's wake");
+		(t.rec.compacts[1].onComplete as (result: unknown) => void)({ summary: "current result" });
+		assert.equal(t.rec.sent.length, 2, "the current request retains its own continuation");
+	} finally {
+		await t.fire("session_shutdown");
+	}
+});
+
+for (const replacement of ["owner input", "shutdown", "user abort"] as const) {
+	test(`a guard callback cannot resume work after ${replacement}`, async () => {
+		const t = setup({
+			current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+			compactSilent: true,
+		});
+		try {
+			t.ctx.model.contextWindow = 272_000;
+			t.ctx.getSystemPrompt = () => "";
+			await t.fire("context", { messages: bigConversation(50) });
+			await t.fire("agent_settled", {});
+			assert.equal(t.rec.compacts.length, 1);
+			if (replacement === "owner input") {
+				await t.fire("input", { source: "interactive", text: "a different task" });
+			} else if (replacement === "shutdown") {
+				await t.fire("session_shutdown");
+			} else {
+				await t.fire("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }] });
+			}
+			(t.rec.compacts[0].onComplete as (result: unknown) => void)({ summary: "obsolete summary" });
+			assert.equal(t.rec.sent.length, 0, "obsolete callbacks are not new owner intent");
+		} finally {
+			await t.fire("session_shutdown");
+		}
+	});
+}
+
 test("continueAfterCompaction also opts out of context-guard wake", async () => {
 	const t = setup({
 		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
@@ -13190,6 +13731,122 @@ test("a compaction that answers through neither callback does not switch the gua
 	await t.fire("session_shutdown");
 });
 
+for (const refusal of [
+	'Compaction failed: Turn prefix summarization failed: {"detail":"Unable to verify Daybreak Blue access. Please try again."}',
+	"Compaction failed: Codex error: This content was flagged for possible cybersecurity risk.",
+]) test("access-refused guard compaction pauses automatic replay without stranding new user input: " + refusal, async () => {
+	const t = setup({
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		config: { compactionWatchdogMs: 30 },
+		compactSilent: true,
+	});
+	const realNow = Date.now;
+	const logBefore = readDebugLog().length;
+	try {
+		t.ctx.model.contextWindow = 272_000;
+		t.ctx.getSystemPrompt = () => "";
+		await t.fire("context", { messages: bigConversation(50) });
+		t.setIdle(true);
+		await t.fire("agent_settled", {});
+		assert.equal(t.rec.compacts.length, 1);
+		const modelsBeforeFailure = [...t.rec.setModels];
+		await t.fire("session_compact_failed", {
+			reason: "manual", aborted: false, willRetry: false, fromExtension: false, errorMessage: refusal,
+		});
+		// Pi may deliver both its public event and the initiating callback. Cleanup/reporting
+		// must be idempotent; neither boundary may schedule another model request.
+		(t.rec.compacts[0].onError as (error: Error) => void)(new Error(refusal));
+		await wait(100);
+		assert.equal(t.rec.sent.length, 0);
+		assert.equal(t.rec.continueCalls.length, 0);
+		assert.deepEqual(t.rec.setModels, modelsBeforeFailure);
+		assert.equal(t.rec.notifies.filter(text => /History is unchanged/.test(text)).length, 1);
+		assert.equal(readDebugLog().slice(logBefore).some(entry => entry.kind === "context_guard_compaction_unanswered"), false);
+
+		const afterBackoff = realNow() + 125_000;
+		Date.now = () => afterBackoff;
+		await t.fire("context", { messages: bigConversation(50) });
+		await t.fire("agent_settled", {});
+		assert.equal(t.rec.compacts.length, 1, "time passing alone cannot replay a provider access/policy refusal");
+		assert.equal((await t.fire("input", { source: "interactive", text: "New diagnostic request" })).action, "continue");
+		await t.fire("context", { messages: bigConversation(50) });
+		await t.fire("agent_settled", {});
+		assert.equal(t.rec.compacts.length, 2, "genuine owner input is not stranded behind the paused guard");
+		assert.deepEqual(t.rec.setModels, modelsBeforeFailure, "access verification does not invalidate credentials or rotate accounts");
+	} finally {
+		Date.now = realNow;
+		await t.fire("session_shutdown");
+	}
+});
+
+test("a native access refusal pauses later guard demand even when no guard compaction was in flight", async () => {
+	const t = setup({ current: { provider: "openai-codex-account-2", id: "gpt-5.5" }, compactSilent: true });
+	try {
+		t.ctx.model.contextWindow = 272_000;
+		t.ctx.getSystemPrompt = () => "";
+		await t.fire("session_compact_failed", {
+			reason: "manual", aborted: false, willRetry: false, fromExtension: false,
+			errorMessage: "Turn prefix summarization failed: Unable to verify Daybreak Blue access. Please try again.",
+		});
+		await t.fire("context", { messages: bigConversation(50) });
+		t.setIdle(true);
+		await t.fire("agent_settled", {});
+		assert.equal(t.rec.compacts.length, 0);
+		assert.equal(t.rec.sent.length, 0);
+		assert.equal(t.rec.notifies.filter(text => /History is unchanged/.test(text)).length, 1);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+for (const refusal of [
+	"Unable to verify Daybreak Blue access. Please try again.",
+	"This content was flagged for possible cybersecurity risk.",
+]) test("routed compaction never hops accounts after an access/policy refusal: " + refusal, async () => {
+	const asked: string[] = [];
+	const t = setup({
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
+		compactionAuth: { ok: true, apiKey: "fixture-only" },
+		compactFn: async (_preparation, model) => { asked.push(model.provider); throw new Error(refusal); },
+	});
+	try {
+		const result = await t.fire("session_before_compact", {
+			reason: "manual", preparation: { messagesToSummarize: [], firstKeptEntryId: "e1", tokensBefore: 250000 },
+			signal: { aborted: false },
+		});
+		assert.equal(result?.cancel, true);
+		assert.equal(asked.length, refusal.startsWith("Unable to verify") ? 3 : 1, "temporary verification gets two bounded retries; policy denial gets none");
+		assert.equal(new Set(asked).size, 1, "recovery never hops accounts after verification/policy failure");
+		assert.equal(t.rec.notifies.filter(text => /History is unchanged/.test(text)).length, 1);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("a temporary routed Daybreak outage recovers on the identical provider and preserves native continuation", async () => {
+	const asked: any[][] = [];
+	const t = setup({
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
+		compactionAuth: { ok: true, apiKey: "fixture-only" },
+		compactFn: async (...args) => { asked.push(args); if(asked.length===1)throw new Error("Unable to verify Daybreak Blue access. Please try again.");return COMPACTION_SUMMARY; },
+	});
+	try {
+		const modelsBefore=[...t.rec.setModels];
+		const result=await t.fire("session_before_compact", {reason:"manual",preparation:{messagesToSummarize:[],firstKeptEntryId:"e1",tokensBefore:250000},signal:{aborted:false}});
+		assert.equal(result?.compaction?.summary,COMPACTION_SUMMARY.summary);
+		assert.equal(asked.length,2);assert.deepEqual(asked[1],asked[0],"captured model/auth/input/signal cannot drift between retries");
+		assert.deepEqual(t.rec.setModels,modelsBefore);assert.equal(t.rec.notifies.some(text=>/automatic.*paused/.test(text)),false);
+	} finally {await t.fire("session_shutdown");}
+});
+
+test("a verification retry cannot outlive the routed watchdog or jump to another account", async () => {
+	const asked:string[]=[];
+	const t=setup({current:{provider:"openai-codex-account-2",id:"gpt-5.5"},seedCooldownsMsFromNow:{"openai-codex-account-2":60*60*1000},compactionAuth:{ok:true,apiKey:"fixture-only"},config:{compactionWatchdogMs:30},compactFn:async (_preparation,model)=>{asked.push(model.provider);throw new Error("Unable to verify Daybreak Blue access. Please try again.");}});
+	try {
+		const result=await t.fire("session_before_compact",{reason:"manual",preparation:{messagesToSummarize:[],firstKeptEntryId:"e1",tokensBefore:250000},signal:{aborted:false}});
+		assert.equal(result?.cancel,true);assert.equal(asked.length,1);
+		await wait(60);assert.equal(asked.length,1,"aborted backoff cannot start an orphaned summary");
+	} finally {await t.fire("session_shutdown");}
+});
+
 test("a failed guard compaction clears demand and backs off before retrying", async () => {
 	const t = setup({
 		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
@@ -13569,4 +14226,401 @@ test("two extension instances retain each other's newly observed account failure
  await a.fire("session_shutdown");
  assert.ok(a.readState().exhaustedUntilByProvider["openai-codex-account-2"] > Date.now());
  await b.fire("session_shutdown");
+});
+
+// 2026-10-08 unattended-session incident: exact normalized transport/model
+// errors and real message_end(aborted) ordering, not only idealized agent_end.
+for (const text of [
+	"terminated (UND_ERR_SOCKET: connection closed before the response completed)",
+	"UND_ERR_SOCKET",
+	"WebSocket closed 1000",
+	"upstream connect error or disconnect/reset before headers. retried and the latest reset reason: remote connection failure, transport failure reason: delayed connect error: Connection refused",
+]) {
+	test(`reliability: recover the specific transport failure ${text.slice(0, 40)} on the same route`, async () => {
+		const t = setup({ accounts: ONE_ACCOUNT, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+		try {
+			await finishError(t, "anthropic", "claude-opus-4-8", text);
+			assert.ok(t.readState().pendingFrom, "a transport failure must arm bounded same-route retry");
+			assert.deepEqual(t.rec.setModels, [], "transport failures are not quota evidence");
+			assert.equal(t.readState().exhaustedUntilByProvider?.anthropic, undefined);
+		} finally { await t.fire("session_shutdown"); }
+	});
+}
+
+test("reliability: unsupported ChatGPT/Codex model is a model failure, not an unhandled dead end", async () => {
+	const t = setup({ accounts: {
+		"openai-codex": { type: "oauth", access: "a", refresh: "r", accountId: "base" },
+		"openai-codex-account-2": { type: "oauth", access: "b", refresh: "s", accountId: "slot" },
+	}, current: { provider: "openai-codex", id: "gpt-5.5" } });
+	try {
+		const start = readDebugLog().length;
+		await finishError(t, "openai-codex", "gpt-5.5", `{"detail":"The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account."}`);
+		assert.ok(readDebugLog().slice(start).some(e => e.kind === "assistant_error" && e.classified === "model"));
+		assert.ok(t.rec.setModels.length > 0, "the unavailable model must not strand the task");
+		assert.equal(t.readState().exhaustedUntilByProvider?.["openai-codex"], undefined, "only this account/model combination is unavailable");
+	} finally { await t.fire("session_shutdown"); }
+});
+
+for (const fallback of [false, true]) {
+	test(`reliability: injected continuation keeps its stuck watchdog (${fallback ? "seamless fallback" : "no continueAgent"})`, async () => {
+		const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" },
+			omitContinueAgent: !fallback, continueThrows: fallback ? "Cannot continue from message role: assistant" : undefined,
+			config: { stuckWatchdogMs: 30 } });
+		try {
+			await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+			assert.equal(t.rec.sent.length, 1);
+			await t.fire("before_agent_start", {}); await t.fire("agent_start", {}); t.setIdle(false);
+			await wait(80);
+			assert.equal(t.rec.aborts, 1, "a silently streaming injected recovery must have a live watchdog");
+		} finally { await t.fire("session_shutdown"); }
+	});
+}
+
+test("reliability: a pre-existing running tool remains protected when injected recovery starts", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, omitContinueAgent: true,
+		config: { stuckWatchdogMs: 30 } });
+	try {
+		await t.fire("tool_execution_start", {});
+		await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+		await t.fire("before_agent_start", {}); await t.fire("agent_start", {}); t.setIdle(false);
+		await wait(80);
+		assert.equal(t.rec.aborts, 0, "watch ownership must not erase an actual running tool");
+		await t.fire("tool_execution_end", {});
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("reliability: aborted assistant output does not clear a provider cooldown", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	try {
+		await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+		const before = t.readState().exhaustedUntilByProvider.anthropic;
+		await t.fire("message_end", { message: { ...okAssistant("anthropic", "claude-opus-4-8"), stopReason: "aborted" } });
+		assert.equal(t.readState().exhaustedUntilByProvider.anthropic, before, "partial aborted output is not proof of provider health");
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("reliability: aborted output cannot erase consecutive recovery failures", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, continueThrows: "network exploded mid-resume" });
+	try {
+		for (let i = 0; i < 3; i++) {
+			await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+			await t.fire("message_end", { message: { ...okAssistant(t.ctx.model.provider, t.ctx.model.id), stopReason: "aborted" } });
+		}
+		assert.ok(t.rec.notifies.some(n => /failed 3.*safe mode/.test(n)), "three failed recoveries must still trip the breaker");
+	} finally { await t.fire("session_shutdown"); }
+});
+
+for (const replacement of [false, true]) {
+	test(`reliability: rejected guard wake restores its budget and ${replacement ? "cannot outlive new owner input" : "retries once accepted"}`, async () => {
+		const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" }, compactSilent: true,
+			sendUserMessageRejects: 1, config: { maxAutoContinuesPerPrompt: 1, pendingPollMs: 25 } });
+		try {
+			t.ctx.model.contextWindow = 272_000; t.ctx.getSystemPrompt = () => "";
+			await t.fire("context", { messages: bigConversation(50) }); await t.fire("agent_settled", {});
+			(t.rec.compacts[0].onComplete as (result: unknown) => void)({ summary: "complete" });
+			await wait(5);
+			if (replacement) await t.input("new owner task");
+			await wait(90);
+			assert.equal(t.rec.sent.length, replacement ? 1 : 2);
+			assert.ok(!t.rec.notifies.some(n => /budget.*spent/.test(n)), "rejected submission is not an accepted continuation");
+		} finally { await t.fire("session_shutdown"); }
+	});
+}
+
+test("reliability: an asynchronous threshold wake rejection retries after the native boundary", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" }, sendMessageRejects: 1,
+		config: { maxAutoContinuesPerPrompt: 1, pendingPollMs: 25 } });
+	try {
+		await t.fire("agent_start", {}); await fireCompact(t); t.setIdle(true);
+		await wait(90);
+		assert.equal(continuations(t).length, 1, "the first submission was attempted synchronously");
+		assert.equal(t.rec.sent.length, 1, "the rejected queue submission must be retried at the idle boundary");
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("reliability: lifetime continuation limit remains enforced but is visibly explained", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { maxAutoContinuesPerPrompt: 1 } });
+	try {
+		await t.fire("agent_start", {}); await fireCompact(t); await t.fire("before_agent_start", {});
+		await fireCompact(t); await fireCompact(t);
+		assert.equal(continuations(t).length, 1);
+		assert.equal(t.rec.notifies.filter(n => /continuation budget.*1\/1/i.test(n)).length, 1);
+		assert.ok(t.rec.statuses.some(s => s.key === "multi-account-recovery" && /paused/i.test(s.value ?? "")));
+		await t.input("continue original work");
+		assert.ok(t.rec.statuses.some(s => s.key === "multi-account-recovery" && s.value === undefined));
+	} finally { await t.fire("session_shutdown"); }
+});
+
+for (const cancel of [false, true]) {
+	test(`reliability: routed compaction auth lookup is ${cancel ? "immediately cancellable" : "inside the attempt budget"}`, async () => {
+		let release: (value: unknown) => void = () => {};
+		let summaries = 0;
+		const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" },
+			seedCooldownsMsFromNow: { anthropic: 60000 }, config: { compactionWatchdogMs: 25 },
+			compactFn: async () => { summaries++; return { summary: "late forbidden summary" }; } });
+		const controller = new AbortController();
+		t.ctx.modelRegistry.getApiKeyAndHeaders = () => new Promise(resolve => { release = resolve; });
+		const pending = t.fire("session_before_compact", { preparation: { previousSummary: "old checkpoint" }, signal: controller.signal });
+		try {
+			await wait(5);
+			if (cancel) controller.abort();
+			const result = await Promise.race([pending, wait(80).then(() => undefined)]);
+			assert.equal(result?.cancel, true, "an uncooperative auth lookup must not retain compaction forever");
+			assert.equal(summaries, 0);
+			release({ ok: true, apiKey: "synthetic-only" }); await pending; await wait(5);
+			assert.equal(summaries, 0, "late auth cannot grant a cancelled attempt permission to summarize");
+		} finally {
+			controller.abort(); release({ ok: false }); await pending; await t.fire("session_shutdown");
+		}
+	});
+}
+
+const UNSUPPORTED_SOL = `Codex error: The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.`;
+
+test("reliability: failed guard wake never claims a successful checkpoint", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-6.1-sol" }, compactSilent: true });
+	try {
+		t.ctx.model.contextWindow = 272_000; t.ctx.getSystemPrompt = () => "";
+		await t.fire("context", { messages: bigConversation(50) }); await t.fire("agent_settled", {});
+		await t.fire("session_compact_failed", { reason: "manual", errorMessage: "Summary transport failed", fromExtension: false });
+		await wait(5);
+		assert.equal(t.rec.sent.length, 1);
+		assert.match(t.rec.sent[0].prompt, /history is unchanged/i);
+		assert.doesNotMatch(t.rec.sent[0].prompt, /history above was just compacted/i);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("reliability: native summary model rejection is attributed to its actual request before waking", async () => {
+	const t = setup({ accounts: {
+		"openai-codex": { type: "oauth", access: "a", refresh: "r", accountId: "base" },
+		"openai-codex-account-2": { type: "oauth", access: "b", refresh: "s", accountId: "slot" },
+	}, hostCodexModels: ["gpt-6.1-sol"], current: { provider: "openai-codex", id: "gpt-6.1-sol" }, compactSilent: true });
+	try {
+		t.ctx.model.contextWindow = 272_000; t.ctx.getSystemPrompt = () => "";
+		await t.fire("context", { messages: bigConversation(50) }); await t.fire("agent_settled", {});
+		await t.fire("session_before_compact", { reason: "manual", preparation: {}, signal: new AbortController().signal });
+		// Pi 0.85.1 does not expose summary request.model in its payload callback.
+		await t.fire("session_compact_failed", { reason: "manual", errorMessage: UNSUPPORTED_SOL, fromExtension: false,
+			requestModel: { provider: "openai-codex", id: "gpt-6.1-sol" } });
+		(t.rec.compacts[0].onError as (error: Error) => void)(new Error(UNSUPPORTED_SOL));
+		await wait(10);
+		assert.ok(t.readState().exhaustedUntilByModel?.["openai-codex/gpt-6.1-sol"] > Date.now());
+		assert.equal(t.readState().exhaustedUntilByProvider?.["openai-codex"], undefined);
+		assert.equal(t.ctx.model.provider, "openai-codex-account-2", "resume must not dispatch the explicitly rejected route");
+		assert.equal(t.rec.sent.length, 1, "public failure and callback cannot double-submit");
+		assert.match(t.rec.sent[0].prompt, /history is unchanged/i);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("reliability: summary refusal without request provenance pauses instead of blaming the selected model", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-6.1-sol" }, compactSilent: true });
+	try {
+		t.ctx.model.contextWindow = 272_000; t.ctx.getSystemPrompt = () => "";
+		await t.fire("context", { messages: bigConversation(50) }); await t.fire("agent_settled", {});
+		await t.fire("session_compact_failed", { reason: "manual", errorMessage: UNSUPPORTED_SOL, fromExtension: false });
+		await wait(5);
+		assert.equal(t.rec.sent.length, 0, "unknown failed route is not permission to replay or change credentials");
+		assert.deepEqual(t.rec.setModels, []);
+		assert.equal(t.readState().exhaustedUntilByModel?.["openai-codex/gpt-6.1-sol"], undefined);
+		assert.ok(t.rec.notifies.some(n => /unsupported|unavailable.*model|model.*unavailable/i.test(n)));
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("reliability: routed summary remembers exact unsupported routes across later compactions", async () => {
+	const asked: string[] = [];
+	const t = setup({ accounts: {
+		anthropic: ONE_ACCOUNT.anthropic,
+		"openai-codex": { type: "oauth", access: "a", refresh: "r", accountId: "base" },
+	}, current: { provider: "anthropic", id: "claude-opus-4-8" }, hostCodexModels: ["gpt-6.1-sol"],
+		seedCooldownsMsFromNow: { anthropic: 60000 }, compactionAuth: { ok: true, apiKey: "synthetic-only" },
+		compactFn: async (_preparation, model) => { asked.push(`${model.provider}/${model.id}`); throw new Error(UNSUPPORTED_SOL); } });
+	try {
+		const event = { reason: "manual", preparation: { previousSummary: "OLD_CHECKPOINT" }, signal: new AbortController().signal };
+		assert.equal((await t.fire("session_before_compact", event))?.cancel, true);
+		assert.equal(asked.length, 1);
+		assert.ok(t.readState().exhaustedUntilByModel?.[asked[0]] > Date.now());
+		assert.equal((await t.fire("session_before_compact", event))?.cancel, true);
+		assert.equal(asked.filter(route => route === asked[0]).length, 1,
+			`the next summary cannot offer an already rejected route again: ${JSON.stringify(asked)}`);
+		assert.equal(t.readState().exhaustedUntilByProvider?.["openai-codex"], undefined);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+// Owner-reported QA incident: quota metadata is not an inference-success receipt.
+test("quota QA: a fresh allowed snapshot cannot erase a later inference refusal", async () => {
+	const now = Date.now();
+	const t = setup({ accounts: ONE_ACCOUNT, current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { showUsage: false }, seedState: { stateVersion: 5, usageByProvider: {
+			anthropic: { provider: "anthropic", family: "anthropic", fetchedAt: now, serviceable: true,
+				primary: { usedPercent: 0, resetAt: now + 3600_000 } },
+		} } });
+	try {
+		await finishError(t, "anthropic", "claude-opus-4-8", "You have hit your usage limit. Try again in ~5803 min.");
+		await t.command("status");
+		assert.ok(t.readState().exhaustedUntilByProvider?.anthropic > Date.now(), "a cached allowed verdict must not reopen the refused route");
+		assert.match(t.rec.notifies.at(-1)!, /reported reset.*96h 43m|provider estimate.*96h 43m/i,
+			"the provider horizon must be distinct from the capped next check");
+		const carried = t.readState();
+		const second = setup({ accounts: ONE_ACCOUNT, current: { provider: "anthropic", id: "claude-opus-4-8" },
+			config: { showUsage: false }, seedState: carried });
+		try {
+			await second.command("status");
+			assert.ok(second.readState().exhaustedUntilByProvider?.anthropic > Date.now(), "a new process must retain the refusal, not re-trust the meter");
+		} finally { await second.fire("session_shutdown"); }
+	} finally { await t.fire("session_shutdown"); }
+});
+
+for (const signal of ["http200", "oauth-refresh", "missing-stop"]) {
+	test(`quota QA: ${signal} is not a completed inference receipt`, async () => {
+		const now = Date.now(), refusal = { observedAt: now - 1000, retryAt: now + 300_000, reportedUntil: now + 3600_000 };
+		const t = setup({ accounts: ONE_ACCOUNT, current: { provider: "anthropic", id: "claude-opus-4-8" },
+			config: { showUsage: false, autoContinue: false }, forceRefreshResults: { anthropic: { status: "refreshed" } },
+			seedState: { stateVersion: 5, exhaustedUntilByProvider: { anthropic: refusal.retryAt },
+				limitRefusalByProvider: { anthropic: refusal }, usageUntrustedUntilByProvider: { anthropic: refusal.retryAt } } });
+		try {
+			if (signal === "http200") await t.fire("after_provider_response", { status: 200, headers: {} });
+			else if (signal === "oauth-refresh") await finishError(t, "anthropic", "claude-opus-4-8", "Your authentication token has been invalidated. Please try signing in again.");
+			else await t.fire("message_end", { message: { role: "assistant", provider: "anthropic", model: "claude-opus-4-8", content: [] } });
+			await t.command("status");
+			assert.deepEqual(t.readState().limitRefusalByProvider?.anthropic, refusal, "only an actual completed inference may clear refusal evidence");
+			assert.ok(t.readState().exhaustedUntilByProvider?.anthropic > Date.now());
+		} finally { await t.fire("session_shutdown"); }
+	});
+}
+test("quota QA: completed inference clears actual refusal and its backoff", async () => {
+	const now = Date.now();
+	const t = setup({ accounts: ONE_ACCOUNT, current: { provider: "anthropic", id: "claude-opus-4-8" }, config: { showUsage: false },
+		seedState: { stateVersion: 5, exhaustedUntilByProvider: { anthropic: now + 300_000 },
+			limitRefusalByProvider: { anthropic: { observedAt: now - 1000, retryAt: now + 300_000 } } } });
+	try {
+		await t.fire("message_end", { message: { role: "assistant", provider: "anthropic", model: "claude-opus-4-8", stopReason: "stop", content: [{ type: "text", text: "synthetic inference reply" }] } });
+		assert.equal(t.readState().limitRefusalByProvider?.anthropic, undefined);
+		assert.equal(t.readState().exhaustedUntilByProvider?.anthropic, undefined);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("quota QA: even a post-refusal allowed probe respects the retry backoff", async () => {
+	const now = Date.now();
+	const t = setup({ accounts: ONE_ACCOUNT, current: { provider: "anthropic", id: "claude-opus-4-8" }, config: { showUsage: false },
+		seedState: { stateVersion: 5, exhaustedUntilByProvider: { anthropic: now + 300_000 },
+			limitRefusalByProvider: { anthropic: { observedAt: now - 1000, retryAt: now + 300_000, reportedUntil: now + 3600_000 } },
+			usageByProvider: { anthropic: { provider: "anthropic", family: "anthropic", fetchedAt: now, serviceable: true,
+				primary: { usedPercent: 0, resetAt: now + 3600_000 } } } } });
+	try {
+		await t.command("best");
+		assert.match(t.rec.notifies.at(-1)!, /no .*account|no .*route/i);
+		assert.deepEqual(t.rec.setModels, []);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("quota QA: a weekly blocked Codex window cannot be hidden by short-window headroom", async () => {
+	const now = Date.now();
+	const t = setup({ accounts: { "openai-codex": { type: "oauth", access: "synthetic-a", refresh: "r", accountId: "qa" } },
+		current: { provider: "openai-codex", id: "gpt-5.5" }, config: { showUsage: false }, seedState: { stateVersion: 5,
+			usageByProvider: { "openai-codex": { provider: "openai-codex", family: "codex", fetchedAt: now - 6 * 60_000,
+				serviceable: false, primary: { usedPercent: 0, resetAt: now + 18000_000 },
+				secondary: { usedPercent: 100, resetAt: now + 4 * 86400_000 } } } } });
+	try {
+		await t.command("accounts");
+		assert.doesNotMatch(t.rec.notifies.at(-1)!, /\bready\b|\beligible\b/i, "stale blocked metadata with a future weekly reset is not a ready receipt");
+		assert.match(t.rec.notifies.at(-1)!, /recheck|blocked|estimate/i);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("quota QA: continuation names the actual cause and does not invent a durable handoff", async () => {
+	const t = setup({ omitContinueAgent: true, current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	try {
+		await finishError(t, "anthropic", "claude-opus-4-8", "model not found");
+		await wait(80);
+		assert.equal(t.rec.sent.length, 1);
+		assert.match(t.rec.sent[0].prompt, /model not found|model unavailable/i);
+		assert.doesNotMatch(t.rec.sent[0].prompt, /hit a quota or rate limit|preserved verbatim in this session|record — read it before acting/i);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+const { readProxyOAuthSidecar, writeProxyOAuthSidecar } = await import("../index.ts");
+for (const shadowed of [false, true]) test(`issue 90: actual Anthropic refresh cannot overwrite a concurrent login (shadowed=${shadowed})`, async () => {
+	const provider = shadowed ? "anthropic-account-2" : "anthropic";
+	const credential = (tag: string) => ({ type: "oauth" as const, access: `synthetic-${tag}-access`,
+		refresh: `synthetic-${tag}-refresh`, expires: Date.now() + 86400_000 });
+	const original = credential("original"), newer = credential("newer-login");
+	const placeholder = childFacingAuthEntryForSlot(provider);
+	if (shadowed) assert.equal(typeof placeholder?.key, "string");
+	const account = shadowed ? { type: "api_key" as const, key: placeholder?.key as string } : original;
+	const t = setup({ accounts: { [provider]: account },
+		current: { provider, id: "claude-opus-4-8" }, config: { childProxy: false, autoDiscoverModels: false, showUsage: false, autoContinue: false } });
+	const { AuthStorage } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js", import.meta.url).href);
+	const first = AuthStorage.create(AUTH), second = AuthStorage.create(AUTH);
+	t.ctx.modelRegistry.authStorage = first;
+	if (shadowed) writeProxyOAuthSidecar({ [provider]: original });
+	let entered!: () => void, release!: () => void;
+	const started = new Promise<void>(resolve => { entered = resolve; });
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	const originalFetch = globalThis.fetch;
+	let usages = 0, exchanges = 0;
+	globalThis.fetch = (async (input: any) => {
+		const url = String(input);
+		if (url.endsWith("/v1/oauth/token")) {
+			exchanges++; entered(); await gate;
+			return new Response(JSON.stringify({ access_token: "synthetic-refreshed-original-access",
+				refresh_token: "synthetic-refreshed-original-refresh", expires_in: 86400 }), { status: 200 });
+		}
+		assert.equal(url, "https://api.anthropic.com/api/oauth/usage", "no external endpoint may run in this fixture");
+		if (++usages === 1) return new Response("synthetic unauthorized", { status: 401 });
+		return new Response(JSON.stringify({ five_hour: { utilization: 25, resets_at: new Date(Date.now() + 3600_000).toISOString() } }), { status: 200 });
+	}) as typeof fetch;
+	let pending: Promise<any> | undefined, writer: Promise<any> | undefined;
+	try {
+		pending = t.command("accounts refresh");
+		await Promise.race([started, wait(3000).then(() => { throw new Error("synthetic refresh did not start"); })]);
+		writer = second.modify(provider, () => {
+			if (shadowed) { writeProxyOAuthSidecar({ [provider]: newer }); return undefined; }
+			return newer;
+		});
+		for (let i = 0; i < 30; i++) await new Promise<void>(resolve => setImmediate(resolve));
+		release(); await Promise.all([pending, writer]);
+		assert.equal(exchanges, 1);
+		assert.deepEqual(shadowed ? readProxyOAuthSidecar()[provider] : await second.read(provider), newer,
+			"the production forced refresh must not overwrite a newer login with its captured credential");
+		if (shadowed) assert.deepEqual(JSON.parse(readFileSync(AUTH, "utf8"))[provider], placeholder,
+			"parent-only refreshed credentials must never replace the child's placeholder");
+		assert.deepEqual(t.rec.setModels, []);
+		assert.equal(t.rec.continueCalls.length, 0);
+	} finally {
+		release(); await Promise.allSettled([pending, writer].filter(Boolean) as Promise<any>[]);
+		globalThis.fetch = originalFetch; await t.fire("session_shutdown"); writeProxyOAuthSidecar({});
+	}
+});
+
+for (const provider of ["anthropic", "openai-codex-account-2"]) for (const storageMode of ["no-transaction", "lock-failure"]) {
+	test(`issue 90: ${provider} never refreshes or blind-writes with ${storageMode}`, async () => {
+		const original = { type: "oauth" as const, access: "synthetic-current-access", refresh: "synthetic-current-refresh",
+			expires: Date.now() + 86400_000, accountId: "synthetic-workspace" };
+		const t = setup({ accounts: { [provider]: original }, current: { provider, id: provider === "anthropic" ? "claude-opus-4-8" : "gpt-5.5" },
+			config: { childProxy: false, autoDiscoverModels: false, autoContinue: false, showUsage: false } });
+		let writes = 0, unexpectedExchanges = 0;
+		t.ctx.modelRegistry.authStorage = { read: async () => original, reload() {}, set() { writes++; },
+			...(storageMode === "lock-failure" ? { modify: async () => { throw new Error("synthetic storage lock unavailable"); } } : {}) };
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (url: any) => {
+			if (String(url).includes("/oauth/usage") || String(url).includes("/wham/usage")) return new Response("synthetic unauthorized", { status: 401 });
+			unexpectedExchanges++; throw new Error("OAuth exchange must not start without a held transaction");
+		}) as typeof fetch;
+		try {
+			await t.command("accounts refresh");
+			assert.equal(unexpectedExchanges, 0);
+			assert.equal(writes, 0);
+			assert.deepEqual(JSON.parse(readFileSync(AUTH, "utf8"))[provider], original);
+		} finally { globalThis.fetch = originalFetch; await t.fire("session_shutdown"); }
+	});
+}
+
+test("quota QA: an unknown route is eligible, not claimed ready", async () => {
+	const t = setup({ accounts: ONE_ACCOUNT, current: { provider: "anthropic", id: "claude-opus-4-8" }, config: { showUsage: false } });
+	try {
+		await t.command("accounts");
+		assert.doesNotMatch(t.rec.notifies.at(-1)!, /\bready\b/i);
+		assert.match(t.rec.notifies.at(-1)!, /unverified|unknown/i);
+	} finally { await t.fire("session_shutdown"); }
 });

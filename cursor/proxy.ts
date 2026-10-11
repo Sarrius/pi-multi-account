@@ -11,10 +11,11 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve as pathResolve, dirname, join as pathJoin } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve as pathResolve, dirname, join as pathJoin, isAbsolute } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { estimatePromptTokens, resolveCursorUsage } from "./prompt-usage.ts";
 import { type BridgeHandle, type BridgeStreams, createBridgeHandle } from "./bridge-handle.ts";
+import { transportStatusError } from "./transport-status.mjs";
 import { startSSEResponse } from "./sse-keepalive.ts";
 import {
   formatStallDuration,
@@ -52,6 +53,11 @@ import {
   clearConversationRegistry,
   conversationStates,
   isStaleForTranscript,
+  coverTranscript,
+  recordAssistantResponse,
+  captureConversation,
+  ownsConversation,
+  type ConversationReceipt,
   deriveBridgeKeyFromSessionId,
   deriveConversationKeyFromSessionId,
   deterministicConversationId,
@@ -189,6 +195,7 @@ interface ChatCompletionRequest {
   reasoning_effort?: string;
   user?: string;
   pi_session_id?: string;
+  pi_cwd?: string;
 }
 
 interface CursorRequestPayload {
@@ -218,6 +225,9 @@ interface ActiveBridge {
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
   currentTurn: ParsedTurn;
+  receipt?: ConversationReceipt;
+  paused?: boolean;
+  dispose?: () => void;
 }
 
 export type { StoredConversation };
@@ -251,7 +261,7 @@ function truncateDebugString(value: string, max = 4000): string {
   return value.length > max ? `${value.slice(0, max)}…<truncated ${value.length - max} chars>` : value;
 }
 
-function sanitizeForDebug(value: unknown): unknown {
+export function sanitizeForDebug(value: unknown): unknown {
   if (value == null) return value;
   if (typeof value === "string") return truncateDebugString(value);
   if (typeof value === "number" || typeof value === "boolean") return value;
@@ -273,7 +283,7 @@ function sanitizeForDebug(value: unknown): unknown {
   }
   if (typeof value === "object") {
     const entries = Object.entries(value as Record<string, unknown>).map(([key, inner]) => {
-      if (key === "accessToken" || key.toLowerCase() === "authorization") {
+      if (/^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|key|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|secret|client[_-]?secret|password)$/i.test(key)) {
         return [key, "<redacted>"] as const;
       }
       if (key === "data" && typeof inner === "string") return [key, `<redacted base64 ${inner.length} chars>`] as const;
@@ -282,6 +292,23 @@ function sanitizeForDebug(value: unknown): unknown {
     return Object.fromEntries(entries);
   }
   return String(value);
+}
+
+/** Metadata-only diagnostics never write prompts, tool results, headers or raw session identifiers. */
+export function metadataForDebug(data: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (/token|secret|password|authorization|cookie|api[_-]?key|^key$/i.test(key)) continue;
+    if (typeof value === "number" || typeof value === "boolean") out[key] = value;
+    else if (["execCase", "msgCase", "updateCase", "terminalEvent", "case", "missing", "kind", "control"].includes(key) && typeof value === "string" && /^[a-zA-Z_.-]{1,80}$/.test(value)) out[key] = value;
+    else if (["bridgeKey", "convKey", "rpcId", "execId", "execMsgId", "sessionId", "conversationId"].includes(key) && typeof value === "string") out[key] = createHash("sha256").update(value).digest("hex").slice(0,16);
+    else if (["toolResults", "pendingExecs", "unresolvedExecs"].includes(key) && Array.isArray(value)) out[`${key}Count`] = value.length;
+    else if (key === "exec" && value && typeof value === "object") {
+      const exec = value as { id?: unknown; execId?: unknown; type?: unknown };
+      out.exec = metadataForDebug({ execId: exec.execId, execMsgId: exec.id, execCase: exec.type });
+    }
+  }
+  return out;
 }
 
 function getDebugLogFilePath(): string {
@@ -296,14 +323,14 @@ function getDebugLogFilePath(): string {
 function debugLog(event: string, data?: Record<string, unknown>): void {
   if (!isProxyDebugEnabled()) return;
   const line = JSON.stringify({
+    ...(data ? (process.env.PI_CURSOR_PROVIDER_DEBUG_METADATA_ONLY === "1" ? metadataForDebug(data) : sanitizeForDebug(data)) : {}),
     ts: new Date().toISOString(),
     pid: process.pid,
     event,
-    ...(data ? sanitizeForDebug(data) : {}),
   });
   const file = getDebugLogFilePath();
   try {
-    appendFileSync(file, `${line}\n`, "utf8");
+    appendFileSync(file, `${line}\n`, { encoding: "utf8", mode: 0o600 });
   } catch (error) {
     console.error("[pi-cursor-provider] failed to write debug log", error);
     console.error(`[pi-cursor-provider] ${line}`);
@@ -318,6 +345,7 @@ function nextDebugRequestId(): string {
 export const __testInternals = {
   activeBridges,
   conversationStates,
+  resumePendingExecWithToolResult,
 };
 
 export function setBridgeFactoryForTests(factory?: BridgeFactory): void {
@@ -383,20 +411,19 @@ export async function callCursorUnaryRpc(options: {
   });
   const chunks: Buffer[] = [];
   return new Promise((resolve) => {
-    let timedOut = false;
+    let timedOut = false, settled = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const settle = (exitCode:number) => {
+      if(settled)return;settled=true;
+      if(timeout)clearTimeout(timeout);
+      resolve({body:Buffer.concat(chunks),exitCode,timedOut});
+    };
     const timeoutMs = options.timeoutMs ?? 5_000;
-    const timeout = timeoutMs > 0
-      ? setTimeout(() => {
-          timedOut = true;
-          try { bridge.proc.kill(); } catch {}
-        }, timeoutMs)
-      : undefined;
+    if(timeoutMs>0)timeout=setTimeout(()=>{timedOut=true;settle(1);bridge.destroy();},timeoutMs);
 
-    bridge.onData((chunk) => { chunks.push(Buffer.from(chunk)); });
-    bridge.onClose((exitCode) => {
-      if (timeout) clearTimeout(timeout);
-      resolve({ body: Buffer.concat(chunks), exitCode, timedOut });
-    });
+    bridge.onData((chunk) => { if(!settled)chunks.push(Buffer.from(chunk)); });
+    bridge.onStatus?.(status=>{if(transportStatusError(status)){settle(1);bridge.destroy();}});
+    bridge.onClose(settle);
 
     bridge.write(options.requestBody);
     bridge.end();
@@ -697,10 +724,22 @@ async function handleChatCompletion(
     return;
   }
 
-  const sessionId = derivePiSessionId(body);
+  const explicitSessionId = derivePiSessionId(body);
+  // Prompt text is not caller identity. Direct/background calls without an owner
+  // id get isolated state, even when two projects have identical prompt prefixes.
+  const sessionId = explicitSessionId ?? `isolated:${crypto.randomUUID()}`;
+  const workspaceCwd = typeof body.pi_cwd === "string" && isAbsolute(body.pi_cwd) ? body.pi_cwd : undefined;
   const bridgeKey = deriveBridgeKey(body.messages, sessionId);
   const convKey = deriveConversationKey(body.messages, sessionId);
-  const activeBridge = activeBridges.get(bridgeKey);
+  let activeBridge = activeBridges.get(bridgeKey);
+  let stored = conversationStates.get(convKey);
+  if ((stored && (stored.workspaceCwd !== workspaceCwd || isStaleForTranscript(stored, body.messages))) ||
+      (activeBridge?.receipt && !ownsConversation(convKey,activeBridge.receipt))) {
+    forgetConversation(convKey);
+    if(activeBridge)cleanupBridge(activeBridge.bridge,activeBridge.heartbeatTimer,bridgeKey);
+    activeBridge=undefined;stored=undefined;
+    debugLog("conversation.stale_checkpoint", {requestId,convKey});
+  }
   debugLog("chat.session_keys", {
     requestId,
     sessionId,
@@ -711,7 +750,8 @@ async function handleChatCompletion(
 
   const promptTokens = estimatePromptTokens(body.messages, body.tools);
 
-  if (activeBridge && toolResults.length > 0) {
+  if (activeBridge && activeBridge.paused !== false && toolResults.length > 0) {
+    if(stored)coverTranscript(stored,body.messages);
     debugLog("chat.resume_tool_results", { requestId, bridgeKey, toolResults, pendingExecs: activeBridge.pendingExecs });
     activeBridges.delete(bridgeKey);
     if (activeBridge.bridge.alive) {
@@ -725,27 +765,14 @@ async function handleChatCompletion(
     cleanupBridge(activeBridge.bridge, activeBridge.heartbeatTimer, bridgeKey);
   }
 
-  let stored = conversationStates.get(convKey);
   debugLog("chat.stored_state.before", { requestId, convKey, stored });
-  // Rotation moves the session between providers mid-conversation. While it is away, Cursor
-  // sees nothing — so a checkpoint that predates that excursion would resume a past with a
-  // hole in it. Detect the jump and start clean instead.
-  if (stored && isStaleForTranscript(stored, parsed.turns.length)) {
-    debugLog("conversation.stale_checkpoint", {
-      requestId,
-      convKey,
-      turnsCovered: stored.turnsCovered,
-      completedTurns: parsed.turns.length,
-    });
-    forgetConversation(convKey);
-    stored = undefined;
-  }
   if (!stored) {
     stored = {
       conversationId: deterministicConversationId(convKey),
       checkpoint: null,
 
-      sessionScoped: !!sessionId,
+      sessionScoped: !!explicitSessionId,
+      workspaceCwd,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
       turnsCovered: parsed.turns.length,
@@ -753,6 +780,7 @@ async function handleChatCompletion(
     conversationStates.set(convKey, stored);
   }
   stored.turnsCovered = parsed.turns.length;
+  coverTranscript(stored,body.messages);
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
 
@@ -771,7 +799,7 @@ async function handleChatCompletion(
   }
   const payload = buildCursorRequest(
     modelId, effectiveSystemPrompt, effectiveUserText, rebuiltTurns,
-    stored.conversationId, stored.checkpoint, stored.blobStore,
+    stored.conversationId, stored.checkpoint, stored.blobStore, workspaceCwd,
   );
   debugLog("chat.cursor_request", {
     requestId,
@@ -791,7 +819,7 @@ async function handleChatCompletion(
 
   if (body.stream === false) {
     debugLog("chat.dispatch_nonstream", { requestId, convKey });
-    await handleNonStreamingResponse(payload, accessToken, modelId, convKey, turns, currentTurn, req, res, requestId, promptTokens);
+    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, turns, currentTurn, req, res, requestId, promptTokens, false);
   } else {
     debugLog("chat.dispatch_stream", { requestId, bridgeKey, convKey });
     handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, turns, currentTurn, req, res, requestId, promptTokens);
@@ -971,6 +999,7 @@ export function buildCursorRequest(
   conversationId: string,
   checkpoint: Uint8Array | null,
   existingBlobStore?: Map<string, Uint8Array>,
+  workspaceCwd?: string,
 ): CursorRequestPayload {
   debugLog("cursor_request.build.start", {
     modelId,
@@ -1015,7 +1044,7 @@ export function buildCursorRequest(
       turns: turnBlobIds,
       todos: [],
       pendingToolCalls: [],
-      previousWorkspaceUris: [`file://${process.cwd()}`],
+      previousWorkspaceUris: workspaceCwd ? [pathToFileURL(workspaceCwd).href] : [],
       mode: 1,
       fileStates: {},
       fileStatesV2: {},
@@ -1496,6 +1525,17 @@ function resumePendingExecWithToolResultUnchecked(
   }
   if (resultCase === "readResult") {
     const path = nativePath(exec);
+    // Native ReadArgs requests a whole file (it has no offset/limit fields). Pi's read is
+    // bounded. Claiming that its partial output is complete makes Cursor repeat the same
+    // native read forever instead of using the exposed MCP read tool's paging arguments.
+    const partial = /\n\n\[(?:Showing lines \d+-\d+ of \d+(?: \([^\]\n]+ limit\))?|\d+ more lines in file)\. Use offset=\d+ to continue\.\]$/.exec(content);
+    if (!isError && partial) {
+      isError = true;
+      content = `Native whole-file read is incomplete. Use the exposed MCP read tool with offset/limit instead of repeating this native read. ${partial[0].trim()}`;
+    } else if (!isError && /^\[Line \d+ is [^\n]+, exceeds [^\n]+ limit\. Use bash: /.test(content)) {
+      isError = true;
+      content = "Pi could not read this oversized line. Use another available authorized tool or report the limitation; this is not complete file content.";
+    }
     sendPendingExecResult(exec, create(ReadResultSchema, isError
       ? { result: { case: "error", value: create(ReadErrorSchema, { path, error: content }) } }
       : {
@@ -1514,6 +1554,7 @@ function resumePendingExecWithToolResultUnchecked(
   }
   if (resultCase === "writeResult") {
     const path = nativePath(exec);
+    const writtenText = typeof exec.nativeArgs?.fileText === "string" ? exec.nativeArgs.fileText : typeof exec.nativeArgs?.content === "string" ? exec.nativeArgs.content : undefined;
     sendPendingExecResult(exec, create(WriteResultSchema, isError
       ? { result: { case: "error", value: create(WriteErrorSchema, { path, error: content }) } }
       : {
@@ -1521,9 +1562,11 @@ function resumePendingExecWithToolResultUnchecked(
           case: "success",
           value: create(WriteSuccessSchema, {
             path,
-            linesCreated: content.split("\n").length,
-            fileSize: Buffer.byteLength(content),
-            fileContentAfterWrite: content,
+            ...(writtenText === undefined ? {} : {
+              linesCreated: writtenText.split("\n").length,
+              fileSize: Buffer.byteLength(writtenText),
+              fileContentAfterWrite: writtenText,
+            }),
           }),
         },
       }), sendFrame);
@@ -1665,18 +1708,12 @@ export function derivePiSessionId(body: Pick<ChatCompletionRequest, "pi_session_
 
 export { deriveBridgeKeyFromSessionId, deriveConversationKeyFromSessionId, deterministicConversationId };
 
-export function deriveBridgeKey(messages: OpenAIMessage[], sessionId?: string): string {
-  if (sessionId) return deriveBridgeKeyFromSessionId(sessionId);
-  const firstUserMsg = messages.find((m) => m.role === "user");
-  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  return createHash("sha256").update(`bridge:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
+export function deriveBridgeKey(_messages: OpenAIMessage[], sessionId?: string): string {
+  return deriveBridgeKeyFromSessionId(sessionId ?? `isolated:${crypto.randomUUID()}`);
 }
 
-export function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string): string {
-  if (sessionId) return deriveConversationKeyFromSessionId(sessionId);
-  const firstUserMsg = messages.find((m) => m.role === "user");
-  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  return createHash("sha256").update(`conv:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
+export function deriveConversationKey(_messages: OpenAIMessage[], sessionId?: string): string {
+  return deriveConversationKeyFromSessionId(sessionId ?? `isolated:${crypto.randomUUID()}`);
 }
 
 export function cleanupSessionState(sessionId?: string): void {
@@ -1783,7 +1820,7 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
     const error = payload?.error;
-    if (error) return new Error(`Connect error ${error.code ?? "unknown"}: ${error.message ?? "Unknown error"}`);
+    if (error) return new Error(transportStatusError({code:error.code}) ?? `Connect error ${error.code ?? "unknown"}: ${error.message ?? "Unknown error"}`);
     return null;
   } catch {
     return new Error("Failed to parse Connect end stream");
@@ -1894,6 +1931,7 @@ function handleStreamingResponse(
   res: ServerResponse,
   requestId: string,
   promptTokenEstimate = 0,
+  stream = true,
 ): void {
   debugLog("stream.start", { requestId, bridgeKey, convKey, modelId });
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
@@ -1911,6 +1949,7 @@ function handleStreamingResponse(
     res,
     requestId,
     promptTokenEstimate,
+    stream,
   );
 }
 
@@ -1933,6 +1972,8 @@ function cleanupBridge(
   bridgeKey: string,
 ): void {
   debugLog("bridge.cleanup", { bridgeKey, alive: bridge.alive });
+  const active=activeBridges.get(bridgeKey);
+  if(active?.bridge===bridge)active.dispose?.();
   clearInterval(heartbeatTimer);
   if (bridge.alive) sendCancelAction(bridge);
   // Ending stdin alone does not terminate a streaming HTTP/2 request: Cursor may
@@ -1940,7 +1981,7 @@ function cleanupBridge(
   // this Run is cancelled or stale, kill the subprocess so dead connections do
   // not accumulate across stalls, compactions, and session switches.
   bridge.destroy();
-  activeBridges.delete(bridgeKey);
+  if(activeBridges.get(bridgeKey)?.bridge===bridge)activeBridges.delete(bridgeKey);
 }
 
 function writeSSEStream(
@@ -1957,12 +1998,18 @@ function writeSSEStream(
   res: ServerResponse,
   requestId?: string,
   promptTokenEstimate = 0,
+  stream = true,
 ): void {
   debugLog("stream.writer_start", { requestId, bridgeKey, convKey, modelId, completedTurnCount: completedTurns.length, currentTurn });
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
-  const stopKeepalive = startSSEResponse(res);
+  const stopKeepalive = stream ? startSSEResponse(res) : () => {};
+  const receipt=captureConversation(convKey);
+  let responseText="";
+  const responseTools:Record<string,any>[]=[];
+  const recordResponse=()=>{if(ownsConversation(convKey,receipt))recordAssistantResponse(receipt!.stored,
+    {role:"assistant",content:responseText||null,tool_calls:responseTools.length?responseTools:undefined});};
 
   let closed = false;
   let coalesceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1971,13 +2018,39 @@ function writeSSEStream(
     clearTimeout(coalesceTimer);
     coalesceTimer = undefined;
   };
-  const sendSSE = (data: object) => {
+  let jsonText="", jsonReasoning="", jsonFinish:string|null=null, jsonError="";
+  let jsonUsage:unknown;
+  const jsonTools:any[]=[];
+  const sendSSE = (data: any) => {
     if (closed) return;
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    if(stream){
+      const failed=data.choices?.find((choice:any)=>choice.finish_reason==="error");
+      // Pi/OpenAI native consumers map unknown finish reasons to a generic error.
+      // The standard SSE error envelope preserves auth/quota/transient evidence.
+      const wire=failed?{...data,error:{message:failed.delta?.content??"Cursor upstream error",type:"upstream_error",code:"cursor_error"}}:data;
+      res.write(`data: ${JSON.stringify(wire)}\n\n`);return;
+    }
+    if(data.usage)jsonUsage=data.usage;
+    for(const choice of data.choices??[]){
+      const delta=choice.delta??{};
+      if(choice.finish_reason==="error")jsonError=delta.content??"Cursor upstream error";
+      else if(typeof delta.content==="string")jsonText+=delta.content;
+      if(typeof delta.reasoning_content==="string")jsonReasoning+=delta.reasoning_content;
+      if(choice.finish_reason)jsonFinish=choice.finish_reason;
+      for(const tool of delta.tool_calls??[]){const {index,...call}=tool;jsonTools[index??jsonTools.length]=call;}
+    }
   };
   const sendDone = () => {
     if (closed) return;
-    res.write("data: [DONE]\n\n");
+    if(stream){res.write("data: [DONE]\n\n");return;}
+    if(jsonFinish==="error"){
+      res.writeHead(502,{"Content-Type":"application/json"});
+      res.write(JSON.stringify({error:{message:jsonError,type:"upstream_error",code:"cursor_error"}}));
+    }else{
+      res.writeHead(200,{"Content-Type":"application/json"});
+      res.write(JSON.stringify({id:completionId,object:"chat.completion",created,model:modelId,
+        choices:[{index:0,message:{role:"assistant",content:jsonText||null,...(jsonReasoning?{reasoning_content:jsonReasoning}:{}),...(jsonTools.length?{tool_calls:jsonTools}:{})},finish_reason:jsonFinish}],usage:jsonUsage}));
+    }
   };
   const closeResponse = () => {
     if (closed) return;
@@ -1986,6 +2059,8 @@ function writeSSEStream(
     stopKeepalive();
     transportWatchdog.stop();
     upstreamWatchdog.stop();
+    req.removeListener("close",onClientClose);
+    res.removeListener("close",onClientClose);
     res.end();
   };
 
@@ -2009,11 +2084,12 @@ function writeSSEStream(
         resumePendingExecWithToolResult(exec, message, true, (data) => bridge.write(data));
       }
     }
-    cleanupBridge(bridge, heartbeatTimer, bridgeKey);
+    if(ownsConversation(convKey,receipt))forgetConversation(convKey);
     sendSSE(makeChunk({ content: message }, "error"));
     sendSSE(makeUsageChunk());
     sendDone();
     closeResponse();
+    cleanupBridge(bridge, heartbeatTimer, bridgeKey);
   };
 
   // A decoded housekeeping frame proves the HTTP/2 transport is alive, but only
@@ -2037,10 +2113,19 @@ function writeSSEStream(
   };
 
   const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0, promptTokenEstimate };
+  // Track dispatched streaming Runs as well as paused tools: compaction/shutdown
+  // must cancel every old generation, not just a Run currently waiting on a tool.
+  const dispose=()=>{
+    if(closed)return;
+    cancelled=true;
+    sendSSE(makeChunk({content:"Cursor Run cancelled"},"error"));sendSSE(makeUsageChunk());sendDone();closeResponse();
+  };
+  activeBridges.set(bridgeKey,{bridge,heartbeatTimer,blobStore,mcpTools,pendingExecs:state.pendingExecs,currentTurn,receipt,paused:false,dispose});
   const tagFilter = createThinkingTagFilter();
   let mcpExecReceived = false;
   let toolCallsFlushed = false;
   let cancelled = false;
+  let observedTurnEnded = false;
   let latestCheckpoint: Uint8Array | null = null;
   const coalesceMs = resolveToolCallCoalesceMs();
 
@@ -2054,10 +2139,12 @@ function writeSSEStream(
     if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
     if (flushed.content) {
       appendAssistantTextToTurn(currentTurn, flushed.content);
+      responseText+=flushed.content;
       sendSSE(makeChunk({ content: flushed.content }));
     }
 
     for (const exec of state.pendingExecs) {
+      responseTools.push({id:exec.toolCallId,type:"function",function:{name:exec.toolName,arguments:exec.decodedArgs}});
       const toolCallIndex = state.toolCallIndex++;
       sendSSE(makeChunk({
         tool_calls: [{
@@ -2068,10 +2155,11 @@ function writeSSEStream(
     }
 
     activeBridges.set(bridgeKey, {
-      bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs: state.pendingExecs, currentTurn,
+      bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs: state.pendingExecs, currentTurn,receipt,paused:true,dispose,
     });
     debugLog("stream.tool_call_pause", { requestId, bridgeKey, pendingExecs: state.pendingExecs, currentTurn });
 
+    recordResponse();
     sendSSE(makeChunk({}, "tool_calls"));
     sendSSE(makeUsageChunk());
     sendDone();
@@ -2103,13 +2191,25 @@ function writeSSEStream(
     if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
     if (flushed.content) {
       appendAssistantTextToTurn(currentTurn, flushed.content);
+      responseText+=flushed.content;
       sendSSE(makeChunk({ content: flushed.content }));
     }
+    recordResponse();
     sendSSE(makeChunk({}, "stop"));
     sendSSE(makeUsageChunk());
     sendDone();
     closeResponse();
     cleanupBridge(bridge, heartbeatTimer, bridgeKey);
+  };
+
+  const failRun=(message:string)=>{
+    if(closed)return;
+    cancelled=true;
+    if(ownsConversation(convKey,receipt))forgetConversation(convKey);
+    const flushed=tagFilter.flush();
+    if(flushed.content)sendSSE(makeChunk({content:flushed.content}));
+    sendSSE(makeChunk({content:message},"error"));sendSSE(makeUsageChunk());sendDone();closeResponse();
+    cleanupBridge(bridge,heartbeatTimer,bridgeKey);
   };
 
   // Detect client disconnect (e.g. user pressed Escape in pi)
@@ -2140,6 +2240,7 @@ function writeSSEStream(
               if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning }));
               if (content) {
                 appendAssistantTextToTurn(currentTurn, content);
+                responseText+=content;
                 sendSSE(makeChunk({ content }));
               }
             }
@@ -2149,7 +2250,7 @@ function writeSSEStream(
           },
           (checkpointBytes) => {
             latestCheckpoint = checkpointBytes;
-            const stored = conversationStates.get(convKey);
+            const stored = ownsConversation(convKey,receipt)?receipt!.stored:undefined;
             if (stored) {
               stored.checkpoint = checkpointBytes;
               for (const [k, v] of blobStore) stored.blobStore.set(k, v);
@@ -2159,6 +2260,7 @@ function writeSSEStream(
             debugLog("stream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
           },
           () => {
+            observedTurnEnded=true;
             debugLog("stream.turn_ended", { requestId, bridgeKey, convKey, mcpExecReceived, closed });
             finishOpenAITurn();
           },
@@ -2172,49 +2274,41 @@ function writeSSEStream(
       const endError = parseConnectEndStream(endStreamBytes);
       if (endError) {
         console.error(`[cursor-provider] Cursor stream error (${modelId}):`, endError.message);
-        conversationStates.delete(convKey);
-        sendSSE(makeChunk({ content: endError.message }, "error"));
-        sendSSE(makeUsageChunk());
-        sendDone();
-        closeResponse();
+        failRun(endError.message);
       }
     },
   );
 
-  bridge.onData(processChunk);
+  bridge.onData(chunk=>{
+    if(receipt && !ownsConversation(convKey,receipt)){
+      cancelled=true;cleanupBridge(bridge,heartbeatTimer,bridgeKey);closeResponse();return;
+    }
+    processChunk(chunk);
+  });
 
+  bridge.onStatus?.(status=>{
+    const error=transportStatusError(status);if(!error)return;
+    if(closed){if(ownsConversation(convKey,receipt))forgetConversation(convKey);cleanupBridge(bridge,heartbeatTimer,bridgeKey);return;}
+    failRun(error);
+  });
   bridge.onClose((code) => {
-    debugLog("stream.bridge_close", { requestId, bridgeKey, convKey, code, cancelled, mcpExecReceived, toolCallsFlushed, currentTurn, latestCheckpoint });
-    clearCoalesceTimer();
-    transportWatchdog.stop();
-    upstreamWatchdog.stop();
-    clearInterval(heartbeatTimer);
-    req.removeListener("close", onClientClose);
-    res.removeListener("close", onClientClose);
-    const stored = conversationStates.get(convKey);
-    if (stored) {
-      for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-      stored.lastAccessMs = Date.now();
-      if (!cancelled && latestCheckpoint) {
-        stored.checkpoint = latestCheckpoint;
-        debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
-      }
+    debugLog("stream.bridge_close", { requestId, bridgeKey, convKey, code, cancelled, observedTurnEnded, mcpExecReceived, toolCallsFlushed });
+    clearCoalesceTimer();transportWatchdog.stop();upstreamWatchdog.stop();clearInterval(heartbeatTimer);
+    req.removeListener("close",onClientClose);res.removeListener("close",onClientClose);
+    if(activeBridges.get(bridgeKey)?.bridge===bridge)activeBridges.delete(bridgeKey);
+    const stored=ownsConversation(convKey,receipt)?receipt!.stored:undefined;
+    if(stored && !cancelled && observedTurnEnded && latestCheckpoint){
+      stored.checkpoint=latestCheckpoint;for(const [k,v] of blobStore)stored.blobStore.set(k,v);stored.lastAccessMs=Date.now();
     }
-    if (cancelled || closed) return;
-    if (!mcpExecReceived) {
-      finishOpenAITurn();
-    } else if (!toolCallsFlushed) {
-      sendSSE(makeChunk({ content: "Cursor ended the turn before tools could run" }, "error"));
-      sendSSE(makeUsageChunk());
-      sendDone();
-      closeResponse();
-    } else if (code !== 0) {
-      sendSSE(makeChunk({ content: "Bridge connection lost" }, "error"));
-      sendSSE(makeUsageChunk());
-      sendDone();
-      closeResponse();
-      activeBridges.delete(bridgeKey);
+    if(cancelled)return;
+    if(closed){
+      if(toolCallsFlushed && !observedTurnEnded && stored)forgetConversation(convKey);
+      if(stored && !stored.sessionScoped && ownsConversation(convKey,receipt))dropConversation(convKey);
+      return;
     }
+    // EOF (including exit 0) is not the protocol's turnEnded. Do not fabricate
+    // success or lose transport failure evidence before same-route recovery.
+    failRun(`Cursor connection error: stream ended before turnEnded (bridge exit ${code})`);
   });
 }
 
@@ -2232,6 +2326,7 @@ export function writeSSEStreamForTests(args: {
   res: ServerResponse;
   requestId?: string;
   promptTokenEstimate?: number;
+  stream?: boolean;
 }): void {
   writeSSEStream(
     args.bridge,
@@ -2247,6 +2342,7 @@ export function writeSSEStreamForTests(args: {
     args.res,
     args.requestId,
     args.promptTokenEstimate ?? 0,
+    args.stream !== false,
   );
 }
 
@@ -2271,7 +2367,7 @@ function handleToolResultResume(
   for (const result of toolResults) {
     const turnToolStep = currentTurn.steps.find((step) => step.kind === "toolCall" && step.toolCallId === result.toolCallId);
     if (turnToolStep) {
-      turnToolStep.result = { content: result.content, isError: false };
+      turnToolStep.result = { content: result.content, isError: result.isError === true };
     }
   }
 
@@ -2284,8 +2380,10 @@ function handleToolResultResume(
       blobStore,
       mcpTools,
       pendingExecs,
-      currentTurn,
+      currentTurn,receipt:active.receipt,paused:true,
     });
+    const stored=conversationStates.get(convKey);
+    if(stored)recordAssistantResponse(stored,{role:"assistant",content:null,tool_calls:unresolvedExecs.map(exec=>({id:exec.toolCallId,type:"function",function:{name:exec.toolName,arguments:exec.decodedArgs}}))});
     debugLog("tool_resume.partial_wait", { requestId, bridgeKey, unresolvedExecs, currentTurn });
     respondWithPendingToolCalls(modelId, unresolvedExecs, stream, res, promptTokenEstimate);
     return;
@@ -2312,6 +2410,7 @@ function handleToolResultResume(
     res,
     requestId,
     promptTokenEstimate,
+    stream,
   );
 
   for (const exec of pendingExecs) {
@@ -2332,6 +2431,7 @@ export function resumeCursorToolResultsForTests(
     bridgeKey: string;
     convKey: string;
     completedTurns?: ParsedTurn[];
+    stream?: boolean;
   },
 ): void {
   handleToolResultResume(
@@ -2343,168 +2443,9 @@ export function resumeCursorToolResultsForTests(
     opts.completedTurns ?? [],
     req,
     res,
-    true,
+    opts.stream !== false,
   );
 }
 
-// ── Non-streaming response ──
-
-async function handleNonStreamingResponse(
-  payload: CursorRequestPayload,
-  accessToken: string,
-  modelId: string,
-  convKey: string,
-  completedTurns: ParsedTurn[],
-  currentTurn: ParsedTurn,
-  req: IncomingMessage,
-  res: ServerResponse,
-  requestId?: string,
-  promptTokenEstimate = 0,
-): Promise<void> {
-  debugLog("nonstream.start", { requestId, convKey, modelId, currentTurn, completedTurnCount: completedTurns.length });
-  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
-  const created = Math.floor(Date.now() / 1000);
-
-  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
-  let cancelled = false;
-
-  const onClientClose = () => {
-    if (cancelled) return;
-    debugLog("nonstream.client_close", { requestId, convKey });
-    cancelled = true;
-    clearInterval(heartbeatTimer);
-    if (bridge.alive) {
-      sendCancelAction(bridge);
-      bridge.end();
-    }
-  };
-  req.on("close", onClientClose);
-  res.on("close", onClientClose);
-  const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0, promptTokenEstimate };
-  const tagFilter = createThinkingTagFilter();
-  let fullText = "";
-  let nonStreamError: Error | null = null;
-  let latestCheckpoint: Uint8Array | null = null;
-
-  return new Promise((resolve) => {
-    let settled = false;
-
-    const endBridge = () => {
-      clearInterval(heartbeatTimer);
-      if (bridge.alive) {
-        sendCancelAction(bridge);
-        bridge.end();
-      }
-    };
-
-    const commitCheckpoint = () => {
-      const stored = conversationStates.get(convKey);
-      if (!stored) return;
-      for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-      stored.lastAccessMs = Date.now();
-      if (!cancelled && !nonStreamError && latestCheckpoint) {
-        stored.checkpoint = latestCheckpoint;
-        debugLog("nonstream.checkpoint_committed", { requestId, convKey, stored });
-      }
-    };
-
-    const settle = () => {
-      if (settled) return;
-      settled = true;
-      req.removeListener("close", onClientClose);
-      res.removeListener("close", onClientClose);
-      commitCheckpoint();
-
-      if (cancelled) {
-        if (!res.headersSent) {
-          res.writeHead(499, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: { message: "Client closed request", type: "aborted", code: "client_closed" } }));
-        }
-        endBridge();
-        resolve();
-        return;
-      }
-
-      if (nonStreamError) {
-        res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          error: { message: nonStreamError.message, type: "upstream_error", code: "cursor_error" },
-        }));
-        endBridge();
-        resolve();
-        return;
-      }
-
-      const flushed = tagFilter.flush();
-      fullText += flushed.content;
-      appendAssistantTextToTurn(currentTurn, flushed.content);
-      const usage = computeUsage(state);
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        id: completionId, object: "chat.completion", created, model: modelId,
-        choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" }],
-        usage,
-      }));
-      endBridge();
-      resolve();
-    };
-
-    bridge.onData(createConnectFrameParser(
-      (messageBytes) => {
-        try {
-          const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
-          processServerMessage(
-            serverMessage, payload.blobStore, payload.mcpTools,
-            (data) => bridge.write(data),
-            state,
-            (text, isThinking) => {
-              if (isThinking) return;
-              const { content } = tagFilter.process(text);
-              fullText += content;
-              appendAssistantTextToTurn(currentTurn, content);
-            },
-            (exec) => {
-              resumePendingExecWithToolResult(
-                exec,
-                "Tools are not available on this non-streaming request.",
-                true,
-                (data) => bridge.write(data),
-              );
-            },
-            (checkpointBytes) => {
-              latestCheckpoint = checkpointBytes;
-              const stored = conversationStates.get(convKey);
-              if (stored) {
-                stored.checkpoint = checkpointBytes;
-                for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-
-                stored.lastAccessMs = Date.now();
-              }
-              debugLog("nonstream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
-            },
-            () => {
-              debugLog("nonstream.turn_ended", { requestId, convKey });
-              settle();
-            },
-          );
-        } catch (err) {
-          console.error("[cursor-provider] Non-stream message processing error:", err instanceof Error ? err.message : err);
-        }
-      },
-      (endStreamBytes) => {
-        const endError = parseConnectEndStream(endStreamBytes);
-        if (endError) {
-          console.error(`[cursor-provider] Cursor non-stream error (${modelId}):`, endError.message);
-          conversationStates.delete(convKey);
-          nonStreamError = endError;
-        }
-      },
-    ));
-
-    bridge.onClose(() => {
-      debugLog("nonstream.bridge_close", { requestId, convKey, cancelled, settled, nonStreamError: nonStreamError?.message, currentTurn, latestCheckpoint });
-      settle();
-    });
-  });
-}
+// JSON and SSE use the same Run ownership, tool pause/resume, deadlines and
+// terminal checks above; only the response serialization differs.

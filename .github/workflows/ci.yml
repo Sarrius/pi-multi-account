@@ -21,6 +21,7 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run check
+      - run: npm run security:check
       - run: npm test
       - run: npm run pack:check
 
@@ -30,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pi: ["0.85.1", "0.86.1", "0.87.1", "0.99.2", "1.0.0"]
+        pi: ["0.85.1", "0.86.1", "0.87.1", "0.99.2", "1.0.0", "1.1.0"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7

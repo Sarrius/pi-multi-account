@@ -115,7 +115,9 @@ export interface CursorCredentials {
 
 export async function refreshCursorToken(
   refreshToken: string,
+  signal: AbortSignal = AbortSignal.timeout(30_000),
 ): Promise<CursorCredentials> {
+  signal.throwIfAborted();
   const response = await fetch(CURSOR_REFRESH_URL, {
     method: "POST",
     headers: {
@@ -123,6 +125,7 @@ export async function refreshCursorToken(
       "Content-Type": "application/json",
     },
     body: "{}",
+    signal,
   });
 
   if (!response.ok) {
@@ -134,6 +137,7 @@ export async function refreshCursorToken(
     accessToken: string;
     refreshToken: string;
   };
+  signal.throwIfAborted();
 
   return {
     access: data.accessToken,

@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [1.25.0] — Unreleased
+
+### Fixed
+
+- Persist actual inference-refusal evidence across aliases and restarts. Positive quota metadata cannot erase the refusal during bounded retry backoff; provider reset estimates and next recheck times are distinct. A completed, non-error inference clears the evidence; HTTP 200 at stream start, OAuth refresh and absent completion markers do not.
+- Preserve newer sibling refusal/cooldown records from stale shared-state deletion or shortening. Coupled weekly exhaustion wins over short-window headroom; Cursor's independent pools retain their existing semantics.
+- Codex usage parsing keeps explicit availability verdicts without windows and treats an explicit negative as authoritative when flags conflict.
+- Status, all-account waiting and continuation messages distinguish eligibility from verified availability and use the actual failure reason. Interrupted handoffs are optional bounded context, not promised durable verbatim receipts; missing results retain unknown-effect status. Exact shipped legacy defaults migrate in memory without rewriting custom prompts.
+- Backport and strengthen the Anthropic refresh transaction pattern discussed in #90: all extension-owned forced refresh families now use one cross-process credential transaction, preserve numbered-slot sidecars/placeholders, and never fall through to blind writes. Without a transactional host API, decline before spending the token.
+- Classify the known Grok 4.7 flagship as frontier (#91), without guessing future 4.x quality or treating `fast` / `non-reasoning` variants as equivalent.
+- Update the billing-header Claude Code version to the registry-observed 2.1.296 (#89), rather than the tracker's already stale 2.1.289 proposal.
+
+- Fence forced-refresh auth/sidecar commits on actual lease identity, cancellation and unchanged disk state; stage sidecar outputs until joined refresh work settles. Use a fast heartbeat compatible with older synchronous host writers, and propagate Cursor cancellation through fetch and body consumption. A lost lease never removes its replacement or grants stale-write authority, including immediate process exit; async leases avoid library-global exit unlink and contention waits within the cancellation budget.
+- Preserve upstream 1.24.0 model pins, host-native Anthropic placeholders, opaque-token proxy refresh and Codex image routing while integrating the local Cursor/compaction and quota-recovery repairs.
+
+### Security
+
+- Remediate Dependabot #13 (`GHSA-q2hr-2g5m-vwhr`) by using the matched **1.1.0 development SDK pair**, whose published package no longer carries the vulnerable old shrinkwrap, and resolving/installing `brace-expansion` **5.0.12**. This changes development fixtures, not the user's installed Pi runtime; legacy hosts remain compatibility targets. The advisory checker verifies lock and actual installed versions. No foreign `node_modules` mutation, postinstall patch or security-alert dismissal is used.
+
+### Compatibility
+
+- Include Pi **1.1.0** in the native host test matrix. General Pi 1.x compatibility does not implement the new `openai` ChatGPT multi-account feature: #92 remains accepted and open with a distinct provider/auth/transport/usage acceptance plan in `docs/openai-chatgpt-accounts.md`. Legacy Codex credentials and aliases are not migrated.
+
 
 ## [1.24.0] — 2026-10-03
 

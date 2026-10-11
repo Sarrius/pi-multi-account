@@ -25,6 +25,8 @@ import {
 	deterministicConversationId,
 	deriveConversationKeyFromSessionId,
 	forgetConversation,
+	coverTranscript,
+	recordAssistantResponse,
 	type StoredConversation,
 } from "../cursor/conversation-registry.ts";
 import { registerSessionLifecycleHooks } from "../cursor/session-lifecycle.ts";
@@ -191,6 +193,32 @@ test("normal progress — one completed turn at a time — keeps the conversatio
 	};
 	assert.equal(isStaleForTranscript(stored, 4), false, "a tool continuation completes no turn");
 	assert.equal(isStaleForTranscript(stored, 5), false, "one finished turn is the normal step");
+});
+
+test("same-turn foreign-provider work and equal-count replacement invalidate a Cursor checkpoint", () => {
+	const stored = seedConversation("transcript-coverage");
+	const before = [{ role: "system", content: "PROJECT_A" }, { role: "user", content: "TASK_A" }];
+	coverTranscript(stored, before);
+	const response = { role: "assistant", content: "DONE_1; NEXT_2" };
+	recordAssistantResponse(stored, response);
+	assert.equal(isStaleForTranscript(stored, [...before, response, { role: "user", content: "continue NEXT_2" }]), false);
+	assert.equal(isStaleForTranscript(stored, [...before, response, { role: "assistant", content: "foreign-provider DONE_2" }]), true);
+	assert.equal(isStaleForTranscript(stored, [{ role: "system", content: "PROJECT_B" }, before[1]]), true);
+	assert.equal(isStaleForTranscript(stored, [...before, { ...response, content: "replacement task" }]), true);
+	assert.equal(isStaleForTranscript(stored, before.slice(0, 1)), true);
+});
+
+test("known Cursor tool results retain coverage without duplicating or accepting foreign steps", () => {
+	const stored = seedConversation("transcript-tool-coverage");
+	const before = [{ role: "user", content: "TASK_A" }];
+	coverTranscript(stored, before);
+	const response = { role: "assistant", content: null, tool_calls: [{ id: "read-1", type: "function", function: { name: "read", arguments: '{"path":"a"}' } }] };
+	recordAssistantResponse(stored, response);
+	const result = { role: "tool", tool_call_id: "read-1", content: "DONE_1" };
+	assert.equal(isStaleForTranscript(stored, [...before, response, result]), false);
+	assert.equal(isStaleForTranscript(stored, [...before, response, { ...result, tool_call_id: "foreign-1" }]), true);
+	assert.equal(isStaleForTranscript(stored, [...before, response, result, result]), true);
+	assert.equal(isStaleForTranscript(stored, [...before, response, result, { role: "assistant", content: "foreign NEXT_2" }]), true);
 });
 
 test("with no checkpoint there is nothing to go stale", () => {

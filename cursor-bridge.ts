@@ -122,6 +122,8 @@ export async function setupCursorSubscription(
 		 * Pass model objects (or ids); the host writes Pi-schema objects, never strings.
 		 */
 		onProvision?: (slotIds: string[], port: number, models: unknown[]) => void;
+		/** Only the cold factory waits: Pi resolves a resumed model after it returns. */
+		waitForCatalogMs?: number;
 	},
 ): Promise<number | undefined> {
 	const mod = await loadCursorModules();
@@ -154,7 +156,7 @@ export async function setupCursorSubscription(
 			},
 		});
 	}
-	void (async () => {
+	const discovery = (async () => {
 		if (typeof mod.discoverCursorModels !== "function") {
 			options.log?.("cursor_catalog", { outcome: "unsupported" });
 			return;
@@ -198,6 +200,21 @@ export async function setupCursorSubscription(
 			reason: error instanceof Error ? error.message : String(error),
 		});
 	});
+	// Fallback registration is immediate, but the requested saved model may exist only
+	// in Cursor's discovered catalog (e.g. grok-4.7). Give the factory a bounded chance
+	// to publish it before Pi performs its one-shot model restore. Keep discovery alive
+	// after timeout for ordinary dynamic registration; never hang an offline startup.
+	if (options.waitForCatalogMs && options.waitForCatalogMs > 0) {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				discovery,
+				new Promise<void>((resolve) => { timer = setTimeout(resolve, options.waitForCatalogMs); }),
+			]);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	}
 	return proxyPort;
 }
 
@@ -226,6 +243,7 @@ export function cleanupCursorControllerSession(sessionId: string): void {
 
 export async function refreshCursorCredentials(
 	refreshToken: string,
+	signal?: AbortSignal,
 ): Promise<{ access: string; refresh: string; expires: number }> {
 	const entry = join(getCursorProviderRoot(), "auth.ts");
 	if (!existsSync(entry)) {
@@ -234,7 +252,8 @@ export async function refreshCursorCredentials(
 	const mod = (await import(/* @vite-ignore */ loadSpecifier(entry))) as {
 		refreshCursorToken: (
 			token: string,
+			signal?: AbortSignal,
 		) => Promise<{ access: string; refresh: string; expires: number }>;
 	};
-	return mod.refreshCursorToken(refreshToken);
+	return mod.refreshCursorToken(refreshToken, signal);
 }

@@ -119,10 +119,29 @@ test("the bridge still delivers length-prefixed frames and its exit code", async
 	await settle();
 
 	proc.emit("exit", 0);
+	assert.deepEqual(closed, [], "exit must not discard stdout which can still be draining");
+	proc.emit("close", 0);
 	await settle();
 
 	assert.deepEqual(frames, ["alpha", "beta", "gamma"]);
 	assert.deepEqual(closed, [0]);
+});
+
+test("spawn failure without exit settles pending and late close listeners exactly once", async () => {
+	const { proc, handle, written } = makeBridge();
+	const closed: number[] = [];
+	handle.onClose(code => closed.push(code));
+	proc.emit("error", new Error("spawn node ENOENT"));
+	assert.equal(handle.alive, false);
+	handle.write(new Uint8Array([1]));
+	assert.equal(written.length, 0);
+	proc.emit("close", null);
+	proc.emit("exit", 1);
+	await settle();
+	assert.deepEqual(closed, [1]);
+	const late: number[] = [];
+	handle.onClose(code => late.push(code));
+	await settle();assert.deepEqual(late, [1]);
 });
 
 test("a bridge whose process already exited is dead and swallows further writes", async () => {
