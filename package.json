@@ -57,6 +57,7 @@
     "completion-route-planner.ts",
     "provider-priority.ts",
     "child-usability.ts",
+    "child-provider.ts",
     "docs/openai-chatgpt-accounts.md",
     "pi-contract.ts",
     "slot-proxy.ts",
@@ -83,8 +84,8 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.85.1 <0.88.0 || >=0.99.0 <0.100.0 || >=1.0.0 <2.0.0",
-    "@earendil-works/pi-coding-agent": ">=0.85.1 <0.88.0 || >=0.99.0 <0.100.0 || >=1.0.0 <2.0.0"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "1.1.0",

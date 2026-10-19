@@ -61,16 +61,28 @@ function reasoningEfforts(source: Record<string, any>): string[] {
 		.filter((value): value is string => !!value);
 }
 
+/** Native Pi treats missing low/middle entries as supported, not denied. Old
+ * cached catalogs used an allowlist, so complete that same closed contract at
+ * registration without discarding the catalog or re-fetching credentials. */
+export function completeCodexThinkingLevelMap(
+	map: Record<string, string | null> | undefined,
+): Record<string, string | null> | undefined {
+	if (!map || Object.keys(map).length === 0) return map;
+	return Object.fromEntries(["off", ...KNOWN_PI_THINKING_LEVELS].map(level => [level, map[level] ?? null]));
+}
+
 function thinkingLevelMap(efforts: string[]): Record<string, string | null> | undefined {
 	if (efforts.length === 0) return undefined;
 	const supported = new Set(efforts);
 	const result: Record<string, string | null> = {};
+	if (supported.has("none")) result.off = "none";
+	else if (supported.has("off")) result.off = "off";
 	for (const level of KNOWN_PI_THINKING_LEVELS) {
 		if (supported.has(level)) result[level] = level;
 	}
 	// Pi has a `minimal` setting while some Codex catalogs begin at `low`.
 	if (!("minimal" in result) && supported.has("low")) result.minimal = "low";
-	return Object.keys(result).length > 0 ? result : undefined;
+	return Object.keys(result).length > 0 ? completeCodexThinkingLevelMap(result) : undefined;
 }
 
 function versionParts(id: string): number[] {

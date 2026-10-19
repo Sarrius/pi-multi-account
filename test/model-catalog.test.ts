@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import {
 	compareCodexModelStrength,
 	parseCodexModelCatalog,
@@ -124,6 +125,25 @@ test("live Codex catalog follows server priority: Sol beats Terra and Luna", () 
 	assert.deepEqual(models[0].input, ["text", "image"]);
 });
 
+test("native thinking-level semantics never grant off or a missing middle level from a closed Codex catalog", () => {
+	const [model] = parseCodexModelCatalog({ models: [{ slug: "closed-effort-fixture",
+		supported_reasoning_levels: ["low", "high", "max"] }] });
+	const native = model as any;
+	assert.equal(getSupportedThinkingLevels(native).includes("off"), false, "undefined off is permissive in the native SDK; unsupported must be null");
+	assert.equal(getSupportedThinkingLevels(native).includes("medium"), false);
+	assert.equal(getSupportedThinkingLevels(native).includes("xhigh"), false);
+	assert.equal(model.thinkingLevelMap?.[clampThinkingLevel(native, "off")], "low");
+	assert.equal(model.thinkingLevelMap?.[clampThinkingLevel(native, "medium")], "high");
+});
+
+test("a catalog that explicitly offers none preserves off instead of inventing mandatory reasoning", () => {
+	const [model] = parseCodexModelCatalog({ models: [{ slug: "allows-none-fixture",
+		supported_reasoning_levels: ["none", "low", "high"] }] });
+	assert.equal(model.thinkingLevelMap?.off, "none");
+	assert.ok(getSupportedThinkingLevels(model as any).includes("off"));
+	assert.equal(clampThinkingLevel(model as any, "off"), "off");
+});
+
 test("GPT-6 Astra catalog metadata keeps its native limits, modalities, and all advertised effort levels", () => {
 	const models = parseCodexModelCatalog({ models: [{
 		slug: "gpt-6-astra",
@@ -140,7 +160,7 @@ test("GPT-6 Astra catalog metadata keeps its native limits, modalities, and all 
 		id: "gpt-6-astra",
 		name: "GPT-6 Astra",
 		reasoning: true,
-		thinkingLevelMap: { minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+		thinkingLevelMap: { off: null, minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
 		input: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 272_000,
@@ -211,14 +231,14 @@ test("a model that advertises max gets max — and one that does not, does not",
 	);
 	assert.equal(
 		withoutMax?.thinkingLevelMap?.max,
-		undefined,
+		null,
 		"a model that never advertised max must NOT be given it — the list filters, it does not grant",
 	);
 	// The gradations that model actually claimed are untouched.
 	assert.equal(withoutMax?.thinkingLevelMap?.xhigh, "xhigh");
 	assert.equal(withoutMax?.thinkingLevelMap?.high, "high");
 	// And a model that never claimed `medium` does not acquire it either.
-	assert.equal(withMax?.thinkingLevelMap?.medium, undefined);
+	assert.equal(withMax?.thinkingLevelMap?.medium, null);
 });
 
 test("fetchOllamaCloudCatalog parses the /v1/models data array into canonical ids", async () => {

@@ -395,6 +395,8 @@ function setup(opts: {
 			autoContinue: true,
 			autoDiscover: true,
 			autoDiscoverModels: false,
+			// Historical guard scenarios explicitly opt in; default-policy cases override this.
+			contextGuard: true,
 			showUsage: false,
 			fallbacks: [],
 			...(opts.config ?? {}),
@@ -2262,6 +2264,86 @@ test("an explicitly invalidated OAuth token is removed immediately and failover 
 				message.includes("openai-codex-account-2"),
 		),
 	);
+});
+
+test("old cached Codex allowlists acquire explicit native denials without a catalog probe", async () => {
+	const providers = ["openai-codex-account-2", "openai-codex-account-4"];
+	const cached = { id: "gpt-6-astra", name: "Owned cached model", reasoning: true,
+		thinkingLevelMap: { minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+		input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 321000, maxTokens: 8123 };
+	const t = setup({ accounts: Object.fromEntries(providers.map((p, i) => [p,
+		{ type: "oauth", access: `fixture-${i}`, refresh: `refresh-${i}`, accountId: `owned-${i}` }])) as Account,
+		current: { provider: providers[0], id: cached.id },
+		config: { childProxy: false, autoDiscoverModels: true, showUsage: false },
+		seedState: { stateVersion: 5, codexModelCatalogByProvider: Object.fromEntries(providers.map(p => [p, { fetchedAt: Date.now(), models: [cached] }])) },
+	});
+	const oldFetch = globalThis.fetch; let probes = 0;
+	globalThis.fetch = (async () => { probes++; throw new Error("Cached-model test forbids provider/catalog requests"); }) as typeof fetch;
+	try {
+		await t.fire("session_start");
+		await wait(20);
+		for (const provider of providers) {
+			const model = t.ctx.modelRegistry.find(provider, cached.id);
+			assert.equal(model?.contextWindow, 321000, "must exercise the cached model, not a static replacement");
+			assert.equal(model?.thinkingLevelMap?.off, null);
+			assert.equal(model?.thinkingLevelMap?.minimal, "low");
+		}
+		assert.equal(probes, 0, "use the existing closed catalog contract, not a token-spending live recheck");
+	} finally { globalThis.fetch = oldFetch; await t.fire("session_shutdown"); }
+});
+
+for (const transportDiagnostic of [false, true]) test(`an expired access-token verdict rotates on the read-only native facade (transport diagnostic=${transportDiagnostic})`, async () => {
+	const provider = "openai-codex-account-2", fallback = "openai-codex-account-4", model = "gpt-6.1-sol";
+	const t = setup({
+		accounts: {
+			[provider]: { type: "oauth", access: "expired-wire-token", refresh: "retained-refresh", accountId: "codex-expired" },
+			[fallback]: { type: "oauth", access: "healthy-token", refresh: "healthy-refresh", accountId: "codex-healthy" },
+		},
+		current: { provider, id: model },
+		config: { childProxy: false, pinnedModels: { "openai-codex": model } },
+	});
+	// Supply the native base catalog explicitly; this harness otherwise only
+	// advertises its historical gpt-5.5 fixture to registered sibling slots.
+	const getAll = t.ctx.modelRegistry.getAll;
+	t.ctx.modelRegistry.getAll = () => [...getAll(), { provider: "openai-codex", id: model }];
+	// Native1.1 exposes a read-only ModelRegistry facade, not AuthStorage.
+	delete (t.ctx.modelRegistry as any).authStorage;
+	try {
+		await t.fire("session_start");
+		assert.ok(t.ctx.modelRegistry.find(fallback, model), "same-model sibling must actually be catalogued");
+		const message = {
+			...assistantError(provider, model, "Provided authentication token is expired. Please try signing in again."),
+			...(transportDiagnostic ? { diagnostics: [{ error: { message: "WebSocket error" } }] } : {}),
+		};
+		await t.fire("message_end", { message });
+		t.setIdle(true);
+		await t.fire("agent_end", { messages: [message] });
+		assert.deepEqual(t.rec.setModels, [`${fallback}/${model}`]);
+		assert.equal(t.rec.continueCalls.length, 1, "resume once on the selected healthy sibling");
+		assert.equal(t.readState().pendingFrom, undefined, "no stale temporary same-account retry");
+		assert.equal(t.readState().invalidatedByProvider?.[provider], undefined, "an expired access token does not revoke the refreshable account");
+		assert.ok((t.readState().exhaustedUntilByProvider?.[provider] ?? 0) > Date.now());
+		assert.ok(!t.rec.notifies.some((notice) => notice.includes("Provider retry: temporary error")));
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("an explicit expired access token uses one supported refresh before same-account continuation", async () => {
+	const provider = "openai-codex-account-2", model = "gpt-6.1-sol";
+	const t = setup({
+		accounts: {
+			[provider]: { type: "oauth", access: "expired-token", refresh: "working-refresh", accountId: "codex-expired" },
+			"openai-codex-account-4": { type: "oauth", access: "healthy-token", refresh: "healthy-refresh", accountId: "codex-healthy" },
+		}, current: { provider, id: model }, config: { childProxy: false },
+	});
+	let refreshes = 0;
+	t.ctx.modelRegistry.authStorage.forceRefreshProvider = async () => { refreshes++; return { status: "refreshed" }; };
+	try {
+		await finishError(t, provider, model, "Provided authentication token is expired. Please try signing in again.");
+		assert.equal(refreshes, 1);
+		assert.deepEqual(t.rec.setModels, []);
+		assert.equal(t.rec.continueCalls.length, 1);
+		assert.equal(t.readState().invalidatedByProvider?.[provider], undefined);
+	} finally { await t.fire("session_shutdown"); }
 });
 
 test("an early-invalidated access token is force-refreshed and retried on the same account", async () => {
@@ -11721,6 +11803,21 @@ function bigConversation(turns: number) {
 		});
 	}
 	return messages;
+}
+
+for (const value of [undefined, null, false, 0, 1, "true", [], [true]]) {
+	test(`context guard is opt-in: ${JSON.stringify(value)} neither trims nor compacts`, async () => {
+		const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" }, config: { contextGuard: value } });
+		t.ctx.model.contextWindow = 272_000;
+		t.ctx.getSystemPrompt = () => "";
+		const messages = bigConversation(50);
+		const before = JSON.stringify(messages);
+		const result = await t.fire("context", { messages });
+		assert.equal(JSON.stringify(result?.messages ?? messages), before);
+		t.setIdle(true);
+		await t.fire("agent_settled", {});
+		assert.equal(t.rec.compacts.length, 0);
+	});
 }
 
 test("the context guard trims a mid-run request instead of letting it overflow", async () => {
