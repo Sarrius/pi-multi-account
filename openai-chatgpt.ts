@@ -1,5 +1,6 @@
 /** Native Sign in with ChatGPT aliases, deliberately separate from legacy Codex. */
 import { PROXY_PLACEHOLDER_KEY, shapeOpenAIChatGPTPayload } from "./slot-proxy.ts";
+import { admitProviderPayload } from "./provider-payload-stream.ts";
 
 export const OPENAI_CHATGPT_BASE = "openai";
 export const OPENAI_CHATGPT_API = "openai-responses";
@@ -70,7 +71,9 @@ export function cloneOpenAIChatGPTProvider(
 	function subscriptionOptions(options: any) {
 		return { ...options, async onPayload(payload: unknown, model: any) {
 			const proposed = await options?.onPayload?.(payload, model);
-			return shapeOpenAIChatGPTPayload(proposed === undefined ? payload : proposed);
+			const final = shapeOpenAIChatGPTPayload(proposed === undefined ? payload : proposed);
+			await admitProviderPayload(final, model, options);
+			return final;
 		} };
 	}
 	function requireRoute(model: any) {

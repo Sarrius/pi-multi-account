@@ -13,6 +13,12 @@ const rootPath = join(dirname(fileURLToPath(import.meta.url)), "..");
 test("host provider factories preserve OAuth callbacks, refresh signals, and Codex keys", () => {
 	const root = mkdtempSync(join(tmpdir(), "pmacct-host-bridge-"));
 	try {
+		// This OAuth-only host deliberately lacks canonical projection. Recovery
+		// remains inactive; public SDK imports must still resolve like a real host.
+		const coding = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
+		mkdirSync(coding, { recursive: true });
+		writeFileSync(join(coding, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", type: "module", exports: "./index.js" }));
+		writeFileSync(join(coding, "index.js"), "export function convertToLlm() { throw new Error('unsupported fixture projection'); }\n");
 		const sdk = join(root, "node_modules", "@earendil-works", "pi-ai");
 		mkdirSync(join(sdk, "providers"), { recursive: true });
 		writeFileSync(join(sdk, "package.json"), JSON.stringify({

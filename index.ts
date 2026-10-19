@@ -25,7 +25,12 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createPayloadStream } from "./provider-payload-stream.ts";
+import { createPayloadStream, PAYLOAD_ADMISSION } from "./provider-payload-stream.ts";
+import { recoveryProjectionSupported } from "./recovery-session.ts";
+import { createRecoveryArchives, RECOVERY_DETAIL } from "./recovery-archive.ts";
+import { recoveryTools, RECOVERY_TOOL_NAMES } from "./recovery-tools.ts";
+import { prepareNativeRecovery, recoveryBudget, guardRecoveryCommit } from "./recovery-compaction.ts";
+import { recoveryProviderAPI, hasRecoveryAdmission, type RecoveryProviderCoverage } from "./recovery-provider.ts";
 import { mutateProxyAuth, mutateProxyAuthAsync } from "./auth-file-transaction.ts";
 import { mergeStateDeltas, mutateStateFile } from "./state-file-transaction.ts";
 import { normalizeModelPins, persistModelPin, validModelPinScope } from "./model-pins.ts";
@@ -463,6 +468,7 @@ type ProviderFailoverConfig = {
 	// against a 272 000 window with no check at all. `true`/absent uses the
 	// defaults; an object overrides individual thresholds; `false` disables the guard entirely.
 	contextGuard?: boolean | Partial<ContextGuardSettings>;
+	recoverLargeContext?: boolean;
 	// After an AUTOMATIC compaction, carry the task on instead of stopping and waiting for the
 	// user to type "продовжуй". Pi already has the machinery: `_runAutoCompaction` ends with
 	// `return this.agent.hasQueuedMessages()`, and the run loop turns a `true` there into
@@ -564,6 +570,8 @@ type RuntimeConfig = Required<
 	openaiCodexAliases: OpenAICodexAliasConfig[];
 	anthropicOAuthAliases: AnthropicOAuthAliasConfig[];
 	contextGuard: ContextGuardSettings;
+	/** Source-preserving emergency recovery, separate from proactive elision. */
+	recoverLargeContext: boolean;
 };
 
 type SwitchRecord = {
@@ -1080,7 +1088,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.25.0";
+const VERSION = "1.26.0";
 function sourceFingerprint(): string {
 	try {
 		const root = dirname(fileURLToPath(import.meta.url));
@@ -1725,6 +1733,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	continuationPrompt: DEFAULT_CONTINUATION_PROMPT,
 	maxRecheckIntervalMs: MAX_RECHECK_INTERVAL_MS,
 	contextGuard: false,
+	recoverLargeContext: true,
 	continueAfterCompaction: true,
 	preserveInterruptedContext: true,
 	routeCompactionToHealthyAccount: true,
@@ -1934,6 +1943,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 			MAX_RECHECK_INTERVAL_MS,
 		),
 		contextGuard: normalizeContextGuard(raw.contextGuard),
+		recoverLargeContext: raw.recoverLargeContext === undefined || raw.recoverLargeContext === true,
 		continueAfterCompaction: raw.continueAfterCompaction ?? true,
 		preserveInterruptedContext: raw.preserveInterruptedContext ?? true,
 		routeCompactionToHealthyAccount:
@@ -4018,6 +4028,40 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let thinkingPreferenceChanged = !hasExplicitCliSelection;
 	const sessionInstanceId = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
 	let config = loadConfig();
+	let recoveryContext: any;
+	let recoveryTarget: string | undefined;
+	let recoveryController: AbortController | undefined;
+	let recoveryProvisional: string | undefined;
+	const recoveryProviders = new Map<string, RecoveryProviderCoverage>();
+	const recoverySourceWindows = new Map<string, number>();
+	const archives = createRecoveryArchives(() => {
+		if (!recoveryContext?.sessionManager) throw new Error("recovery_archive:session_unavailable");
+		return recoveryContext.sessionManager;
+	});
+	const recoveryEnabled = (ctx: any) => config.recoverLargeContext && recoveryProjectionSupported &&
+		typeof ctx?.sessionManager?.buildSessionProjection === "function";
+	const activateRecoveryTools = () => {
+		if (typeof pi.getActiveTools === "function" && typeof pi.setActiveTools === "function")
+			pi.setActiveTools([...new Set([...pi.getActiveTools(), ...RECOVERY_TOOL_NAMES])]);
+	};
+	const rejectOversizedRecoveryPayload = (payload: unknown, model: any, options: any) => {
+		if (!automaticFailoverEnabled() || (options?.sessionId && options.sessionId !== recoveryContext?.sessionManager?.getSessionId())) return;
+		options?.signal?.throwIfAborted();
+		if (!recoveryEnabled(recoveryContext) || `${model?.provider}/${model?.id}` !== recoveryTarget) return;
+		const limit = recoveryBudget(model).inputBytes;
+		if (Buffer.byteLength(JSON.stringify(payload)) > limit) {
+			// Recognized by the native overflow lifecycle: no second scheduler or
+			// synthetic user task. The native host owns compact-and-retry once.
+			throw new Error("maximum context length exceeded: multi-account destination admission rejected the oversized payload before dispatch");
+		}
+	};
+	if (recoveryProjectionSupported) {
+		pi = recoveryProviderAPI(pi, rejectOversizedRecoveryPayload, recoveryProviders);
+		if (typeof pi.registerTool === "function") for (const tool of recoveryTools(ctx => {
+			recoveryContext = ctx;
+			return archives;
+		})) pi.registerTool(tool);
+	}
 	let sessionClosed = false;
 	let supersededRoot = false;
 	let manualRouteOwnsErrors = false;
@@ -7123,6 +7167,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// All automatic foreground switches share this boundary. Explicit user switches
 		// remain allowed; an opted-out route belongs to Pi/the provider, not this router.
 		if (!options.manual && (isFailoverExempt(sourceModel?.provider) || isFailoverExempt(ctx.model?.provider))) return false;
+		const sourceRef = `${sourceModel?.provider}/${sourceModel?.id}`;
+		const resolvedSource = sourceModel?.contextWindow ? sourceModel : sourceModel?.provider && sourceModel?.id ? findModelIncludingHidden(ctx, sourceModel.provider, sourceModel.id) : undefined;
+		const sourceWindow = recoverySourceWindows.get(sourceRef) ?? resolvedSource?.contextWindow;
+		if (Number.isFinite(sourceWindow)) recoverySourceWindows.set(sourceRef, sourceWindow);
 		const activationEpoch = chainEpoch;
 		const stale = () => sessionClosed || activationEpoch !== chainEpoch || (!options.manual && (userAbortedChain || ctx.signal?.aborted));
 		// A switch the user asked for is not an automatic step: it is never refused, and it clears
@@ -7140,6 +7188,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (!options.allowExcluded && isRotationExcluded(fallback)) continue;
 			if (failedProviders.has(fallback.provider)) continue;
 			const to = ref(fallback.provider, fallback.id);
+			const needsRecoveryAdmission = !options.manual && recoveryEnabled(ctx) && (!Number.isFinite(sourceWindow) || !Number.isFinite(fallback.contextWindow) || fallback.contextWindow < sourceWindow || !!recoveryTarget);
+			if (needsRecoveryAdmission) {
+				try {
+					recoveryBudget(fallback);
+					if (isCursorProviderId(fallback.provider)) throw new Error("opaque_destination");
+					if (!hasRecoveryAdmission(ctx.modelRegistry, fallback, recoveryProviders)) throw new Error("missing_owned_admission");
+				} catch {
+					logEvent("source_recovery_route_unsupported", { provider: fallback.provider });
+					continue;
+				}
+			}
 			if (to === from) {
 				if (options.manual && candidates.length === 1) {
 					modelPreferenceChanged = true;
@@ -7194,11 +7253,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				continue;
 			}
 			if (stale()) return false;
+			if (needsRecoveryAdmission && !hasRecoveryAdmission(ctx.modelRegistry, fallback, recoveryProviders)) {
+				stopEverything(ctx, "destination admission was replaced during model activation; original context retained");
+				return false;
+			}
 			if (options.manual) {
 				modelPreferenceChanged = true;
 				rememberUserModel(ctx.model ?? fallback);
 			}
 			restoreDesiredThinking(ctx);
+			recoveryContext = ctx;
+			if (recoveryEnabled(ctx) && (recoveryTarget || !Number.isFinite(sourceWindow) || fallback.contextWindow < sourceWindow)) {
+				recoveryTarget = `${fallback.provider}/${fallback.id}`;
+			}
 			applyOnlyActiveFilter(ctx, fallback.provider);
 			setLastProbe(fallback.provider);
 			if (options.armContinuation !== false) {
@@ -7955,6 +8022,67 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return ids;
 	}
 
+	async function runSourceRecovery(event: any, ctx: any): Promise<any> {
+		const model = isCurrentModelReady(ctx) && !isCursorProviderId(ctx.model?.provider ?? "")
+			? ctx.model : config.routeCompactionToHealthyAccount ? compactionCandidates(ctx)[0] : undefined;
+		if (!model || typeof ctx.modelRegistry?.streamSimple !== "function")
+			return compactionCancelled("source recovery needs an available native summarizer; original history retained");
+		if (recoveryController) return compactionCancelled("source recovery already running");
+		const controller = new AbortController(), epoch = chainEpoch;
+		recoveryController = controller;
+		const abort = () => controller.abort();
+		event.signal?.addEventListener?.("abort", abort, { once: true });
+		if (event.signal?.aborted) abort();
+		const current = () => !sessionClosed && !controller.signal.aborted && chainEpoch === epoch;
+		try {
+			activateRecoveryTools();
+			const active = new Set(pi.getActiveTools?.() ?? []);
+			const tools = (pi.getAllTools?.() ?? []).filter((tool: any) => active.has(tool.name));
+			const protectedBytes = Buffer.byteLength(ctx.getSystemPrompt?.() ?? "") + Buffer.byteLength(JSON.stringify(tools));
+			const thinking = pi.getThinkingLevel?.();
+			compactionObservation?.phase(`${model.provider}/${model.id}`, config.compactionWatchdogMs);
+			ctx.ui?.notify?.("Preparing a smaller working context in bounded pieces; original public history will remain searchable.", "info");
+			const result = await prepareNativeRecovery({ archives, getSession: () => recoveryContext.sessionManager,
+				isCurrent: current, signal: controller.signal, model, timeoutMs: config.compactionWatchdogMs,
+				customInstructions: event.customInstructions, protectedBytes,
+				generate: async (request, signal) => {
+					const admit = (payload: unknown, actualModel: any = model) => {
+						signal.throwIfAborted();
+						if (!current()) throw new Error("recovery:stale");
+						if (Buffer.byteLength(JSON.stringify(payload)) > recoveryBudget(actualModel).inputBytes)
+							throw new Error("recovery:serialized_request_budget");
+					};
+					const message = await ctx.modelRegistry.streamSimple(model, request, {
+						signal, maxTokens: Math.min(model.maxTokens || 16384, 16384),
+						...(thinking ? { reasoning: thinking } : {}),
+						sessionId: ctx.sessionManager.getSessionId(), onPayload: admit, [PAYLOAD_ADMISSION]: admit,
+					}).result();
+					if (message.stopReason === "error") throw new Error(message.errorMessage || "recovery:generation_error");
+					return { text: (message.content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n"),
+						stopReason: message.stopReason, hasToolCalls: (message.content ?? []).some((b: any) => b.type === "toolCall") };
+				},
+			});
+			recoveryProvisional = result.descriptor.archiveId;
+			if (!current() || !result.isCurrent()) throw new Error("recovery:stale");
+			// A metadata-only anchor lets native compaction retain NONE of the oversized
+			// tail. The complete canonical source remains referenced by the checkpoint.
+			pi.appendEntry("multi-account-recovery-anchor", { archiveId: result.descriptor.archiveId });
+			const firstKeptEntryId = ctx.sessionManager.getLeafId();
+			if (!firstKeptEntryId || !current() || !result.isCurrent()) throw new Error("recovery:stale");
+			logEvent("source_recovery_prepared", { passes: result.passes, pieces: result.acceptedPieces, archiveId: result.descriptor.archiveId });
+			return { compaction: guardRecoveryCommit({ summary: result.summary, firstKeptEntryId, tokensBefore: event.preparation.tokensBefore, details: result.details }, () => current() && result.isCurrent()) };
+		} catch (error) {
+			if (recoveryProvisional) { archives.discard(recoveryProvisional); recoveryProvisional = undefined; }
+			const reason = `Source recovery stopped; original history retained (${String(error instanceof Error ? error.message : error).slice(0, 180)})`;
+			ctx.ui?.notify?.(reason, "warning");
+			logEvent("source_recovery_blocked", { reason });
+			return compactionCancelled(reason);
+		} finally {
+			event.signal?.removeEventListener?.("abort", abort);
+			if (!recoveryProvisional && recoveryController === controller) recoveryController = undefined;
+		}
+	}
+
 	async function runHealthyCompaction(
 		event: any,
 		ctx: any,
@@ -8521,6 +8649,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * made `/multi-account stop` need typing three times.
 	 */
 	function stopEverything(ctx: any, reason: string) {
+		recoveryController?.abort();
 		if (governorStopped()) return;
 		governorStoppedReason = reason;
 		chainEpoch++;
@@ -8697,6 +8826,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * working account.
 	 */
 	function claimUserControl(reason: string) {
+		recoveryController?.abort();
 		chainEpoch++;
 		if (reason === "interactive input" || reason.startsWith("manual")) {
 			contextGuardAccessFailure = undefined;
@@ -10436,6 +10566,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// every Anthropic OAuth request so subscription tokens are accepted — without
 	// requiring a separate pi-anthropic-auth install. Idempotent, so it coexists
 	// safely if pi-anthropic-auth is also present.
+	if (nativeOpenAI && recoveryProjectionSupported) (pi.registerProvider as any)(nativeOpenAI);
 	pi.registerProvider("anthropic", {
 		baseUrl: "https://api.anthropic.com",
 		api: "anthropic-messages",
@@ -10443,6 +10574,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		oauth: anthropicOAuthOverride("anthropic", "Anthropic (Claude Pro/Max)"),
 	} as any);
 	pi.registerProvider("openai-codex", {
+		...(recoveryProjectionSupported ? { api: "openai-codex-responses" } : {}),
 		oauth: codexOAuthOverride(
 			"openai-codex",
 			"ChatGPT Plus/Pro (Codex Subscription)",
@@ -10703,6 +10835,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// provider reporting its own copy of the conversation, and learning from it would wedge the
 	// guard's accounting for the rest of the session.
 	safeOn("message_end", (event: any, ctx: any) => {
+		if (Number.isFinite(ctx.model?.contextWindow)) recoverySourceWindows.set(`${ctx.model.provider}/${ctx.model.id}`, ctx.model.contextWindow);
+		const recovered = event.message;
+		if (recovered?.role === "assistant" && recovered.stopReason !== "error" && recovered.stopReason !== "aborted" &&
+			`${recovered.provider}/${recovered.model}` === recoveryTarget) recoveryTarget = undefined;
 		if (!contextGuardActive()) return undefined;
 		const usage = event?.message?.usage;
 		if (usage) contextGuardLlmCalls++;
@@ -10938,7 +11074,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	// A compaction happened (ours, Pi's, or the user's /compact): the message list is rebuilt, so
 	// every elision key now points at history that is no longer in the request. Start clean.
-	safeOn("session_compact", () => {
+	safeOn("session_compact", (event: any) => {
+		if (recoveryProvisional) {
+			if (event.compactionEntry?.details?.[RECOVERY_DETAIL]?.archiveId === recoveryProvisional) archives.committed(recoveryProvisional);
+			else archives.discard(recoveryProvisional);
+		}
+		recoveryProvisional = undefined;
+		recoveryController = undefined;
 		finishCompactionObservation("success");
 		contextGuardElided.clear();
 		contextGuardAccessFailure = undefined;
@@ -11319,6 +11461,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function relinquishRoot(): void {
+		recoveryController?.abort();
+		archives.close();
 		if (supersededRoot) return;
 		// The old closure's shutdown becomes passive below. Clear only its own parked
 		// work now; otherwise a same-session replacement leaves an ownerless disk marker.
@@ -12127,6 +12271,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	safeOn("session_start", async (event, ctx) => {
+		recoveryController?.abort();
+		archives.close();
+		recoveryTarget = undefined;
+		recoveryProvisional = undefined;
+		recoveryController = undefined;
+		recoverySourceWindows.clear();
+		recoveryContext = ctx;
+		if (recoveryEnabled(ctx) && archives.list().items.length) activateRecoveryTools();
 		const startEpoch = ++chainEpoch;
 		sessionClosed = false;
 		hostOwnsSessionModel = typeof ctx?.sessionManager?.getBranch === "function";
@@ -12300,6 +12452,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// by a new/resumed/forked session) — the extension's background activity must end with it.
 	// Kill every timer and drop the pending continuation so nothing survives the session.
 	safeOn("session_shutdown", async (_event, ctx) => {
+		recoveryController?.abort();
+		archives.close();
+		recoveryTarget = undefined;
 		finishCompactionObservation("shutdown");
 		clearRejectedCompactionWake();
 		chainEpoch++;
@@ -12341,6 +12496,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (!automaticFailoverEnabled() || isFailoverExempt(ctx.model?.provider)) return undefined;
 		beginCompactionObservation(event, ctx);
 		if (event?.reason === "overflow") lastContextOverflowAt = Date.now();
+		recoveryContext = ctx;
+		if (recoveryEnabled(ctx) && (recoveryTarget || event?.reason === "overflow" || !isCurrentModelReady(ctx))) {
+			const recovered = await runSourceRecovery(event, ctx);
+			if (recovered !== undefined) return recovered;
+		}
 		const result = await runHealthyCompaction(event, ctx);
 		if (result !== undefined) return result;
 		// The host runs its own default compaction on the ACTIVE account with no timeout.
@@ -12387,6 +12547,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// never emitted to extensions, so subscribing to that name made unit tests green while live
 	// cancellations bypassed this recovery path entirely.
 	safeOn("session_compact_failed", (event: any, ctx: any) => {
+		recoveryController?.abort();
+		recoveryController = undefined;
+		if (recoveryProvisional) { archives.discard(recoveryProvisional); recoveryProvisional = undefined; }
 		// Older hosts omit payload request metadata for native summaries. The
 		// failure event's captured identity is authoritative; ctx.model is not.
 		const nativeAttempt = event?.fromExtension !== true &&
