@@ -31,7 +31,7 @@ for (const quota of [false, true]) test(`native Pi recovers an ${quota ? "exhaus
 	const realFetch = globalThis.fetch;
 	globalThis.fetch = (async () => { throw new Error("AUTH_RECOVERY_TEST_EXTERNAL_REQUEST_FORBIDDEN"); }) as typeof fetch;
 	const requests: string[] = [], errors: any[] = [], toolResults: any[] = [];
-	const settings = SettingsManager.inMemory({ packages: [], compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off" });
+	const settings = SettingsManager.inMemory({ packages: [], compaction: { enabled: false }, retry: { enabled: false }, ...({ cacheWarming: "off" } as Record<string, unknown>) });
 	let nativeRegistry: any;
 	const registerFixtures = (pi: any) => {
 		const register = () => { for (const model of models) pi.registerProvider(model.provider, {

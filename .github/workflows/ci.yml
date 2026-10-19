@@ -40,6 +40,13 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm pkg set 'devDependencies.@earendil-works/pi-coding-agent=${{ matrix.pi }}' 'devDependencies.@earendil-works/pi-ai=${{ matrix.pi }}'
+      # Native 1.x packages use ^ ranges although their internal APIs move together.
+      # Pin the synthetic host family so a 1.1 host cannot load 1.3 codemode/MCP.
+      - if: startsWith(matrix.pi, '1.')
+        run: |
+          for package in chord pi-agent-core pi-tui pi-codemode pi-mcp; do
+            npm pkg set "overrides.@earendil-works/$package=${{ matrix.pi }}"
+          done
       - run: npm install --ignore-scripts --package-lock=false
       - run: npm ls --all
       - run: npm run check

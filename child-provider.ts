@@ -54,7 +54,8 @@ export function childCodexProvider(native: Provider, id: string, assertEffective
 		}
 	}
 	return {
-		...native, id, name: `Codex child (${id})`, getModels: () => models, getAllModels: () => models,
+		...native, id, name: `Codex child (${id})`, getModels: () => models,
+		...("getAllModels" in native ? { getAllModels: () => models } : {}),
 		// No background catalog requests or non-chat operations in this helper.
 		refreshModels: undefined, generateImages: undefined, classify: undefined,
 		fetchDeferred: undefined, cancelDeferred: undefined,

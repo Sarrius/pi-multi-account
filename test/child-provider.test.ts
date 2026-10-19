@@ -28,7 +28,7 @@ async function open(credential: any, baseUrl: string, withAdapter = true, api = 
 	const savedArgv = process.argv;
 	process.argv = [process.execPath, "owned-cli.js", "--no-extensions", "--model", `${alias}/gpt-6-astra`];
 	try {
-		const settings = SettingsManager.inMemory({ packages: [], compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off" });
+		const settings = SettingsManager.inMemory({ packages: [], compaction: { enabled: false }, retry: { enabled: false }, ...({ cacheWarming: "off" } as Record<string, unknown>) });
 		const loader = new DefaultResourceLoader({ cwd: dir, agentDir: dir, settingsManager: settings,
 			noExtensions: true, noContextFiles: true, noSkills: true, noPromptTemplates: true,
 			additionalExtensionPaths: withAdapter && process.env.PI_MULTI_ACCOUNT_TEST_CHILD_ADAPTER !== "none" ? [adapterPath] : [],
