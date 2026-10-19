@@ -13,7 +13,9 @@ const { createAssistantMessageEventStream } = await import("@earendil-works/pi-a
 const { getApiProvider, registerApiProvider } = await import("@earendil-works/pi-ai/compat");
 const { default: multiAccount } = await import("../index.ts");
 const { createRecoveryArchives } = await import("../recovery-archive.ts");
-const fixtureModels = (providers: string[]) => providers.map((provider, i) => ({ provider, id: "gpt-6.1-sol", name: provider,
+// Use a catalog ID present on every qualified host. Otherwise startup can
+// legitimately choose a different model before our fixture replaces metadata.
+const fixtureModels = (providers: string[]) => providers.map((provider, i) => ({ provider, id: "gpt-6-sol", name: provider,
 	api: "openai-codex-responses" as const, baseUrl: "http://127.0.0.1:1", reasoning: false,
 	input: ["text" as const], contextWindow: i ? 64000 : 400000, maxTokens: 4096,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }));
@@ -29,8 +31,8 @@ for (const mode of ["success", "base_provider", "delayed_quota", "preflight", "i
 		{ type: "oauth", access: `synthetic-${i}`, refresh: `synthetic-refresh-${i}`, accountId: `owned-${i}`, expires: 4102444800000 }]))));
 	writeFileSync(join(dir, "provider-failover.json"), JSON.stringify({ childProxy: false, autoDiscoverModels: false,
 		showUsage: false, autoContinue: true, onlyActive: false, followLastSuccessfulModel: false,
-		includeOtherProviders: false, fallbacks: providers, preferredModels: { "openai-codex": ["gpt-6.1-sol"] },
-		pinnedModels: { "openai-codex": "gpt-6.1-sol" }, includeCursor: false }));
+		includeOtherProviders: false, fallbacks: providers, preferredModels: { "openai-codex": ["gpt-6-sol"] },
+		pinnedModels: { "openai-codex": "gpt-6-sol" }, includeCursor: false }));
 	writeFileSync(join(dir, "owned-proof.txt"), "OWNED_READ_PROOF");
 	rmSync(join(dir, "provider-failover-state.json"), { force: true });
 	if (mode === "delayed_quota") writeFileSync(join(dir, "provider-failover-state.json"), JSON.stringify({ exhaustedUntilByProvider: { [providers[1]]: Date.now() + 750 } }));
@@ -116,6 +118,7 @@ for (const mode of ["success", "base_provider", "delayed_quota", "preflight", "i
 			sessionManager: manager, model: models[0], thinkingLevel: "off" });
 		assert.deepEqual(result.extensionsResult.errors, []); session = result.session;
 		await session.bindExtensions({ mode: "print", onError: (e: any) => errors.push(e) });
+		assert.equal(session.model?.id, models[0].id, "startup must retain the declared fixture model ID");
 		session.subscribe((e: any) => { if (e.type === "tool_execution_end") effects.push(e); });
 		await session.prompt("OWNED_ORIGINAL_REQUEST: read owned-proof.txt exactly once, then return OWNED_RECOVERY_OK. Do not deploy or provision anything.");
 		const until = Date.now() + 8000;
