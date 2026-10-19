@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [1.26.0] — 2026-10-19
+
+### Context recovery
+
+- Add source-preserving, bounded recovery for smaller-window managed fallbacks on canonical-projection hosts, without enabling the optional proactive context guard.
+- Reject oversized transition payloads at owned provider boundaries, prepare a checkpoint in read-only passes, and let native compaction commit/retry the original task.
+- Add scoped, paginated history retrieval and native-journal archive restoration. Private thinking/signatures are excluded; invalid or stale preparation never commits a partial checkpoint.
+- Document byte-budget limits, unsupported destinations, cancellation and evidence limitations in `docs/context-recovery.md`.
+
 ## [1.25.0] — 2026-10-19
 
 ### Context policy migration

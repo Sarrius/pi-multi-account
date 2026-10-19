@@ -1,3 +1,9 @@
+export const PAYLOAD_ADMISSION = Symbol("multi-account-payload-admission");
+export const OWNED_PAYLOAD_STREAM = Symbol("multi-account-owned-payload-stream");
+export async function admitProviderPayload(payload: unknown, model: any, options: any) {
+	await options?.[PAYLOAD_ADMISSION]?.(payload, model);
+}
+
 type Shape = (payload: any, model: any, options: any, context: any) => any;
 type Api = { streamSimple: (model: any, context: any, options: any) => any };
 let registry: Promise<typeof import("@earendil-works/pi-ai/compat")> | undefined;
@@ -20,14 +26,16 @@ async function nativeApi(api: string): Promise<Api> {
 /** Provider-level shaping applies to every public Pi client, including calls
  * outside the interactive agent's before_provider_request event lifecycle. */
 export function createPayloadStream(shape: Shape, resolveApi: (api: string) => Api | Promise<Api> = nativeApi) {
-	return (model: any, context: any, options: any = {}) => {
+	const stream = (model: any, context: any, options: any = {}) => {
 		const start = (api: Api) => api.streamSimple(model, context, {
 			...options,
 			onPayload: async (payload: any, actualModel: any) => {
 				const replacement = await options.onPayload?.(payload, actualModel);
 				const current = replacement === undefined ? payload : replacement;
 				const shaped = await shape(current, actualModel, options, context);
-				return shaped === undefined ? current : shaped;
+				const final = shaped === undefined ? current : shaped;
+				await admitProviderPayload(final, actualModel, options);
+				return final;
 			},
 		});
 		const api = resolveApi(model.api);
@@ -42,6 +50,7 @@ export function createPayloadStream(shape: Shape, resolveApi: (api: string) => A
 			async result() { return (await stream).result(); },
 		};
 	};
+	return Object.assign(stream, { [OWNED_PAYLOAD_STREAM]: true });
 }
 
 // Native Pi keeps item-level uniqueness when converting Responses pipe ids to
