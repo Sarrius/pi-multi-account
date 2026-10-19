@@ -35,7 +35,7 @@ for (const bundled of [false, true]) {
 		writeFileSync(join(dir, "provider-failover.json"), JSON.stringify({
 			enabled: true, autoContinue: true, continueAfterCompaction: true, compactionWatchdogMs: 30,
 			childProxy: false, includeCursor: false, includeOllama: false, autoDiscover: false,
-			autoDiscoverModels: false, showUsage: false, fallbacks: [],
+			autoDiscoverModels: false, showUsage: false, fallbacks: [], contextGuard: true,
 		}));
 		writeFileSync(join(dir, "provider-failover-debug.log"), "");
 		const originalFetch = globalThis.fetch;

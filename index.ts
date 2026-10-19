@@ -302,6 +302,7 @@ function piAiGetModel(provider: string, id: string): any {
 import {
 	CodexCatalogFetchError,
 	compareCodexModelStrength,
+	completeCodexThinkingLevelMap,
 	fetchCodexModelCatalog,
 	fetchOllamaCloudCatalog,
 	rankAnthropicModelIds,
@@ -1255,6 +1256,7 @@ const DEFAULT_AUTH_ERROR_PATTERNS = [
 	"invalid_token",
 	"invalid token",
 	"token has expired",
+	"token is expired",
 	"token expired",
 	"expired token",
 	"invalid_grant",
@@ -1349,6 +1351,13 @@ const TERMINAL_AUTH_ERROR_PATTERNS = [
 const FORCE_REFRESH_AUTH_ERROR_PATTERNS = [
 	"authentication token has been invalidated",
 	"token has been invalidated",
+	// Codex can reject the wire access token before the locally recorded
+	// expiry. This is auth evidence even alongside a WebSocket diagnostic;
+	// refresh once where supported, otherwise skip this recoverable slot.
+	"token has expired",
+	"token is expired",
+	"token expired",
+	"expired token",
 ];
 
 // These are explicit refresh-endpoint verdicts that re-login cannot wait out.
@@ -1715,7 +1724,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	ignoreErrorPatterns: DEFAULT_IGNORE_PATTERNS,
 	continuationPrompt: DEFAULT_CONTINUATION_PROMPT,
 	maxRecheckIntervalMs: MAX_RECHECK_INTERVAL_MS,
-	contextGuard: true,
+	contextGuard: false,
 	continueAfterCompaction: true,
 	preserveInterruptedContext: true,
 	routeCompactionToHealthyAccount: true,
@@ -1752,15 +1761,16 @@ function positiveOr(value: unknown, fallback: number) {
 }
 
 /**
- * Resolve the context-guard settings. `true`/absent takes the defaults, `false` turns the guard
- * off, an object overrides individual thresholds. Every number is sanity-checked here rather than
+ * The context guard is opt-in: `true` enables defaults, an object overrides thresholds.
+ * Missing, null, false and invalid values disable it; Pi owns normal compaction timing. Every number is sanity-checked here rather than
  * trusted, because a mistyped percentage would either trim on every request or never at all.
  */
 function normalizeContextGuard(value: unknown): ContextGuardSettings {
 	const defaults = DEFAULT_CONTEXT_GUARD_SETTINGS;
-	if (value === false) return { ...defaults, enabled: false };
-	if (value === true || value === undefined || value === null) return { ...defaults };
-	if (typeof value !== "object") return { ...defaults };
+	if (value === true) return { ...defaults };
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+		return { ...defaults, enabled: false };
+	}
 	const raw = value as Partial<ContextGuardSettings>;
 	const share = (candidate: unknown, fallback: number) =>
 		typeof candidate === "number" && Number.isFinite(candidate) && candidate > 0 && candidate <= 1
@@ -3023,6 +3033,12 @@ function codexOAuthOverride(providerId: string, name: string) {
 	};
 }
 
+function codexModelsWithEffortContracts(models: Array<Record<string, unknown>>) {
+	return models.map(model => model.thinkingLevelMap
+		? { ...model, thinkingLevelMap: completeCodexThinkingLevelMap(model.thinkingLevelMap as Record<string, string | null>) }
+		: model);
+}
+
 function registerCodexSlot(
 	pi: ExtensionAPI,
 	id: string,
@@ -4141,7 +4157,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			(value.reportedUntil === undefined || Number.isSafeInteger(value.reportedUntil))),
 	);
 	const codexModelCatalogByProvider = new Map<string, CodexCatalogSnapshot>(
-		Object.entries(persistedState.codexModelCatalogByProvider ?? {}),
+		Object.entries(persistedState.codexModelCatalogByProvider ?? {}).map(([id, snapshot]) =>
+			[id, { ...snapshot, models: codexModelsWithEffortContracts(snapshot.models) as CodexCatalogModel[] }]),
 	);
 	const usageFetches = new Map<string, Promise<UsageSnapshot>>();
 	const usageErrors = new Map<string, string>();
@@ -4791,7 +4808,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				[codexModelCatalogByProvider, next.codexModelCatalogByProvider],
 			] as Array<[Map<string, any>, Record<string, any> | undefined]>) {
 				map.clear();
-				for (const [key, value] of Object.entries(values ?? {})) map.set(key, value);
+				for (const [key, value] of Object.entries(values ?? {})) {
+					map.set(key, map === codexModelCatalogByProvider
+						? { ...value, models: codexModelsWithEffortContracts(value.models) } : value);
+				}
 			}
 			lastSavedState = structuredClone(next);
 		} catch {
@@ -11880,9 +11900,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				const cached = codexModelCatalogByProvider.get(id)?.models as
 					| Array<Record<string, unknown>>
 					| undefined;
-				const models = (cached?.length ? cached : DEFAULT_CODEX_MODELS.map(codexModelDef)) as Array<
+				const models = ((cached?.length ? cached : DEFAULT_CODEX_MODELS.map(codexModelDef)) as Array<
 					Record<string, unknown>
-				>;
+				>);
 				// Published as Codex's own API on purpose: Pi then shapes the body the way that
 				// backend requires (`store: false`, the instructions field, its own headers), which
 				// a generic `openai-responses` slot would not. The cost is that Pi insists on
@@ -12903,11 +12923,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						from: target,
 						to: target,
 						reason:
-							"OAuth access token was revoked early and refreshed automatically",
+							"OAuth access token was rejected and refreshed automatically",
 						at: Date.now(),
 					};
 					ctx.ui.notify(
-						`Provider failover: ${provider} access token was invalidated, refreshed successfully, and will retry on the same account.`,
+						`Provider failover: ${provider} access token was rejected, refreshed successfully, and will retry on the same account.`,
 						"info",
 					);
 					return;

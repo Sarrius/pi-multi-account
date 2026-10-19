@@ -4,7 +4,14 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-## [1.25.0] — Unreleased
+## [1.25.0] — 2026-10-19
+
+### Context policy migration
+
+- Make `contextGuard` explicit opt-in (#95). Missing, null, false and invalid values no longer trim tool results or request guard-driven summaries; Pi owns normal compaction timing. Existing explicit `true` or object settings remain unchanged: remove `contextGuard` or set it to `false` to opt out. Account failover and summary-account routing are unaffected.
+- Preserve native sparse reasoning-map semantics on aliases and restricted children. Only known catalog allowlists acquire explicit denials; omitted native `medium`/`high` entries remain supported.
+- Add a provider-only Codex adapter for explicitly selected restricted maintenance children, without parent account rotation, credential copying or ambient paid-key fallback. Recover expired-access-token failures through available same-model siblings when the host exposes no transactional refresh API.
+- Declare host-provided SDK packages as wildcard peers as required by Pi's extension loader; compatibility is verified independently by CI.
 
 ### Added
 
