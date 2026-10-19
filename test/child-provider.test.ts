@@ -104,14 +104,14 @@ test("a child preserves unmarked composed-map semantics without inventing legacy
 		const model = f.ctx.modelRegistry.find(alias, "gpt-6-astra");
 		assert.equal(model.thinkingLevelMap.off, undefined, "must exercise the old composed metadata, not a rewritten publication");
 		let body: any;
-		const result = await f.ctx.modelRegistry.streamSimple(model, { messages: [{ role: "user", content: "Owned legacy metadata probe", timestamp: 0 }] }, {
+		const result = await f.session.modelRuntime.streamSimple(model, { messages: [{ role: "user", content: "Owned legacy metadata probe", timestamp: 0 }] }, {
 			transport: "sse", maxRetries: 0, fetch: async (_url: any, init: any) => {
 				const bytes = new Headers(init.headers).get("content-encoding") === "zstd" ? zstdDecompressSync(init.body) : init.body;
 				body = JSON.parse(Buffer.from(bytes).toString());
 				return new Response(response("OWNED_LEGACY_METADATA_OK"), { headers: { "content-type": "text/event-stream" } });
 			},
 		}).result();
-		assert.equal(result.stopReason, "stop", JSON.stringify(result)); assert.equal(body.reasoning.effort, "none");
+		assert.equal(result.stopReason, "stop", JSON.stringify(result)); assert.ok(body.reasoning === undefined || body.reasoning.effort === "none", "native off remains off (omitted on older hosts), not an invented low requirement");
 		assert.equal(readFileSync(join(dir, "models.json"), "utf8"), before);
 	} finally { await f.close(); }
 });
@@ -121,7 +121,7 @@ for (const level of ["medium", "high"] as const) test(`child sparse native map p
 	try {
 		const model = f.ctx.modelRegistry.find(alias, "gpt-6-astra");
 		let body: any;
-		const result = await f.ctx.modelRegistry.streamSimple(model, { messages: [{ role: "user", content: "Owned sparse map probe", timestamp: 0 }] }, {
+		const result = await f.session.modelRuntime.streamSimple(model, { messages: [{ role: "user", content: "Owned sparse map probe", timestamp: 0 }] }, {
 			transport: "sse", reasoning: level, maxRetries: 0, fetch: async (_url: any, init: any) => {
 				const bytes = new Headers(init.headers).get("content-encoding") === "zstd" ? zstdDecompressSync(init.body) : init.body;
 				body = JSON.parse(Buffer.from(bytes).toString());
