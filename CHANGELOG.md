@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security and compatibility
 
+- Pin the development HTTP client to patched undici 8.12.2; verify the resolved lock and clean install rather than relying on an override declaration alone.
 - Distinguish the pinned public installed-application identity from private account tokens; retain strict private-file/secret checks with an exact, source-reviewed protocol-profile exception only. The former manual client file is neither required nor read.
 - Fresh-install native-host tests exercise default registration, browser callback and account catalog without a config file. Modern transcript APIs are capability-gated; legacy host support for other providers remains covered by CI.
 
