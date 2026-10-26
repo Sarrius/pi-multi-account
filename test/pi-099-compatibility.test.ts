@@ -50,6 +50,7 @@ test("OAuth uses Pi's host-bound pi-ai when the extension has no private SDK cop
 	for (const name of readdirSync(REPO_ROOT)) {
 		if (name.endsWith(".ts")) cpSync(join(REPO_ROOT, name), join(extensionDir, name));
 	}
+	for (const directory of ["antigravity", "google-transport"]) cpSync(join(REPO_ROOT, directory), join(extensionDir, directory), { recursive: true });
 	writeFileSync(
 		join(agentDir, "auth.json"),
 		JSON.stringify({

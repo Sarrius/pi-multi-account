@@ -11788,11 +11788,13 @@ test("only-active never empties a public provider, including account aliases", a
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
 	});
 	await t.fire("session_start");
+	// Login-only discovered providers legitimately start empty before authorization.
+	const initiallyEmpty = new Set(t.rec.registrations.filter(r => r.models === 0).map(r => r.provider));
 	await t.command("only-active on");
 	const emptied = [
 		...new Set(
 			[...t.rec.registrations]
-				.filter((r) => r.models === 0)
+				.filter((r) => r.models === 0 && !initiallyEmpty.has(r.provider))
 				.map((r) => r.provider),
 		),
 	];

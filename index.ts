@@ -1090,7 +1090,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.26.0";
+const VERSION = "1.27.0";
 function sourceFingerprint(): string {
 	try {
 		const root = dirname(fileURLToPath(import.meta.url));
@@ -1708,7 +1708,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	includeOllama: true,
 	includeOtherProviders: true,
 	includeCursor: true,
-	antigravitySubscription: false,
+	antigravitySubscription: true,
 	followLastSuccessfulModel: false,
 	childProxy: true,
 	neverFailoverProviders: [],
@@ -1870,7 +1870,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		includeOllama: raw.includeOllama ?? true,
 		includeOtherProviders: raw.includeOtherProviders ?? true,
 		includeCursor: raw.includeCursor ?? true,
-		antigravitySubscription: raw.antigravitySubscription === true,
+		antigravitySubscription: raw.antigravitySubscription !== false,
 		followLastSuccessfulModel: raw.followLastSuccessfulModel === true,
 		childProxy: raw.childProxy ?? true,
 		onlyActive: raw.onlyActive ?? false,
@@ -13276,7 +13276,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// models are registered, so the host restore does not print
 	// "Could not restore model" and dump the session onto kimi/anthropic.
 	// Account-discovered Antigravity subscription; no legacy Code Assist registration.
-	const antigravityReady = !config.antigravitySubscription ? Promise.resolve() : import("./antigravity/provider.ts").then(({ antigravityProvider }) => {
+	const antigravityReady = !config.antigravitySubscription ? Promise.resolve() : import("./google-transport/native.ts").then(async ({supportsNativeTranscript}) => {
+		if (!supportsNativeTranscript) return;
+		const {antigravityProvider} = await import("./antigravity/provider.ts");
 		const base = "google-antigravity";
 		const auth = readAuthFile();
 		const registered = new Map<string, ReturnType<typeof antigravityProvider>>();

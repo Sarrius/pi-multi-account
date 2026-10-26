@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -23,6 +24,13 @@ const patterns = [
 	{ id: "account-nick", re: new RegExp(accountNick, "gi") },
 ];
 
+// Exact public installed-client protocol profile, reviewed against the pinned MIT
+// reference and RFC8252 section8.5. Never allow an arbitrary client, token, file
+// or directory. New values require another provenance review, not obfuscation.
+const publicInstalledClient = {
+ "google-oauth-client-id": "bf00c418024ba6bf606ccdc37120976e41bc429dd1d46ecf16a729aa532626ea",
+ "google-oauth-client-secret": "1d2f041093fd95aa8995a038c711d50a7960da09a505381c09a745d6ad0ecc60",
+};
 const hits = [];
 for (const rel of tracked) {
 	if (/(^|\/)(?:auth\.json|antigravity-oauth-client\.json|\.implementation-ledger\.md|\.env(?:\..*)?)$/.test(rel)) hits.push(`${rel}: private-file`);
@@ -35,7 +43,10 @@ for (const rel of tracked) {
 	}
 	for (const { id, re } of patterns) {
 		re.lastIndex = 0;
-		if (re.test(text)) hits.push(`${rel}: ${id}`);
+		for (const match of text.matchAll(re)) {
+			const reviewed = rel === "antigravity/oauth-client.ts" && publicInstalledClient[id] === createHash("sha256").update(match[0]).digest("hex");
+			if (!reviewed) hits.push(`${rel}: ${id}`);
+		}
 	}
 	for (const match of text.matchAll(/\/Users\/([A-Za-z0-9._-]+)/g)) {
 		if (!allowedUsers.has(match[1].toLowerCase())) hits.push(`${rel}: absolute-macos-home (${match[1]})`);

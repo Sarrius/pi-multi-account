@@ -1,24 +1,12 @@
-# Google Antigravity subscription (unofficial, opt-in)
+# Google Antigravity subscription (unofficial browser login)
 
 This is distinct from the `google` API-key provider. The experimental `google-code-assist` integration has been removed, including its login, configuration flag and Broker admission. Existing credentials are not deleted or migrated. Shared callback/HTTP/SSE/replay utilities live in `google-transport/`; the Antigravity stream lives in `antigravity/stream.ts`.
 
 Google explicitly prohibits third-party access and warns of suspension/termination: https://antigravity.google/docs/faq/ . Login asks for explicit risk acceptance. This adapter is not Google-approved. Successful offline checks do not establish real account compatibility.
 
-## Enable and sign in
+## Install and sign in
 
-Use an updated local build on Pi 1.1+:
-
-```json
-{
-  "antigravitySubscription": true
-}
-```
-
-Merge these fields into `~/.pi/agent/provider-failover.json`, preserving other settings.
-
-OAuth application credentials are **not shipped in source or the package**. Before login or token refresh, provide the client ID and client secret you are authorized to use in `~/.pi/agent/antigravity-oauth-client.json`, outside every Git repository, owned by your OS user and with permissions `0600`. Its JSON fields are `clientId` and `clientSecret`; never paste real values into issues, commits, command-line arguments or logs. An absolute `PI_ANTIGRAVITY_OAUTH_CLIENT_FILE` may select another private file. Symlinks, group/world-readable files, malformed data and missing configuration fail closed; there is no built-in or network-downloaded fallback. The configured client must support the callback below and the Antigravity service; arbitrary Google Cloud OAuth clients are not guaranteed service eligibility. Existing refresh tokens remain bound to the application client used to obtain them: changing the client configuration is not credential migration. The extension never writes this configuration into auth.json or model metadata.
-
-Then start a fresh Pi process. Run `/login google-antigravity`. The menu name is **Google Antigravity (unofficial subscription)**. Browser callback: localhost:51121/oauth-callback. On a remote terminal, paste the full callback URL; bare codes are rejected.
+On Pi 1.1+, install/update `pi-multi-account`, reload Pi, run `/login` and select Google Antigravity, or run `/login google-antigravity` directly. Follow the browser authorization and return to Pi. The login provider is registered by default on compatible hosts, even before an account exists. No Google Cloud project creation, client registration, manual JSON configuration, token import or separate application credential file is required. An explicit `antigravitySubscription: false` remains an opt-out; older hosts keep existing providers but do not advertise unsupported Antigravity transcript APIs. The menu name is **Google Antigravity (unofficial subscription)**. Browser callback: localhost:51121/oauth-callback. On a remote terminal, paste the full callback URL; bare codes are rejected.
 
 The flow validates OAuth state/PKCE, resolves a stable Google account identity, obtains an Antigravity project, and fetches the account's actual available-model catalog. First-use setup has separate consent. It never invents a project, repeats an uncertain onboarding POST or substitutes Gemini CLI/API-key credentials. Pending onboarding is polled only if Google supplies a validated operation name. If not, it stops with an explicit pending-state error rather than guessing or retrying the mutation.
 
@@ -49,6 +37,14 @@ Synthetic tests exercise full OAuth/project/catalog paths, protocol separation, 
 
 Owner browser login and live account catalog/quotas are verified. Fresh installed Pi 1.3 processes passed real isolated Broker read/tool/result/final canaries for `gemini-3.8-flash-low`, `claude-sonnet-5-5-low` and `gpt-oss-120b-medium`. Argon was not invoked after its exhaustion was confirmed. This establishes these concrete protocol paths, not universal model/effort compatibility, quota headroom or a reliability rate. Each process/route/effort still requires current Broker qualification. Existing Pi processes must be restarted or reloaded to adopt changed code; no new Google login is needed. An error must be investigated from bounded stage/shape evidence, not followed by another guessed provider/tier substitution.
 
+## Public application identity versus private account tokens
+
+The adapter carries the reference application's shared **installed-client protocol identity** in `antigravity/oauth-client.ts`. Its `client_secret` is statically distributed to every installation, not an individual user's password or account token. [RFC8252 section8.5](https://www.rfc-editor.org/rfc/rfc8252#section-8.5) explains why such native-app shared values are not confidential credentials. This classification does not mean Google approves this third-party adapter or guarantees access.
+
+The profile is plaintext and source-attributed, never obfuscated or downloaded from a hidden endpoint. The privacy gate permits only its exact reviewed fingerprints in that single module; other application secrets and private files remain rejected. Browser login still uses PKCE/state and fixed callback/token destinations. Account access/refresh tokens are issued separately, stored through native Pi AuthStorage and never bundled, logged or published. Do not share auth.json or diagnostic dumps containing account data.
+
+The earlier local client-configuration file/environment variable is no longer read or required. Existing account tokens use the same application identity; no token migration or renewed login is forced merely by this change. Private files are not deleted by the extension.
+
 ## Source
 
-Protocol reference (MIT): https://github.com/NoeFabris/opencode-antigravity-auth/tree/f212f7eb01aa904b5985895cf93f6d3074c5bc6d . License retained in `antigravity/LICENSE.reference`. Only pinned 2.24.0 wire-compatibility metadata is used; OAuth application credentials must be supplied privately, not copied into the package; this is not a claim an official client is running. Its hardcoded fallback project, repeated onboarding POST loop, inferred family quota aggregation and injected system prompt are **not** adopted. Message/tool conversion and auth persistence are native Pi facilities.
+Protocol reference (MIT): https://github.com/NoeFabris/opencode-antigravity-auth/tree/f212f7eb01aa904b5985895cf93f6d3074c5bc6d . License retained in `antigravity/LICENSE.reference`. The reference's shared installed-client identity and pinned 2.24.0 wire-compatibility metadata are used; this is not a claim an official client is running. Its hardcoded fallback project, repeated onboarding POST loop, inferred family quota aggregation and injected system prompt are **not** adopted. Message/tool conversion and auth persistence are native Pi facilities.
