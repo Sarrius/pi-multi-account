@@ -5626,7 +5626,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	): string {
 		const window = snapshot?.[position];
 		if (!snapshot || !window) return "—";
-		return `${windowLabel(window, snapshot.family, position)} ${remainingPercent(window)}%/${formatResetDuration(window.resetAt, now)}`;
+		return `${windowLabel(window, snapshot.family, position)} ${remainingPercent(window)}%`;
 	}
 
 	function renderAccountTable(ctx: any): string {
@@ -5643,7 +5643,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		);
 		const unconfigured = new Set(unconfiguredRotationMembers(ctx));
 		const now = Date.now();
-		const rows = ordered.map((provider) => {
+		const overview = ordered.map((provider, order) => {
 			const entry = auth[provider];
 			const snapshot = cachedUsage(provider);
 			const account = snapshot?.account ?? "—";
@@ -5659,21 +5659,45 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			else if (duplicate) status = `duplicate → ${duplicate}`;
 			else if (unconfigured.has(provider)) status = "unavailable · no models";
 			else status = providerAvailabilityDescription(provider, now);
-			return [
-				provider,
-				alias,
-				account,
-				snapshot?.plan ?? "—",
-				accountUsageCell(snapshot, "primary", now),
-				accountUsageCell(snapshot, "secondary", now),
-				accountUsageCell(snapshot, "tertiary", now),
+			const fresh = !!snapshot && snapshot.fetchedAt <= now && now - snapshot.fetchedAt < usageCacheTtl(provider);
+			const windows = [snapshot?.primary, snapshot?.secondary];
+			const exhausted = windows.filter((w) => w && w.usedPercent >= 100);
+			// Independent Cursor pools cannot be collapsed into account-wide recovery.
+			// A passed/unknown blocking reset requires new evidence, not optimistic recovery.
+			const quotaAt = snapshot?.family !== "cursor" && exhausted.length > 0 &&
+				exhausted.every((w) => Number.isFinite(w!.resetAt) && w!.resetAt > now)
+				? Math.max(...exhausted.map((w) => w!.resetAt)) : undefined;
+			const candidate = fresh && !usageErrors.has(provider) && quotaAt !== undefined &&
+				snapshot?.serviceable !== true && !!entry && isEntryUsable(entry) &&
+				rotation.includes(provider) && !config.excludedProviders.includes(provider) &&
+				!isInvalidated(provider) && !duplicate && !unconfigured.has(provider);
+			const resetCell = (position: UsageWindowPosition) => {
+				const w = snapshot?.[position];
+				if (!w || !Number.isFinite(w.resetAt)) return "—";
+				return w.resetAt <= now ? "passed; refresh" : formatResetDuration(w.resetAt, now);
+			};
+			const observed = snapshot
+				? `${fresh ? "fresh" : "stale"} ${formatDelay(Math.max(0, now - snapshot.fetchedAt))} ago${usageErrors.has(provider) ? "; refresh failed" : ""}`
+				: usageErrors.has(provider) ? "unavailable; refresh failed" : "not fetched";
+			return { order, provider, estimate: candidate ? quotaAt : undefined, cells: [
+				provider, alias, account, snapshot?.plan ?? "—",
+				accountUsageCell(snapshot, "primary", now), resetCell("primary"),
+				accountUsageCell(snapshot, "secondary", now), resetCell("secondary"),
+				accountUsageCell(snapshot, "tertiary", now), resetCell("tertiary"),
+				observed,
+				quotaAt === undefined ? "unknown" : `${formatDelay(quotaAt - now)}${candidate ? "" : " (last known; unconfirmed)"}`,
 				status,
-			];
+			] };
 		});
+		overview.sort((a, b) => (a.estimate ?? Infinity) - (b.estimate ?? Infinity) || a.order - b.order);
+		const rows = overview.map((row) => row.cells);
 		if (rows.length === 0) {
 			return "pi-multi-account accounts: no configured accounts in auth.json";
 		}
-		const header = ["Slot", "Alias", "Account", "Plan", "Primary", "Secondary", "Tertiary", "Status"];
+		const earliest = overview[0]?.estimate;
+		const summary = earliest === undefined ? "Earliest known quota recovery: unknown" :
+			`Earliest known quota recovery: ${overview.filter((r) => r.estimate === earliest).map((r) => r.provider).join(", ")} in ~${formatDelay(earliest - now)} — not guaranteed availability or model compatibility`;
+		const header = ["Slot", "Alias", "Account", "Plan", "Primary left", "Reset", "Secondary left", "Reset", "Tertiary left", "Reset", "Observed", "Quota estimate", "Status"];
 		const widths = header.map((title, column) =>
 			Math.max(title.length, ...rows.map((row) => row[column].length)),
 		);
@@ -5684,6 +5708,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			line(header),
 			line(widths.map((width) => "-".repeat(width))),
 			...rows.map(line),
+			summary,
+			"Sorted by fresh known quota estimates, not rotation priority. Retry backoff is a next-check schedule, not quota recovery.",
 			"Use /multi-account accounts refresh to refresh every supported account explicitly.",
 		].join("\n");
 	}
