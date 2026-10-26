@@ -397,6 +397,7 @@ type ProviderFailoverConfig = {
 	 */
 	includeOtherProviders?: boolean;
 	includeCursor?: boolean;
+	antigravitySubscription?: boolean;
 	/** Opt-in: new terminal sessions follow the last successful foreground model across projects. */
 	followLastSuccessfulModel?: boolean;
 	/**
@@ -528,6 +529,7 @@ type RuntimeConfig = Required<
 		| "includeOllama"
 		| "includeOtherProviders"
 		| "includeCursor"
+		| "antigravitySubscription"
 		| "followLastSuccessfulModel"
 		| "childProxy"
 		| "onlyActive"
@@ -1706,6 +1708,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	includeOllama: true,
 	includeOtherProviders: true,
 	includeCursor: true,
+	antigravitySubscription: false,
 	followLastSuccessfulModel: false,
 	childProxy: true,
 	neverFailoverProviders: [],
@@ -1867,6 +1870,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		includeOllama: raw.includeOllama ?? true,
 		includeOtherProviders: raw.includeOtherProviders ?? true,
 		includeCursor: raw.includeCursor ?? true,
+		antigravitySubscription: raw.antigravitySubscription === true,
 		followLastSuccessfulModel: raw.followLastSuccessfulModel === true,
 		childProxy: raw.childProxy ?? true,
 		onlyActive: raw.onlyActive ?? false,
@@ -5626,7 +5630,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	): string {
 		const window = snapshot?.[position];
 		if (!snapshot || !window) return "—";
-		return `${windowLabel(window, snapshot.family, position)} ${remainingPercent(window)}%/${formatResetDuration(window.resetAt, now)}`;
+		return `${windowLabel(window, snapshot.family, position)} ${remainingPercent(window)}%`;
 	}
 
 	function renderAccountTable(ctx: any): string {
@@ -5643,7 +5647,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		);
 		const unconfigured = new Set(unconfiguredRotationMembers(ctx));
 		const now = Date.now();
-		const rows = ordered.map((provider) => {
+		const overview = ordered.map((provider, order) => {
 			const entry = auth[provider];
 			const snapshot = cachedUsage(provider);
 			const account = snapshot?.account ?? "—";
@@ -5659,21 +5663,45 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			else if (duplicate) status = `duplicate → ${duplicate}`;
 			else if (unconfigured.has(provider)) status = "unavailable · no models";
 			else status = providerAvailabilityDescription(provider, now);
-			return [
-				provider,
-				alias,
-				account,
-				snapshot?.plan ?? "—",
-				accountUsageCell(snapshot, "primary", now),
-				accountUsageCell(snapshot, "secondary", now),
-				accountUsageCell(snapshot, "tertiary", now),
+			const fresh = !!snapshot && snapshot.fetchedAt <= now && now - snapshot.fetchedAt < usageCacheTtl(provider);
+			const windows = [snapshot?.primary, snapshot?.secondary];
+			const exhausted = windows.filter((w) => w && w.usedPercent >= 100);
+			// Independent Cursor pools cannot be collapsed into account-wide recovery.
+			// A passed/unknown blocking reset requires new evidence, not optimistic recovery.
+			const quotaAt = snapshot?.family !== "cursor" && exhausted.length > 0 &&
+				exhausted.every((w) => Number.isFinite(w!.resetAt) && w!.resetAt > now)
+				? Math.max(...exhausted.map((w) => w!.resetAt)) : undefined;
+			const candidate = fresh && !usageErrors.has(provider) && quotaAt !== undefined &&
+				snapshot?.serviceable !== true && !!entry && isEntryUsable(entry) &&
+				rotation.includes(provider) && !config.excludedProviders.includes(provider) &&
+				!isInvalidated(provider) && !duplicate && !unconfigured.has(provider);
+			const resetCell = (position: UsageWindowPosition) => {
+				const w = snapshot?.[position];
+				if (!w || !Number.isFinite(w.resetAt)) return "—";
+				return w.resetAt <= now ? "passed; refresh" : formatResetDuration(w.resetAt, now);
+			};
+			const observed = snapshot
+				? `${fresh ? "fresh" : "stale"} ${formatDelay(Math.max(0, now - snapshot.fetchedAt))} ago${usageErrors.has(provider) ? "; refresh failed" : ""}`
+				: usageErrors.has(provider) ? "unavailable; refresh failed" : "not fetched";
+			return { order, provider, estimate: candidate ? quotaAt : undefined, cells: [
+				provider, alias, account, snapshot?.plan ?? "—",
+				accountUsageCell(snapshot, "primary", now), resetCell("primary"),
+				accountUsageCell(snapshot, "secondary", now), resetCell("secondary"),
+				accountUsageCell(snapshot, "tertiary", now), resetCell("tertiary"),
+				observed,
+				quotaAt === undefined ? "unknown" : `${formatDelay(quotaAt - now)}${candidate ? "" : " (last known; unconfirmed)"}`,
 				status,
-			];
+			] };
 		});
+		overview.sort((a, b) => (a.estimate ?? Infinity) - (b.estimate ?? Infinity) || a.order - b.order);
+		const rows = overview.map((row) => row.cells);
 		if (rows.length === 0) {
 			return "pi-multi-account accounts: no configured accounts in auth.json";
 		}
-		const header = ["Slot", "Alias", "Account", "Plan", "Primary", "Secondary", "Tertiary", "Status"];
+		const earliest = overview[0]?.estimate;
+		const summary = earliest === undefined ? "Earliest known quota recovery: unknown" :
+			`Earliest known quota recovery: ${overview.filter((r) => r.estimate === earliest).map((r) => r.provider).join(", ")} in ~${formatDelay(earliest - now)} — not guaranteed availability or model compatibility`;
+		const header = ["Slot", "Alias", "Account", "Plan", "Primary left", "Reset", "Secondary left", "Reset", "Tertiary left", "Reset", "Observed", "Quota estimate", "Status"];
 		const widths = header.map((title, column) =>
 			Math.max(title.length, ...rows.map((row) => row[column].length)),
 		);
@@ -5684,6 +5712,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			line(header),
 			line(widths.map((width) => "-".repeat(width))),
 			...rows.map(line),
+			summary,
+			"Sorted by fresh known quota estimates, not rotation priority. Retry backoff is a next-check schedule, not quota recovery.",
 			"Use /multi-account accounts refresh to refresh every supported account explicitly.",
 		].join("\n");
 	}
@@ -13054,8 +13084,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// how a session ended up answering every user message with the same "out of credits"
 			// error while live accounts sat unused. Transient blips and model-specific errors keep
 			// the light touch, because those genuinely are momentary or model-scoped.
-			const accountLevel = failureKind === "limit" || failureKind === "auth";
-			if (accountLevel || failureKind === "model") {
+			const accountLevel = failureKind === "auth" || (failureKind === "limit" && !/^google-antigravity(?:-account-\d+)?$/.test(provider));
+			if (accountLevel || failureKind === "model" || failureKind === "limit") {
 				await switchToFallback(
 					ctx,
 					failedModel,
@@ -13149,7 +13179,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				failedModel,
 				`assistant error: ${errorText.slice(0, 120)}`,
 				cooldownMs,
-				{ waitForQuotaRecovery: true },
+				{ waitForQuotaRecovery: true, ...(/^google-antigravity(?:-account-\d+)?$/.test(provider) ? { scope: "model" as const } : {}) },
 			);
 			return;
 		}
@@ -13245,5 +13275,55 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// createAgentSession's getModel(cursor, cursor-grok-4.6) runs AFTER fallback
 	// models are registered, so the host restore does not print
 	// "Could not restore model" and dump the session onto kimi/anthropic.
-	return cursorReady;
+	// Account-discovered Antigravity subscription; no legacy Code Assist registration.
+	const antigravityReady = !config.antigravitySubscription ? Promise.resolve() : import("./antigravity/provider.ts").then(({ antigravityProvider }) => {
+		const base = "google-antigravity";
+		const auth = readAuthFile();
+		const registered = new Map<string, ReturnType<typeof antigravityProvider>>();
+		const register = (id: string) => {
+			if (registered.has(id)) return;
+			const provider = antigravityProvider({ id, credential: auth[id] as any, assertConfiguration() {
+				const entry = existsSync(MODELS_CONFIG_PATH) ? JSON.parse(readFileSync(MODELS_CONFIG_PATH, "utf8"))?.providers?.[id] : undefined;
+				if (entry && (entry.apiKey !== undefined || entry.oauth || (entry.api && entry.api !== base) ||
+					(entry.baseUrl && entry.baseUrl !== "https://daily-cloudcode-pa.googleapis.com") || entry.models?.length || entry.headers))
+					throw new Error("Antigravity uses its exact account-discovered catalog and destination; models.json overrides are not supported");
+			} });
+			const oauth = provider.auth.oauth!;
+			const login = oauth.login.bind(oauth);
+			oauth.login = async (...args: Parameters<typeof login>) => {
+				const credential = rejectDuplicateLogin(id, await login(...args));
+				args[0].signal.throwIfAborted();
+				const number = id === base ? 1 : Number(id.slice(id.lastIndexOf("-") + 1));
+				if (number < config.maxAccountsPerProvider) register(`${base}-account-${number + 1}`);
+				return credential;
+			};
+			(pi.registerProvider as any)(provider); registered.set(id, provider);
+		};
+		register(base);
+		let highest = auth[base] ? 1 : 0;
+		for (const id of Object.keys(auth)) if (/^google-antigravity-account-[1-9]\d*$/.test(id)) {
+			register(id); highest = Math.max(highest, Number(id.slice(id.lastIndexOf("-") + 1)));
+		}
+		if (highest && highest < config.maxAccountsPerProvider) register(`${base}-account-${highest + 1}`);
+		pi.registerCommand("antigravity", {
+			description: "Account-discovered models and individual model quotas; /antigravity refresh fetches current evidence",
+			handler: async (args, ctx) => {
+				if (args.trim() && args.trim() !== "refresh") { ctx.ui.notify("Usage: /antigravity [refresh]", "warning"); return; }
+				if (args.trim() === "refresh") {
+					const result = await ctx.modelRegistry.refresh({ providers: [...registered.keys()], allowNetwork: true, force: true });
+					if (result.errors.size) ctx.ui.notify(`Antigravity refresh failed for: ${[...result.errors.keys()].join(", ")}; retained data may be stale`, "warning");
+				}
+				const lines = ["Antigravity — per-model observations, not inferred shared quota pools:"];
+				for (const [id, provider] of registered) {
+					const snapshot = provider.quotaSnapshot();
+					if (!snapshot.models.length) continue;
+					lines.push(`${id} · observed ${snapshot.updatedAt ? new Date(snapshot.updatedAt).toISOString() : "unknown"}`);
+					for (const model of snapshot.models) lines.push(`  ${model.id}: ${model.remaining === undefined ? "unknown" : `${Math.round(model.remaining * 100)}% remaining`}; reset ${model.reset ?? "unknown"}`);
+				}
+				if (lines.length === 1) lines.push("No account catalog. Sign in with /login google-antigravity.");
+				ctx.ui.notify(lines.join("\n"), "info");
+			},
+		});
+	});
+	return Promise.all([cursorReady, antigravityReady]);
 }
