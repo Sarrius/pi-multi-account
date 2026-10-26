@@ -760,8 +760,9 @@ function setup(opts: {
 	if (opts.independentRoots) process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS = "1";
 	else delete process.env.PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS;
 	process.argv = ["node", "pi", ...(opts.cliArgs ?? [])];
+	let initialization: ReturnType<typeof piMultiAccount>;
 	try {
-		piMultiAccount(pi);
+		initialization = piMultiAccount(pi);
 	} finally {
 		process.argv = previousArgv;
 		if (previousSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
@@ -773,6 +774,8 @@ function setup(opts: {
 	}
 
 	const fire = async (event: string, payload: any = {}) => {
+		// Real Pi awaits async provider registration before lifecycle delivery.
+		await initialization;
 		const handlers = events[event];
 		if (!handlers || handlers.length === 0) return undefined;
 		if (event === "context") {
@@ -834,8 +837,10 @@ function setup(opts: {
 		}
 		return result;
 	};
-	const command = async (args: string) =>
-		commands["multi-account"]?.(args, ctx);
+	const command = async (args: string) => {
+		await initialization;
+		return commands["multi-account"]?.(args, ctx);
+	};
 	const input = async (text: string, images?: any[]) =>
 		fire("input", { type: "input", text, images, source: "interactive" });
 
