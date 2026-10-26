@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [1.27.0] — 2026-10-26
+
+### Added
+
+- Google Antigravity browser login is available by default on compatible hosts: install, `/login`, authorize in the browser, return to Pi. No manual client configuration or token import. Existing explicit opt-out is retained.
+- Account-discovered models, signed tool/result replay, per-model quota observations, bounded callback/setup handling and no API-key or AI-credit fallback. The integration is unofficial and asks for account-risk consent.
+- Improved `/multi-account accounts` overview (#100): separate quota/reset columns, observation freshness, earliest known recovery and sorted estimates without changing rotation or adding requests.
+
+### Security and compatibility
+
+- Pin the development HTTP client to patched undici 8.12.2; verify the resolved lock and clean install rather than relying on an override declaration alone.
+- Distinguish the pinned public installed-application identity from private account tokens; retain strict private-file/secret checks with an exact, source-reviewed protocol-profile exception only. The former manual client file is neither required nor read.
+- Fresh-install native-host tests exercise default registration, browser callback and account catalog without a config file. Modern transcript APIs are capability-gated; legacy host support for other providers remains covered by CI.
+
 ## [1.26.0] — 2026-10-19
 
 ### Context recovery

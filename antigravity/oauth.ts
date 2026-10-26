@@ -5,10 +5,10 @@ import { callbackCode, listenForGoogleCallback } from "../google-transport/callb
 import { TOKEN_URL, post, jsonResponse, operationSignal, cancellable, record, token } from "../google-transport/http.ts";
 import { BASE, VERSION, PROJECT_HEADER, headers, request, project } from "./transport.ts";
 import { fetchCatalog } from "./catalog.ts";
-import { readOAuthClient, type OAuthClient } from "./client-config.ts";
+import { PUBLIC_INSTALLED_CLIENT, type OAuthClient } from "./oauth-client.ts";
 export const REDIRECT = "http://localhost:51121/oauth-callback";
 const INFO = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json";
-export function authorization(client: OAuthClient = readOAuthClient()) {
+export function authorization(client: OAuthClient = PUBLIC_INSTALLED_CLIENT) {
  const verifier=randomBytes(64).toString("base64url"),state=randomBytes(32).toString("hex");
  const url=new URL("https://accounts.google.com/o/oauth2/v2/auth");
  url.search=new URLSearchParams({client_id:client.clientId,redirect_uri:REDIRECT,response_type:"code",access_type:"offline",prompt:"consent select_account",state,
@@ -65,7 +65,7 @@ export function createAntigravityOAuth(fetchImpl:typeof fetch=fetch):OAuthAuth {
    const signal=operationSignal(interaction.signal,300000);signal.throwIfAborted();
    const choice=await cancellable(interaction.prompt({type:"select",signal,message:"Google prohibits third-party Antigravity clients and warns of account suspension. This is an unofficial adapter, not Google-approved. Accept this account risk?",options:[{id:"no",label:"Cancel"},{id:"yes",label:"Accept risk and sign in"}]}),signal);
    if(choice!=="yes")throw new Error("Antigravity login cancelled");
-   const client=readOAuthClient(),auth=authorization(client), listener=await listenForGoogleCallback(auth.state,signal,51121,REDIRECT),manual=new AbortController();
+   const client=PUBLIC_INSTALLED_CLIENT,auth=authorization(client), listener=await listenForGoogleCallback(auth.state,signal,51121,REDIRECT),manual=new AbortController();
    let code:string;
    try {
     interaction.notify({type:"auth_url",url:auth.url,instructions:"Sign in with your Antigravity account. The local callback is automatic; remote users can paste the full callback URL."});
@@ -83,7 +83,7 @@ export function createAntigravityOAuth(fetchImpl:typeof fetch=fetch):OAuthAuth {
    interaction.notify({type:"info",message:`Antigravity account resolved; ${catalog.length} models discovered. This is not yet a live inference qualification.`});
    return {...c,accountId:`google:${identity.id}`,projectId,catalog,catalogAt:Date.now()};
   },
-  async refresh(c,signal){requireCredential(c);const active=operationSignal(signal);active.throwIfAborted();return exchange({grant_type:"refresh_token",refresh_token:c.refresh},active,readOAuthClient(),c);},
+  async refresh(c,signal){requireCredential(c);const active=operationSignal(signal);active.throwIfAborted();return exchange({grant_type:"refresh_token",refresh_token:c.refresh},active,PUBLIC_INSTALLED_CLIENT,c);},
   async toAuth(c){const id=requireCredential(c);return {apiKey:c.access,baseUrl:BASE,headers:{[PROJECT_HEADER]:id}};},
  };
 }

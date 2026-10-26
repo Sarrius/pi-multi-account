@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import "./fixtures/antigravity-oauth-client.ts";
 import test from "node:test";
 import { authorization, createAntigravityOAuth as createGoogleOAuth, REDIRECT as REDIRECT_URI } from "../antigravity/oauth.ts";
 import { callbackCode as parseCallback, listenForGoogleCallback as listenCallback } from "../google-transport/callback.ts";

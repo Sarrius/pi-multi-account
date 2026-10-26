@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { fixtureClient } from "./fixtures/antigravity-oauth-client.ts";
+import { PUBLIC_INSTALLED_CLIENT as installedClient } from "../antigravity/oauth-client.ts";
 import nodeTest from "node:test";
 import { supportsNativeTranscript } from "../google-transport/native.ts";
 const test = supportsNativeTranscript ? nodeTest : nodeTest.skip;
@@ -25,7 +25,7 @@ test("Antigravity preserves opaque account-returned project names without accept
 
 test("Antigravity uses distinct OAuth client, scopes and callback; verifier not in state",()=>{
  const a=authorization(),url=new URL(a.url);
- assert.equal(url.searchParams.get("client_id"),fixtureClient.clientId);
+ assert.equal(url.searchParams.get("client_id"),installedClient.clientId);
  assert.equal(url.searchParams.get("redirect_uri"),REDIRECT);assert.match(url.searchParams.get("scope")!,/experimentsandconfigs/);
  assert.equal(url.searchParams.get("state"),a.state);assert.ok(!a.state.includes(a.verifier));
 });
@@ -35,7 +35,7 @@ for(const onboarding of [false,true])test(`complete Antigravity login resolves a
  const provider=antigravityProvider({fetch:(async(url,init)=>{
   const u=String(url);calls.push(u);assert.equal(init?.redirect,"error");
   if(u.includes("oauth2.googleapis.com/token")) {
-   const fields=new URLSearchParams(String(init?.body));assert.equal(fields.get("client_id"),fixtureClient.clientId);assert.equal(fields.get("client_secret"),fixtureClient.clientSecret);
+   const fields=new URLSearchParams(String(init?.body));assert.equal(fields.get("client_id"),installedClient.clientId);assert.ok(fields.get("client_secret")===installedClient.clientSecret);
    return Response.json({token_type:"Bearer",access_token:"fixture-access",refresh_token:"fixture-refresh",expires_in:3600});
   }
   if(u.includes("/userinfo?"))return Response.json({id:"123",email:"private@example.test"});

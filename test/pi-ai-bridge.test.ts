@@ -23,7 +23,7 @@ test("host provider factories preserve OAuth callbacks, refresh signals, and Cod
 		mkdirSync(join(sdk, "providers"), { recursive: true });
 		writeFileSync(join(sdk, "package.json"), JSON.stringify({
 			name: "@earendil-works/pi-ai", type: "module",
-			exports: { "./compat": "./compat.js", "./providers/*": "./providers/*.js" },
+			exports: { ".": "./compat.js", "./compat": "./compat.js", "./providers/*": "./providers/*.js" },
 		}));
 		writeFileSync(join(sdk, "compat.js"), "export const getModel = () => undefined;\n");
 		for (const [name, factory] of [
@@ -63,6 +63,7 @@ export function ${factory}() { return { auth: { oauth: {
 		for (const file of files.filter((file) => file.endsWith(".ts"))) {
 			cpSync(join(rootPath, file), join(ext, file));
 		}
+		for (const directory of ["antigravity", "google-transport"]) cpSync(join(rootPath, directory), join(ext, directory), { recursive: true });
 		writeFileSync(join(ext, "package.json"), '{"type":"module"}');
 		const agent = join(root, "agent");
 		mkdirSync(agent);
@@ -72,7 +73,7 @@ process.env.PI_CODING_AGENT_DIR = ${JSON.stringify(agent)};
 process.env.PI_CURSOR_PROVIDER_ROOT = ${JSON.stringify(join(root, "no-cursor"))};
 const {default: extension} = await import(${JSON.stringify(join(ext, "index.ts"))});
 const registrations = new Map();
-extension({registerProvider: (id, config) => registrations.set(id, config),
+await extension({registerProvider: (id, config) => registrations.set(id, config),
  registerCommand() {}, on() {}, setModel: async () => true,
  getThinkingLevel: () => "high", setThinkingLevel() {}, appendEntry() {}});
 const result = {};
