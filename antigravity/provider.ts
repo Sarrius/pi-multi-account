@@ -23,7 +23,7 @@ export function antigravityProvider(options: { id?:string; fetch?:typeof fetch; 
   else if(key!==requestBinding) {requestBinding=key;updatedAt=0;generation++;}
   return auth;
  };
- oauth.login=async(interaction,loginOptions)=>{ options.assertConfiguration?.();const c=await originalLogin(interaction,loginOptions);interaction.signal.throwIfAborted();publish(c);return c; };
+ oauth.login=async(...args:Parameters<typeof originalLogin>)=>{ options.assertConfiguration?.();const c=await originalLogin(...args);args[0].signal.throwIfAborted();publish(c);return c; };
  const provider=createAntigravityStream([], {id,oauth,fetch:fetchImpl,assertConfiguration:options.assertConfiguration,
   async beforeRequest(model,req,signal) {
    const p=project(new Headers(req.headers as HeadersInit).get(PROJECT_HEADER)),key=binding(req.apiKey??"",p);
@@ -41,12 +41,11 @@ export function antigravityProvider(options: { id?:string; fetch?:typeof fetch; 
   },
  });
  provider.getModels=()=>models(entries,id);
- provider.getAllModels=provider.getModels;
  provider.filterModels=(_models,c)=>{
   if(c?.type!=="oauth" || c.antigravityVersion!==1 || c.accountId!==account || c.projectId!==accountProject)return [];
   return models(entries,id);
  };
- provider.filterAllModels=(all,c)=>provider.filterModels!(all as Model<Api>[],c);
+ const allModels = {getAllModels:provider.getModels,filterAllModels:(all:readonly unknown[],c?:Parameters<NonNullable<typeof provider.filterModels>>[1])=>provider.filterModels!(all as Model<Api>[],c)};
  provider.refreshModels=async(ctx:RefreshModelsContext)=>{
   const c=ctx.credential;
   if(c?.type!=="oauth" || c.antigravityVersion!==1) {await ctx.publish({update(){entries=[];account="";accountProject="";updatedAt=0;requestBinding="";generation++;}});return;}
@@ -58,5 +57,5 @@ export function antigravityProvider(options: { id?:string; fetch?:typeof fetch; 
   if(epoch!==generation)throw new Error("Antigravity credential changed during catalog refresh");
   await ctx.publish({update(){if(epoch===generation)publish(c,fresh,Date.now());}});
  };
- return Object.assign(provider, { quotaSnapshot:()=>({updatedAt,models:entries.map(e=>({id:e.id,remaining:e.remaining,reset:e.reset}))}) });
+ return Object.assign(provider, allModels, { quotaSnapshot:()=>({updatedAt,models:entries.map(e=>({id:e.id,remaining:e.remaining,reset:e.reset}))}) });
 }

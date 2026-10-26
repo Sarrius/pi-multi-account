@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import { fixtureClient } from "./fixtures/antigravity-oauth-client.ts";
-import test from "node:test";
+import nodeTest from "node:test";
+import { supportsNativeTranscript } from "../google-transport/native.ts";
+const test = supportsNativeTranscript ? nodeTest : nodeTest.skip;
 import { antigravityProvider } from "../antigravity/provider.ts";
 import { authorization, REDIRECT } from "../antigravity/oauth.ts";
 import { BASE, ID, STREAM, PROJECT_HEADER, project } from "../antigravity/transport.ts";
 import { parseCatalog } from "../antigravity/catalog.ts";
+nodeTest("unsupported hosts reject Antigravity without guessing transcript compatibility", {skip:supportsNativeTranscript}, () => {
+ assert.throws(() => antigravityProvider(), /requires modern native transcript APIs/);
+});
 const catalog={models:{
  "gemini-4-argon-high":{displayName:"Argon",maxTokens:1000000,maxOutputTokens:65536,supportsImages:true,supportsThinking:true,quotaInfo:{remainingFraction:.8,resetTime:"2027-01-01T00:00:00Z"}},
  "claude-opus-4-6-thinking":{maxTokens:200000,maxOutputTokens:65536,supportsThinking:true,quotaInfo:{remainingFraction:.3}},

@@ -3,7 +3,9 @@ import { mkdtempSync,rmSync,writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import test from "node:test";
+import nodeTest from "node:test";
+import { supportsNativeTranscript } from "../google-transport/native.ts";
+const test = supportsNativeTranscript ? nodeTest : nodeTest.skip;
 import * as NativeHost from "@earendil-works/pi-coding-agent";
 for(const bundled of [false,true])test(`Antigravity account catalog and stream through real ${bundled?"bundled":"node"} Pi loader`,async()=>{
  const host=bundled?await import(new URL("./bundle/index.js",import.meta.resolve("@earendil-works/pi-coding-agent")).href) as typeof NativeHost:NativeHost;

@@ -11,18 +11,20 @@ import { createGoogleReplayCache } from "../google-transport/replay.ts";
 const callbackCode=(input:string,state:string)=>parseCallback(input,state,REDIRECT_URI);
 const listenForGoogleCallback=(state:string,signal:AbortSignal,port:number)=>listenCallback(state,signal,port,REDIRECT_URI);
 const fixtureStream=(models:readonly Model<Api>[],options:{fetch:typeof fetch})=>createAntigravityStream(models,{...options,oauth:createGoogleOAuth(options.fetch)});
-import { normalizeContext, type Model, type Api } from "@earendil-works/pi-ai";
+import type { Model, Api } from "@earendil-works/pi-ai";
+import { normalizeContext, supportsNativeTranscript } from "../google-transport/native.ts";
+const streamTest = supportsNativeTranscript ? test : test.skip;
 
 const definition: Model<Api> = { id: "synthetic-gemini", name: "Synthetic fixture", provider: "google",
  api: "google-generative-ai", baseUrl: "https://generativelanguage.googleapis.com", reasoning: false,
  input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 10000, maxTokens: 1000 };
-const context = normalizeContext({ systemPrompt: "Fixture system", tools: [{ name: "read", description: "Fixture read",
+const context = supportsNativeTranscript ? normalizeContext({ systemPrompt: "Fixture system", tools: [{ name: "read", description: "Fixture read",
  parameters: { type: "object", properties: { path: { type: "string" } } } }],
- messages: [{ role: "user", content: "Read fixture", timestamp: 1 }] });
+ messages: [{ role: "user", content: "Read fixture", timestamp: 1 }] }) : null!;
 const requestAuth = { sessionId: "synthetic-task", apiKey: "synthetic-access", headers: { [PROJECT_HEADER]: "fixture-project" }, maxRetries: 0 };
 const sse = (frames: unknown[]) => frames.map(response => `data: ${JSON.stringify({ response })}\n\n`).join("");
 
-test("Google provider native transcript, hooks, signed tools and replay complete without hidden retries", async () => {
+streamTest("Google provider native transcript, hooks, signed tools and replay complete without hidden retries", async () => {
  let calls = 0, responseHooks = 0, frameHooks = 0; const requests: any[] = [];
  const provider = fixtureStream([definition], { fetch: (async (_url, options) => {
   calls++; requests.push(JSON.parse(String(options?.body)));
@@ -68,7 +70,7 @@ test("Google provider native transcript, hooks, signed tools and replay complete
  assert.equal((cache.restore(binding, tampered).messages[assistantIndex] as any).provider, undefined);
 });
 
-test("SSE text fragments form one semantic block for native RPC/Broker extraction",async()=>{
+streamTest("SSE text fragments form one semantic block for native RPC/Broker extraction",async()=>{
  const p=fixtureStream([definition],{fetch:(async()=>new Response(sse([
   {candidates:[{content:{role:"model"}}],responseId:"fixture-metadata"},
   {candidates:[{content:{parts:[{text:"nonce-"}]}}]},
@@ -82,7 +84,7 @@ test("SSE text fragments form one semantic block for native RPC/Broker extractio
 });
 
 for (const scenario of ["truncated", "malformed", "unknown_finish", "rate_limit", "cancelled", "foreign_route"] as const) {
- test(`Google provider rejects ${scenario} without executable tools or success terminal`, async () => {
+ streamTest(`Google provider rejects ${scenario} without executable tools or success terminal`, async () => {
   let calls = 0; const controller = new AbortController();
   const provider = fixtureStream([definition], { fetch: (async () => {
    calls++;

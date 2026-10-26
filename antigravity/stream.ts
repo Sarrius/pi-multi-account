@@ -1,11 +1,16 @@
 /** Antigravity native stream; protocol reference: LICENSE.reference. */
 import { randomUUID } from "node:crypto";
-import { createProvider, createAssistantMessageEventStream, collapseSystemMessages, getCurrentTools,
- getCurrentSystemPrompt, type Model, type Api, type AssistantMessage, type SimpleStreamOptions,
- type TranscriptContext, type ToolCall, type OAuthAuth } from "@earendil-works/pi-ai";
+import { createProvider, createAssistantMessageEventStream,
+ type Model, type Api, type AssistantMessage, type ToolCall, type OAuthAuth } from "@earendil-works/pi-ai";
+import { collapseSystemMessages, getCurrentTools, getCurrentSystemPrompt, requireNativeTranscript,
+ type NativeContext as TranscriptContext, type NativeStreamOptions as SimpleStreamOptions } from "../google-transport/native.ts";
 // Resolve the public import export explicitly: the host's legacy jiti prefix alias
 // otherwise treats unknown pi-ai subpaths as children of compat.js.
-const loadGoogleHelpers = () => import(new URL("./api/google-shared.js", import.meta.resolve("@earendil-works/pi-ai/compat")).href) as Promise<typeof import("@earendil-works/pi-ai/api/google-shared")>;
+const loadGoogleHelpers = () => import(new URL("./api/google-shared.js", import.meta.resolve("@earendil-works/pi-ai/compat")).href) as Promise<typeof import("@earendil-works/pi-ai/api/google-shared") & {
+ usesGoogleThinkingLevel(model: Model<"google-generative-ai">): boolean;
+ toGoogleThinkingLevel(level: "minimal" | "low" | "medium" | "high"): string;
+ getDisabledGoogleThinkingConfig(model: Model<"google-generative-ai">): unknown;
+}>;
 import { createGoogleReplayCache } from "../google-transport/replay.ts";
 import { events } from "../google-transport/sse.ts";
 import { operationSignal, record, cancellable } from "../google-transport/http.ts";
@@ -17,6 +22,7 @@ export function createAntigravityStream(models: readonly Model<Api>[], options: 
  oauth: OAuthAuth;
  beforeRequest?: (model: Model<Api>, request: SimpleStreamOptions, signal: AbortSignal) => Promise<void>;
 }) {
+ requireNativeTranscript();
  const api = ag.ID, baseUrl = ag.BASE;
  const id = options.id ?? api;
  if (!/^google-antigravity(?:-account-[1-9]\d*)?$/.test(id)) throw new Error("Invalid Antigravity slot");
@@ -189,7 +195,7 @@ export function createAntigravityStream(models: readonly Model<Api>[], options: 
   })();
   return stream;
  };
- return createProvider<Api>({ id, name: "Google Antigravity (unofficial subscription)", baseUrl,
+ return Object.assign(createProvider<Api>({ id, name: "Google Antigravity (unofficial subscription)", baseUrl,
   auth: { oauth: { ...oauth, async toAuth(credential) { options.assertConfiguration?.(); return oauth.toAuth(credential); } } },
-  models: definitions, api: { stream: transport, streamSimple: transport } });
+  models: definitions, api: { stream: transport, streamSimple: transport } }), { streamSimple: transport });
 }

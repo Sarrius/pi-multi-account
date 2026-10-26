@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import type { AssistantMessage, TranscriptContext } from "@earendil-works/pi-ai";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { NativeContext as TranscriptContext } from "./native.ts";
 
 /** Parent-only, bounded native replay receipts. Never accepts private metadata from children. */
 export function createGoogleReplayCache(now = Date.now) {

@@ -13290,9 +13290,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			} });
 			const oauth = provider.auth.oauth!;
 			const login = oauth.login.bind(oauth);
-			oauth.login = async (interaction, options) => {
-				const credential = rejectDuplicateLogin(id, await login(interaction, options));
-				interaction.signal.throwIfAborted();
+			oauth.login = async (...args: Parameters<typeof login>) => {
+				const credential = rejectDuplicateLogin(id, await login(...args));
+				args[0].signal.throwIfAborted();
 				const number = id === base ? 1 : Number(id.slice(id.lastIndexOf("-") + 1));
 				if (number < config.maxAccountsPerProvider) register(`${base}-account-${number + 1}`);
 				return credential;
