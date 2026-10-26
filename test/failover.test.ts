@@ -10351,6 +10351,19 @@ test("a 402 'out of credits' refusal is actionable, not unhandled", async () => 
 	);
 });
 
+test("Antigravity model quota does not bench unrelated model quotas on the same account", async () => {
+ const provider = "google-antigravity", model = "gemini-4-argon-high";
+ const t = setup({ accounts: { [provider]: { type: "oauth", access: "ag-token", refresh: "ag-refresh" },
+  anthropic: { type: "oauth", access: "a-token", refresh: "a-refresh" } },
+  current: { provider, id: model }, hostModelsByProvider: { [provider]: [model, "gemini-3.8-flash-high"] } });
+ await t.fire("session_start");
+ await finishError(t, provider, model, `Antigravity model quota exhausted: ${model}; no credit overage request sent`);
+ const state = t.readState();
+ assert.equal(state.exhaustedUntilByProvider?.[provider] ?? 0, 0);
+ assert.ok((state.exhaustedUntilByModel?.[`${provider}/${model}`] ?? 0) > Date.now(), JSON.stringify({ state, switches: t.rec.setModels, notices: t.rec.notifies }));
+ assert.equal(state.exhaustedUntilByModel?.[`${provider}/gemini-3.8-flash-high`] ?? 0, 0);
+});
+
 test("a provider that is out of credits is benched, so failover cannot land back on it", async () => {
 	// Failing over once is not enough: openrouter was also the configured fallback target, so the
 	// next switch chose it again, it refused again, and the loop closed. It has to carry a

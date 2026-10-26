@@ -1,0 +1,54 @@
+# Google Antigravity subscription (unofficial, opt-in)
+
+This is distinct from the `google` API-key provider. The experimental `google-code-assist` integration has been removed, including its login, configuration flag and Broker admission. Existing credentials are not deleted or migrated. Shared callback/HTTP/SSE/replay utilities live in `google-transport/`; the Antigravity stream lives in `antigravity/stream.ts`.
+
+Google explicitly prohibits third-party access and warns of suspension/termination: https://antigravity.google/docs/faq/ . Login asks for explicit risk acceptance. This adapter is not Google-approved. Successful offline checks do not establish real account compatibility.
+
+## Enable and sign in
+
+Use an updated local build on Pi 1.1+:
+
+```json
+{
+  "antigravitySubscription": true
+}
+```
+
+Merge these fields into `~/.pi/agent/provider-failover.json`, preserving other settings.
+
+OAuth application credentials are **not shipped in source or the package**. Before login or token refresh, provide the client ID and client secret you are authorized to use in `~/.pi/agent/antigravity-oauth-client.json`, outside every Git repository, owned by your OS user and with permissions `0600`. Its JSON fields are `clientId` and `clientSecret`; never paste real values into issues, commits, command-line arguments or logs. An absolute `PI_ANTIGRAVITY_OAUTH_CLIENT_FILE` may select another private file. Symlinks, group/world-readable files, malformed data and missing configuration fail closed; there is no built-in or network-downloaded fallback. The configured client must support the callback below and the Antigravity service; arbitrary Google Cloud OAuth clients are not guaranteed service eligibility. Existing refresh tokens remain bound to the application client used to obtain them: changing the client configuration is not credential migration. The extension never writes this configuration into auth.json or model metadata.
+
+Then start a fresh Pi process. Run `/login google-antigravity`. The menu name is **Google Antigravity (unofficial subscription)**. Browser callback: localhost:51121/oauth-callback. On a remote terminal, paste the full callback URL; bare codes are rejected.
+
+The flow validates OAuth state/PKCE, resolves a stable Google account identity, obtains an Antigravity project, and fetches the account's actual available-model catalog. First-use setup has separate consent. It never invents a project, repeats an uncertain onboarding POST or substitutes Gemini CLI/API-key credentials. Pending onboarding is polled only if Google supplies a validated operation name. If not, it stops with an explicit pending-state error rather than guessing or retrying the mutation.
+
+Credentials and a whitelisted model/quota snapshot are persisted by native Pi credential storage, not by this extension writing auth.json. Numbered aliases use `google-antigravity-account-N`; duplicate Google account IDs are rejected. Do not import tokens from the official application.
+
+## Models and quotas
+
+- No static Google API catalog is used. Only supported chat model IDs from the account response are exposed: Gemini, Claude and GPT-OSS; disabled/image-only/unsupported entries are omitted. Missing context metadata does not produce fabricated models.
+- Server context/output metadata is retained. When output metadata is absent, the local output cap is conservatively 8,192 (or context size if smaller), not a claim about the service's true maximum. Thinking requiring more output than this is refused rather than silently lowered.
+- `/antigravity` displays cached per-model quota observations and their timestamps. In this service's quotaInfo, a valid reset with an omitted numeric remainingFraction represents protobuf-default zero (confirmed on an exhausted Argon account). Missing quotaInfo or malformed values stay unknown.
+- `/antigravity refresh` requests new account catalog/quota evidence through the native model runtime. It does not run inference. A failed refresh retains prior data and reports that it may be stale.
+- Do not interpret equal percentages/reset times as proof of a shared quota bucket. Argon and other model observations are not collapsed into guessed family pools.
+- Before inference the exact account/model is checked against recent discovery. Known zero quota prevents dispatch; model-level quota refusals do not bench unrelated models in Multi Account. Expired snapshots are refreshed before dispatch.
+- The request does not enable AI credit types (`enabled_credit_types: []`) and never falls back to a billed Google API. No automatic retries. This is a request-level boundary, not independent verification of Google account billing/settings or server behavior; keep official-app AI Credit Overages set to Never.
+- API, destination, header and static-model overrides for this provider in models.json are rejected.
+
+## Transport and Broker
+
+Gemini-native message conversion handles Google-hosted Gemini/Claude/GPT-OSS; Claude uses the native helper's parameters schema and signature-aware tool/result representation. Signed tool calls are withheld until stream framing and terminal completion validate. Parent-only canonical replay receipts remain bounded and route/account/model/session bound. Live support for every advertised model is not established by catalog visibility or synthetic replay.
+
+Broker classifies Antigravity as a mixed included subscription, not an API-key or pay-as-you-go route. Hosted Claude/GPT retain their actual developer provenance while becoming eligible as included subscription models; current-generation evidence, quality, actual qualification and leases remain mandatory. Gemini Argon, Pro, Flash and Flash-Lite are separate product families for generation comparisons. A newer Argon does not retire Flash.
+
+Concurrency remains shared per account: model quota scope does not manufacture additional slots. A model's 429 cools only that resource, while authentication failures remain account-scoped. On startup, an old account-wide Antigravity quota cooldown is reattributed only when exact durable cooldown events identify the affected resources; their cooldowns and dispatch-failure evidence are preserved. Missing/inconsistent migration evidence leaves the old breaker intact.
+
+## Evidence and remaining acceptance
+
+Synthetic tests exercise full OAuth/project/catalog paths, protocol separation, no-project setup, exact account binding, native Gemini/Claude signed tool replay, zero-quota refusal, stale refresh, refresh races, no credit opt-in and no credential migration. The real installed Pi CLI lists the synthetic account catalog under network-denied isolated startup. These are offline results.
+
+Owner browser login and live account catalog/quotas are verified. Fresh installed Pi 1.3 processes passed real isolated Broker read/tool/result/final canaries for `gemini-3.8-flash-low`, `claude-sonnet-5-5-low` and `gpt-oss-120b-medium`. Argon was not invoked after its exhaustion was confirmed. This establishes these concrete protocol paths, not universal model/effort compatibility, quota headroom or a reliability rate. Each process/route/effort still requires current Broker qualification. Existing Pi processes must be restarted or reloaded to adopt changed code; no new Google login is needed. An error must be investigated from bounded stage/shape evidence, not followed by another guessed provider/tier substitution.
+
+## Source
+
+Protocol reference (MIT): https://github.com/NoeFabris/opencode-antigravity-auth/tree/f212f7eb01aa904b5985895cf93f6d3074c5bc6d . License retained in `antigravity/LICENSE.reference`. Only pinned 2.24.0 wire-compatibility metadata is used; OAuth application credentials must be supplied privately, not copied into the package; this is not a claim an official client is running. Its hardcoded fallback project, repeated onboarding POST loop, inferred family quota aggregation and injected system prompt are **not** adopted. Message/tool conversion and auth persistence are native Pi facilities.
