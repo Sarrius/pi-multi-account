@@ -109,6 +109,10 @@ test, not a one-off patch.
 
 Optional companion validation: `test/goal-quota-recovery.integration.test.ts` exercises a supplied Goal extension through the real Pi SDK. It is explicitly skipped without `PI_GOAL_TEST_ENTRY`; it is not evidence that every third-party Goal version supports this integration.
 
+| 81 | **Native model selection gets one actual attempt despite stale preflight cooldowns.** A successful response clears the legacy cooldown; a fresh provider refusal still triggers normal recovery. | `native model selection retries DeepSeek through both preflights despite a stale cooldown` · `a manual model selection does not disable failover for a real limit` |
+| 82 | **Unmanaged API-key refusals distinguish credentials from quota.** Explicit invalid-key failures are fingerprint-bound; replacement clears them, generic 401 stays transient, and actual quota retains its cooldown. | `unmanaged API-key auth rejection is credential-bound, not a quota cooldown` · `unmanaged provider retains recoverable/auth versus quota distinction: 401 unauthorized` · `unmanaged provider retains recoverable/auth versus quota distinction: 429 quota exceeded` |
+| 83 | **Antigravity projects literal tool schemas without mutating the validation schema.** Nested constants and numeric enums use protobuf-compatible wire values, property names remain intact, and error diagnostics never echo raw response messages. | `Antigravity translates nested literal schemas to protobuf enums without mutating tools` · `Antigravity reports safe 400 schema diagnostics without response secrets` |
+
 ## How to keep this honest
 
 - **Every bug fix adds a row here and a test.** A fix without a locking test is not done.

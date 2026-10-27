@@ -15,6 +15,7 @@ import { createGoogleReplayCache } from "../google-transport/replay.ts";
 import { events } from "../google-transport/sse.ts";
 import { operationSignal, record, cancellable } from "../google-transport/http.ts";
 import * as ag from "./transport.ts";
+import { antigravityParameters } from "./schema.ts";
 
 /** Callers must supply reviewed model metadata; no fabricated entitlement/catalog. */
 export function createAntigravityStream(models: readonly Model<Api>[], options: {
@@ -80,7 +81,7 @@ export function createAntigravityStream(models: readonly Model<Api>[], options: 
     }
     const payload = { contents: convertMessages(nativeModel, normalized),
      systemInstruction: { parts: [{ text: getCurrentSystemPrompt(normalized.messages) }] },
-     tools: convertTools(tools, true), generationConfig,
+     tools: convertTools(tools.map(tool => ({ ...tool, parameters: antigravityParameters(tool.parameters) as typeof tool.parameters })), true), generationConfig,
      ...(request.toolChoice ? { toolConfig: { functionCallingConfig: { mode: request.toolChoice === "none" ? "NONE" : "AUTO" } } } : {}) };
     const replacement = await cancellable(Promise.resolve(request.onPayload?.(payload, model)), signal);
     options.assertConfiguration?.(); signal.throwIfAborted();
@@ -93,7 +94,7 @@ export function createAntigravityStream(models: readonly Model<Api>[], options: 
     const response = await ag.request(options.fetch ?? fetch, ag.STREAM, { project:projectId, model:model.id, request:content,
        requestType:"agent", userAgent:"antigravity", requestId:`agent-${randomUUID()}`, enabled_credit_types:[] }, signal, authHeaders);
     await cancellable(Promise.resolve(request.onResponse?.({ status: response.status, headers: Object.fromEntries(response.headers) }, model)), signal);
-    if (!response.ok) { await response.body?.cancel(); throw new Error(`Antigravity HTTP ${response.status}`); }
+    if (!response.ok) throw await ag.responseError(response, signal);
     if (!response.body) throw new Error("Missing Google stream body");
     stream.push({ type: "start", partial: message });
     let terminal: string | undefined;

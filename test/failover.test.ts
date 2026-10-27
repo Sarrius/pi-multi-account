@@ -10400,6 +10400,55 @@ test("a provider that is out of credits is benched, so failover cannot land back
 	);
 });
 
+test("native model selection retries DeepSeek through both preflights despite a stale cooldown", async () => {
+	const model = { provider: "deepseek", id: "deepseek-flash" };
+	const t = setup({ current: model,
+		accounts: { ...TWO_ACCOUNTS, deepseek: { type: "api_key", key: "fixture-key" } },
+		hostModelsByProvider: { deepseek: [model.id] },
+		seedCooldownsMsFromNow: { deepseek: 6 * 60 * 60 * 1000 },
+		config: { childProxy: false, autoContinue: false } });
+	try {
+		await t.fire("model_select", { model, source: "set" });
+		const before = t.rec.setModels.length;
+		await t.input("retry the selected model");
+		await t.fire("before_agent_start", {});
+		assert.equal(t.rec.setModels.length, before, "manual native selection must reach the provider");
+		assert.equal(t.ctx.model.provider, "deepseek");
+		await t.fire("message_end", { message: { role: "assistant", provider: model.provider, model: model.id, stopReason: "stop", content: [{ type: "text", text: "OK" }], timestamp: Date.now() } });
+		assert.equal(t.readState().exhaustedUntilByProvider?.deepseek, undefined, "successful retry clears the legacy cooldown");
+	} finally { await t.fire("session_shutdown"); }
+});
+
+for (const error of ["401 unauthorized", "429 quota exceeded"]) test(`unmanaged provider retains recoverable/auth versus quota distinction: ${error}`, async () => {
+	const model = { provider: "deepseek", id: "deepseek-flash" };
+	const t = setup({ current: model,
+		accounts: { ...TWO_ACCOUNTS, deepseek: { type: "api_key", key: "fixture-key" } },
+		hostModelsByProvider: { deepseek: [model.id] }, config: { childProxy: false, autoContinue: false } });
+	try {
+		await finishError(t, model.provider, model.id, error);
+		assert.equal(t.readState().invalidatedByProvider?.deepseek, undefined);
+		const remaining = t.readState().exhaustedUntilByProvider.deepseek - Date.now();
+		if (error.startsWith("401")) { assert.ok(remaining > 0 && remaining <= 60000); assert.doesNotMatch(t.rec.notifies.join("\n"), /out of quota/); }
+		else assert.ok(remaining > 5 * 60 * 60 * 1000, "actual quota refusal must keep its long cooldown");
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("unmanaged API-key auth rejection is credential-bound, not a quota cooldown", async () => {
+	const model = { provider: "deepseek", id: "deepseek-flash" };
+	const accounts = { ...TWO_ACCOUNTS, deepseek: { type: "api_key", key: "fixture-old" } };
+	const t = setup({ current: model, accounts, hostModelsByProvider: { deepseek: [model.id] },
+		config: { childProxy: false, autoContinue: false } });
+	try {
+		await finishError(t, model.provider, model.id, '401: {"message":"Authentication Fails, Your api key: ****test is invalid (request_id: fixture)"}');
+		assert.ok(t.readState().invalidatedByProvider?.deepseek, "auth rejection must retain the rejected credential fingerprint");
+		assert.equal(t.readState().exhaustedUntilByProvider?.deepseek, undefined);
+		assert.doesNotMatch(t.rec.notifies.join("\n"), /out of quota/);
+		writeFileSync(AUTH, JSON.stringify({ ...accounts, deepseek: { type: "api_key", key: "fixture-new" } }));
+		await t.command("refresh");
+		assert.equal(t.readState().invalidatedByProvider?.deepseek, undefined, "replacement key clears auth refusal");
+	} finally { await t.fire("session_shutdown"); }
+});
+
 test("a manually chosen account survives BOTH preflights of the same message", async () => {
 	// Pi runs the readiness preflight twice for one user message: once on `input`, then again in
 	// `before_agent_start`. The one-attempt reprieve was consumed by the first, so the second saw

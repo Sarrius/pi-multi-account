@@ -77,6 +77,33 @@ for(const modelId of ["gemini-4-argon-high","claude-opus-4-6-thinking"])test(`na
  assert.match(JSON.stringify(bodies[1]),/RESULT/);assert.match(JSON.stringify(bodies[1]),/c2lnbmF0dXJl/);assert.equal(bodies.length,2);
 });
 
+test("Antigravity reports safe 400 schema diagnostics without response secrets", async()=>{
+ const p=antigravityProvider({credential,fetch:(async()=>Response.json({error:{status:"INVALID_ARGUMENT",message:'Unknown name "const" at request.tools[0]. PRIVATE_TOKEN PRIVATE_PROMPT'}},{status:400})) as typeof fetch});
+ const result=await p.streamSimple(p.getModels()[0],{messages:[{role:"user",content:"fixture",timestamp:0}]} as any,{apiKey:credential.access,headers:{[PROJECT_HEADER]:credential.projectId}}).result();
+ assert.equal(result.stopReason,"error");
+ assert.match(result.errorMessage!,/HTTP 400.*INVALID_ARGUMENT.*tool schema/);
+ assert.doesNotMatch(result.errorMessage!,/PRIVATE|Unknown name/);
+});
+
+test("Antigravity translates nested literal schemas to protobuf enums without mutating tools", async()=>{
+ const bodies:any[]=[];
+ const p=antigravityProvider({credential,fetch:(async(_url,init)=>{
+  bodies.push(JSON.parse(String(init?.body)));
+  return new Response('data: {"response":{"candidates":[{"content":{"parts":[{"text":"OK"}]},"finishReason":"STOP"}]}}\n\n');
+ }) as typeof fetch});
+ const parameters={type:"object",properties:{approval:{type:"object",properties:{schemaVersion:{type:"integer",const:1},decision:{type:"string",const:"approve"},const:{type:"string",const:"literal-property"}}},items:{type:"array",items:{anyOf:[{type:"string",const:"a"},{type:"integer",enum:[1,2]}]}}}};
+ const before=structuredClone(parameters);
+ const m=p.getModels()[0];
+ const result=await p.streamSimple(m,{messages:[{role:"system",content:"fixture",timestamp:0,toolsAdded:[{name:"fixture",description:"fixture",parameters}]},{role:"user",content:"OK",timestamp:1}]} as any,{apiKey:credential.access,headers:{[PROJECT_HEADER]:credential.projectId}}).result();
+ assert.equal(result.stopReason,"stop",result.errorMessage);
+ const schema=bodies[0].request.tools[0].functionDeclarations[0].parameters;
+ assert.deepEqual(schema.properties.approval.properties.schemaVersion,{type:"integer",enum:["1"]});
+ assert.deepEqual(schema.properties.approval.properties.decision,{type:"string",enum:["approve"]});
+ assert.deepEqual(schema.properties.approval.properties.const,{type:"string",enum:["literal-property"]});
+ assert.deepEqual(schema.properties.items.items.anyOf,[{type:"string",enum:["a"]},{type:"integer",enum:["1","2"]}]);
+ assert.deepEqual(parameters,before);
+});
+
 test("catalog keeps distinct per-model quota; no family buckets or private payload",()=>{
  const data=structuredClone(catalog) as any;data.models["gemini-3.8-flash"]={maxTokens:100000,quotaInfo:{remainingFraction:.1},systemPrompt:"PRIVATE"};
  const result=parseCatalog(data);assert.equal(result.length,3);assert.deepEqual(result.map(x=>x.remaining),[.8,.3,.1]);assert.ok(!JSON.stringify(result).includes("PRIVATE"));
