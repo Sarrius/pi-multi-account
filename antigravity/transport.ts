@@ -1,6 +1,6 @@
 // Protocol reference: NoeFabris/opencode-antigravity-auth, MIT,
 // f212f7eb01aa904b5985895cf93f6d3074c5bc6d. See LICENSE.reference.
-import { cancellable, token } from "../google-transport/http.ts";
+import { cancellable, token, jsonResponse, record } from "../google-transport/http.ts";
 export const ID = "google-antigravity";
 export const BASE = "https://daily-cloudcode-pa.googleapis.com";
 export const VERSION = "2.24.0";
@@ -22,6 +22,19 @@ export function headers(access: string, supplied: Record<string, string | null> 
   if (value !== null) out.set(key,value);
  }
  return out;
+}
+/** Decode bounded error evidence, but expose only fixed labels: Google messages can echo prompts. */
+export async function responseError(response: Response, signal: AbortSignal): Promise<Error> {
+ let detail = "";
+ try {
+  const data = await jsonResponse(new Response(response.body), signal, 16384);
+  if (record(data) && record(data.error)) {
+   const status = data.error.status;
+   if (typeof status === "string" && ["INVALID_ARGUMENT", "UNAUTHENTICATED", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "UNAVAILABLE"].includes(status)) detail = ` (${status})`;
+   if (response.status === 400 && typeof data.error.message === "string" && /request\.tools\[/.test(data.error.message)) detail += ": provider rejected tool schema";
+  }
+ } catch { signal.throwIfAborted(); /* Status remains useful for malformed/oversized responses. */ }
+ return new Error(`Antigravity HTTP ${response.status}${detail}`);
 }
 export async function request(fetchImpl: typeof fetch, url: string, body: unknown, signal: AbortSignal, hdr: Headers): Promise<Response> {
  if (![STREAM,...["loadCodeAssist","onboardUser","fetchAvailableModels"].map(m=>`${BASE}/v1internal:${m}`)].includes(url)) throw new Error("Foreign Antigravity destination rejected");

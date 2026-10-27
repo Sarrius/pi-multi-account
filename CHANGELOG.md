@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [1.27.1] — 2026-10-27
+
+### Fixed
+
+- Native `/model` selections now receive the same one-message preflight reprieve as `/multi-account switch`, allowing an explicitly selected provider to retry after a stale cooldown.
+- Unmanaged API-key authentication failures are no longer mislabeled as quota exhaustion: explicit invalid-key refusals are credential-bound and recover when the key is replaced; generic 401s retain transient failure handling and actual quota refusals retain their cooldowns.
+- Antigravity translates nested tool-schema literals and numeric enums to Cloud Code Assist's protobuf schema representation, fixing HTTP 400 with the standard delegation repair tools. Error diagnostics identify rejected tool schemas without exposing provider response text.
+
 ## [1.27.0] — 2026-10-26
 
 ### Added

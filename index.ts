@@ -1090,7 +1090,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.27.0";
+const VERSION = "1.27.1";
 function sourceFingerprint(): string {
 	try {
 		const root = dirname(fileURLToPath(import.meta.url));
@@ -12908,6 +12908,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// Cancel stale pending work; if the selected model then returns a real limit, normal
 		// failover still applies to that completed request.
 		claimUserControl("manual model selection");
+		// Native /model must get the same one-message reprieve as /multi-account switch.
+		// A cached refusal is not evidence that the user's newly saved key still fails.
+		pinManualChoice(model.provider);
 		if (queuedUserInputs.length > 0) {
 			runBackground("manual model selection queued input resume", ctx, () =>
 				attemptQueuedInputResume(ctx),
@@ -13084,12 +13087,25 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// how a session ended up answering every user message with the same "out of credits"
 			// error while live accounts sat unused. Transient blips and model-specific errors keep
 			// the light touch, because those genuinely are momentary or model-scoped.
+			if (failureKind === "auth" && !isRefreshable(provider)) {
+				// API-key rejection belongs to this credential, not a six-hour quota forecast.
+				// Persist its fingerprint so replacement also recovers across process restarts.
+				// DeepSeek places the masked key between "api key:" and "is invalid".
+				const explicitInvalidKey = /api[ -]?key\b[^\r\n]{0,256}\bis invalid\b/i.test(errorText);
+				const killed = explicitInvalidKey
+					? (markInvalid(provider, errorText), true)
+					: markAuthFailure(provider, errorText);
+				await switchToFallback(ctx, failedModel,
+					`external provider authentication failed: ${errorText.slice(0, 100)}`, killed ? 0 : config.transientCooldownMs,
+					{ scope: "provider" });
+				return;
+			}
 			const accountLevel = failureKind === "auth" || (failureKind === "limit" && !/^google-antigravity(?:-account-\d+)?$/.test(provider));
 			if (accountLevel || failureKind === "model" || failureKind === "limit") {
 				await switchToFallback(
 					ctx,
 					failedModel,
-					`external provider out of quota: ${errorText.slice(0, 100)}`,
+					`external provider ${failureKind === "auth" ? "authentication failed" : failureKind === "model" ? "model unavailable" : "out of quota"}: ${errorText.slice(0, 100)}`,
 					accountLevel ? config.cooldownMs : config.transientCooldownMs,
 					{
 						scope: accountLevel ? "provider" : "model",
