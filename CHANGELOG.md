@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [Unreleased]
+
+### Added
+
+- Typing `/multi-account ` (or `/failover`, `/provider-failover`) now autocompletes subcommands with a one-line description each, and completes arguments for `switch`, `exclude`, `include`, `revive`, `add`, `remove`, `limits`, `accounts`, `priority`, `log` and `only-active`.
+
 ## [1.27.1] — 2026-10-27
 
 ### Fixed
