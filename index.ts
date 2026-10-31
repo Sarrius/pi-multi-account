@@ -26,6 +26,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createPayloadStream, PAYLOAD_ADMISSION } from "./provider-payload-stream.ts";
+import { completeCommandArguments } from "./command-completions.ts";
 import { recoveryProjectionSupported } from "./recovery-session.ts";
 import { createRecoveryArchives, RECOVERY_DETAIL } from "./recovery-archive.ts";
 import { recoveryTools, RECOVERY_TOOL_NAMES } from "./recovery-tools.ts";
@@ -10587,6 +10588,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	for (const name of ["multi-account", "provider-failover", "failover"]) {
 		pi.registerCommand(name, {
 			description: "Manage automatic multi-account failover & rotation",
+			getArgumentCompletions: prefix => completeCommandArguments(prefix, { rotation }),
 			handler: safeHandleCommand,
 		});
 	}

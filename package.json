@@ -55,6 +55,7 @@
     "config-file-transaction.ts",
     "model-catalog.ts",
     "model-pins.ts",
+    "command-completions.ts",
     "openai-chatgpt.ts",
     "google-transport",
     "antigravity",
