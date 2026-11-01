@@ -877,6 +877,30 @@ function setup(opts: {
 	};
 }
 
+test("startup awaits an offline host registry refresh before continuing after slot publication", async () => {
+	const t = setup({ current: { provider: "openai-codex-account-2", id: "gpt-5.5" } });
+	let entered = false;
+	let release!: () => void;
+	const barrier = new Promise<void>(resolve => { release = resolve; });
+	t.ctx.modelRegistry.refresh = async (options: unknown) => {
+		assert.deepEqual(options, { allowNetwork: false });
+		entered = true;
+		await barrier;
+	};
+	let settled = false;
+	const startup = t.fire("session_start", {}).then(() => { settled = true; });
+	try {
+		for (let i = 0; i < 100 && !entered && !settled; i++) await new Promise(resolve => setTimeout(resolve, 2));
+		assert.equal(entered, true, "publication must explicitly refresh the host's cached provider configuration");
+		assert.equal(settled, false, "startup must await the refresh, not race its first request");
+		await t.fire("session_shutdown", {});
+		release();
+		await startup;
+		assert.equal(t.rec.notifies.some((message: string) => message.includes("loaded (")), false,
+			"a refresh resolving after shutdown cannot continue startup");
+	} finally { release(); await startup; await t.fire("session_shutdown", {}); }
+});
+
 test("account picker filters only its UI and uses the model's native thinking default", async () => {
 	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" }, modelSetThinkingLevel: "low", thinkingLevel: "high" });
 	t.ctx.hasUI = true;
