@@ -4,11 +4,11 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-## [Unreleased]
+## [1.28.0] — 2026-11-01
 
 ### Added
 
-- Typing `/multi-account ` (or `/failover`, `/provider-failover`) now autocompletes subcommands with a one-line description each, and completes arguments for `switch`, `exclude`, `include`, `revive`, `add`, `remove`, `limits`, `accounts`, `priority`, `log` and `only-active`.
+- Typing `/multi-account ` (or `/failover`, `/provider-failover`) now autocompletes subcommands with a one-line description each, and completes arguments for `switch`, `exclude`, `include`, `revive`, `add`, `remove`, `limits`, `accounts`, `priority`, `log` and `only-active`. Recovery suggestions use excluded/invalidated targets rather than the healthy rotation. Thanks to @kaiserbh (#105).
 
 ### Fixed
 
