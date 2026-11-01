@@ -100,7 +100,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-ai": "1.4.0",
     "@earendil-works/pi-coding-agent": "1.1.0",
     "@types/node": "^22.20.4",
     "typescript": "^6.0.3"
