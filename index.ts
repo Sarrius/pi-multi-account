@@ -3564,7 +3564,7 @@ const MINIMAL_ANTHROPIC_OAUTH_PROMPT = [
 ].join("\n");
 const CLAUDE_CODE_IDENTITY_PREFIX =
 	"You are Claude Code, Anthropic's official CLI";
-const CLAUDE_CODE_VERSION = "2.1.296";
+const CLAUDE_CODE_VERSION = "2.1.316";
 const BILLING_HEADER_SALT = "59cf53e54c78";
 const BILLING_HEADER_POSITIONS = [4, 7, 20] as const;
 const CLAUDE_CODE_ENTRYPOINT = "sdk-cli";
@@ -12406,6 +12406,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		await publishProxiedSlots(ctx);
 		if (!config.childProxy) activateSharedProxy();
 		publishOwnedNativeAliases(ctx);
+		// Publication changes models.json/auth.json after Pi loaded its provider config.
+		// Registration's background refresh is not a startup barrier: await the final
+		// disk snapshot before a placeholder-backed route can serve its first request.
+		await ctx.modelRegistry.refresh?.({ allowNetwork: false });
+		if (sessionClosed || chainEpoch !== startEpoch) return;
 		// Not installed → silent skip (refreshCursorSlots warns only on the explicit path).
 		if (config.includeCursor) await refreshCursorSlots(readAuthFile(), ctx);
 		applyOnlyActiveFilter(ctx);

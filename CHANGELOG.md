@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Typing `/multi-account ` (or `/failover`, `/provider-failover`) now autocompletes subcommands with a one-line description each, and completes arguments for `switch`, `exclude`, `include`, `revive`, `add`, `remove`, `limits`, `accounts`, `priority`, `log` and `only-active`.
 
+### Fixed
+
+- Await an offline host registry refresh after startup slot publication, with shutdown/ownership rechecking, instead of relying on background registration refreshes (#101).
+- Update the Claude Code OAuth billing header version to 2.1.316 (#98).
+
 ## [1.27.1] — 2026-10-27
 
 ### Fixed
