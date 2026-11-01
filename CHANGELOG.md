@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [Unreleased]
+
+### Fixed
+
+- Await an offline host registry refresh after startup slot publication, with shutdown/ownership rechecking, instead of relying on background registration refreshes (#101).
+- Update the Claude Code OAuth billing header version to 2.1.316 (#98).
+
 ## [1.27.1] — 2026-10-27
 
 ### Fixed

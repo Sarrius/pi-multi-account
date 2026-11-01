@@ -113,6 +113,8 @@ Optional companion validation: `test/goal-quota-recovery.integration.test.ts` ex
 | 82 | **Unmanaged API-key refusals distinguish credentials from quota.** Explicit invalid-key failures are fingerprint-bound; replacement clears them, generic 401 stays transient, and actual quota retains its cooldown. | `unmanaged API-key auth rejection is credential-bound, not a quota cooldown` · `unmanaged provider retains recoverable/auth versus quota distinction: 401 unauthorized` · `unmanaged provider retains recoverable/auth versus quota distinction: 429 quota exceeded` |
 | 83 | **Antigravity projects literal tool schemas without mutating the validation schema.** Nested constants and numeric enums use protobuf-compatible wire values, property names remain intact, and error diagnostics never echo raw response messages. | `Antigravity translates nested literal schemas to protobuf enums without mutating tools` · `Antigravity reports safe 400 schema diagnostics without response secrets` |
 
+| 84 | **Startup awaits the host's offline provider-config refresh after publishing slots.** A first request cannot depend on an unawaited registration refresh, and shutdown invalidates startup while that refresh is pending. | `startup awaits an offline host registry refresh before continuing after slot publication` · `fresh Codex startup authenticates its published placeholder through the host registry` |
+
 ## How to keep this honest
 
 - **Every bug fix adds a row here and a test.** A fix without a locking test is not done.
