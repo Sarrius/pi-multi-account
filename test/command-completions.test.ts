@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { completeCommandArguments, type CompletionItem } from "../command-completions.ts";
 
 const rotation = ["anthropic", "anthropic-account-2", "pi-sub-anthropic"];
@@ -67,7 +69,9 @@ test("nothing is offered for commands without arguments, unknown commands or ext
 });
 
 test("native Pi completion replaces the entire subcommand tail", async () => {
-	const { CombinedAutocompleteProvider } = await import("@earendil-works/pi-tui");
+	// Resolve through the host: compatibility installs may keep pi-tui nested.
+	const hostRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+	const { CombinedAutocompleteProvider } = await import(pathToFileURL(hostRequire.resolve("@earendil-works/pi-tui")).href);
 	for (const name of ["multi-account", "provider-failover", "failover"]) {
 		const provider = new CombinedAutocompleteProvider([{ name, description: "Accounts", getArgumentCompletions: complete }], process.cwd());
 		const line = `/${name} switch anthropic-a`;
