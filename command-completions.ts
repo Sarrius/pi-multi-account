@@ -6,6 +6,8 @@ export interface CompletionItem {
 
 export interface CompletionContext {
 	rotation: readonly string[];
+	invalidated?: readonly string[];
+	excluded?: readonly string[];
 }
 
 interface Choice {
@@ -61,15 +63,16 @@ const SUBCOMMANDS: readonly Subcommand[] = [
 		name: "remove",
 		description: "Log an account out by deleting its credential",
 		takesArgument: true,
-		choices: context => [...families(), ...accounts(context)],
+		choices: context => [...new Map([...families(), ...accounts(context)].map(choice => [choice.value, choice])).values()],
 	},
 	{ name: "exclude", description: "Leave an account or model out of the rotation", takesArgument: true, choices: accounts },
-	{ name: "include", description: "Put an excluded account or model back", takesArgument: true, choices: accounts },
+	{ name: "include", description: "Put an excluded account or model back", takesArgument: true,
+		choices: context => (context.excluded ?? []).map(value => ({ value, description: "Excluded account or model" })) },
 	{
 		name: "revive",
 		description: "Clear an account's invalidated state",
 		takesArgument: true,
-		choices: context => [...accounts(context), { value: "all", description: "Revive every invalidated account" }],
+		choices: context => [...(context.invalidated ?? []).map(value => ({ value, description: "Invalidated account" })), { value: "all", description: "Revive every invalidated account" }],
 	},
 	{ name: "rediscover", description: "Rescan auth.json and rebuild the rotation" },
 	{ name: "reload", description: "Reload config from disk and rediscover accounts" },
@@ -78,7 +81,7 @@ const SUBCOMMANDS: readonly Subcommand[] = [
 	{ name: "enable", description: "Turn failover on for this pi process" },
 	{ name: "disable", description: "Turn failover off for this pi process" },
 	{ name: "log", description: "Show or toggle the debug log", takesArgument: true, choices: toggle },
-	{ name: "only-active", description: "Legacy: limit the model picker to the active account", takesArgument: true, choices: toggle },
+	{ name: "only-active", description: "Legacy picker preference; use pick for current-account models", takesArgument: true, choices: toggle },
 	{ name: "clear", description: "Warning: wipe fallbacks, rotation state and numbered account logins" },
 ];
 

@@ -3,7 +3,9 @@ import test from "node:test";
 import { completeCommandArguments, type CompletionItem } from "../command-completions.ts";
 
 const rotation = ["anthropic", "anthropic-account-2", "pi-sub-anthropic"];
-const complete = (prefix: string) => completeCommandArguments(prefix, { rotation });
+const complete = (prefix: string) => completeCommandArguments(prefix, {
+	rotation, invalidated: ["dead-account"], excluded: ["excluded-account", "anthropic/hidden-model"],
+});
 const values = (items: CompletionItem[] | null) => items?.map(item => item.value);
 
 test("an empty prefix offers every subcommand with a description", () => {
@@ -25,10 +27,11 @@ test("switch offers the accounts in the rotation", () => {
 	assert.equal(complete("switch anthropic")?.[0]?.label, "anthropic");
 });
 
-test("exclude, include and revive offer the rotation and revive also offers all", () => {
+test("recovery completions offer excluded and invalidated targets absent from rotation", () => {
 	assert.deepEqual(values(complete("exclude pi")), ["exclude pi-sub-anthropic"]);
-	assert.deepEqual(values(complete("include anthropic-a")), ["include anthropic-account-2"]);
-	assert.ok(values(complete("revive "))?.includes("revive all"));
+	assert.deepEqual(values(complete("include ")), ["include excluded-account", "include anthropic/hidden-model"]);
+	assert.deepEqual(values(complete("revive ")), ["revive dead-account", "revive all"]);
+	assert.deepEqual(values(complete("remove anthropic")), ["remove anthropic", "remove anthropic-account-2"]);
 });
 
 test("limits and accounts offer refresh", () => {
@@ -61,6 +64,18 @@ test("nothing is offered for commands without arguments, unknown commands or ext
 	assert.equal(complete("status "), null);
 	assert.equal(complete("bogus "), null);
 	assert.equal(complete("switch anthropic extra"), null);
+});
+
+test("native Pi completion replaces the entire subcommand tail", async () => {
+	const { CombinedAutocompleteProvider } = await import("@earendil-works/pi-tui");
+	for (const name of ["multi-account", "provider-failover", "failover"]) {
+		const provider = new CombinedAutocompleteProvider([{ name, description: "Accounts", getArgumentCompletions: complete }], process.cwd());
+		const line = `/${name} switch anthropic-a`;
+		const suggestions = await provider.getSuggestions([line], 0, line.length, { signal: new AbortController().signal });
+		assert.ok(suggestions);
+		const applied = provider.applyCompletion([line], 0, line.length, suggestions.items[0], suggestions.prefix);
+		assert.deepEqual(applied.lines, [`/${name} switch anthropic-account-2`]);
+	}
 });
 
 test("an empty rotation offers no accounts", () => {

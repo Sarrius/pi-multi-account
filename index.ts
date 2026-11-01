@@ -10588,7 +10588,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	for (const name of ["multi-account", "provider-failover", "failover"]) {
 		pi.registerCommand(name, {
 			description: "Manage automatic multi-account failover & rotation",
-			getArgumentCompletions: prefix => completeCommandArguments(prefix, { rotation }),
+			getArgumentCompletions: prefix => completeCommandArguments(prefix, {
+				rotation,
+				invalidated: [...invalidatedByProvider.keys()],
+				excluded: [...config.excludedProviders, ...config.excludedModels],
+			}),
 			handler: safeHandleCommand,
 		});
 	}
