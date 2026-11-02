@@ -148,7 +148,16 @@ try {
   assert.equal(tools.length, 1); assert.equal(tools[0].toolName, "read");
   assert.equal(requests.length, 2);
   assert.match(JSON.stringify(requests[0]), /DIRECT_CANARY_REQUEST/); assert.match(JSON.stringify(requests[0]), /data:image\/png;base64/);
-  assert.match(JSON.stringify(requests[0].tools), /"name":"read"/);
+  // Pi 1.4 can preserve tool deltas as Responses additional_tools input items.
+  // Both native wire dialects must carry the actual callable schema, not just
+  // mention the tool in the system prompt.
+  const declaredTools = [
+    ...(requests[0].tools ?? []),
+    ...(requests[0].input ?? []).filter((item: any) => item.type === "additional_tools").flatMap((item: any) => item.tools ?? []),
+  ];
+  const declaredRead = declaredTools.find((tool: any) => tool.type === "function" && tool.name === "read");
+  assert.ok(declaredRead, "native Responses request must declare read");
+  assert.equal(declaredRead.parameters.properties.path.type, "string");
   assert.match(JSON.stringify(requests[1]), /function_call_output/); assert.match(JSON.stringify(requests[1]), /DIRECT_TOOL_RESULT_MARKER/);
   assert.match(JSON.stringify(requests[1]), /call_canary/);
 
