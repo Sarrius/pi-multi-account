@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
+## [1.28.1] — 2026-11-02
+
 ### Compatibility
 
 - Validate Pi 1.4.0 alongside supported older hosts; update development SDKs and accept native Responses `additional_tools` declarations in the image/tool/replay/cancellation canary without weakening schema checks.
