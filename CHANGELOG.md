@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
+### Compatibility
+
+- Validate Pi 1.4.0 alongside supported older hosts; update development SDKs and accept native Responses `additional_tools` declarations in the image/tool/replay/cancellation canary without weakening schema checks.
+
 ### Fixed
 
 - Resolve host-managed authentication before direct Codex catalog requests so expired OAuth tokens can refresh normally; re-read the stored credential and matching account ID instead of sending host-returned proxy placeholders. This does not change forced refresh for revoked tokens or proxy sidecars.
