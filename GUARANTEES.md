@@ -115,6 +115,8 @@ Optional companion validation: `test/goal-quota-recovery.integration.test.ts` ex
 
 | 84 | **Startup awaits the host's offline provider-config refresh after publishing slots.** A first request cannot depend on an unawaited registration refresh, and shutdown invalidates startup while that refresh is pending. | `startup awaits an offline host registry refresh before continuing after slot publication` · `fresh Codex startup authenticates its published placeholder through the host registry` |
 
+| 85 | **Direct Codex catalog probes resolve host-managed authentication before reading the stored credential.** Expired OAuth may refresh under the host's lock; only the re-read parent token and matching account ID go upstream, never a host-returned loopback placeholder. Failed/missing host authentication stops the probe without trying another getter; hosts without either getter retain the legacy path. This does not promise forced refresh of unexpired revoked tokens or proxy sidecars. | `test/codex-catalog-host-auth.test.ts` |
+
 ## How to keep this honest
 
 - **Every bug fix adds a row here and a test.** A fix without a locking test is not done.
