@@ -5171,6 +5171,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		ctx: any,
 		provider: string,
 	): Promise<CodexCatalogModel[]> {
+		const registry = ctx?.modelRegistry;
+		const resolveAuth =
+			typeof registry?.getProviderAuth === "function"
+				? registry.getProviderAuth
+				: registry?.getApiKeyForProvider;
+		if (typeof resolveAuth === "function") {
+			// Let the host refresh expired OAuth under its own lock. Its result may be a
+			// loopback placeholder, so only the re-read parent credential goes upstream.
+			if (!(await resolveAuth.call(registry, provider))) {
+				throw new CodexCatalogFetchError(`${provider} has no resolved host authentication`);
+			}
+		}
 		let entry = readAuthFile()[provider];
 		if (!entry) throw new CodexCatalogFetchError(`${provider} has no stored credential`);
 		const runFetch = () =>
