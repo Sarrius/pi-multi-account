@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
+### Fixed
+
+- Load the Antigravity Google helpers on Pi 1.5. Pi 1.5 maps `@earendil-works/pi-ai/compat` to its own extension view and `import.meta.resolve` no longer sees the extension loader aliases, so every Antigravity request failed with `Cannot find module '@earendil-works/pi-ai/compat'`. The helpers are now located from the host's own pi-ai install (`getPackageDir()` plus pi-ai's public `./api/*` export) when the old resolution does not reach an existing file.
+
 ## [1.28.1] — 2026-11-02
 
 ### Compatibility
