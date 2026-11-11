@@ -29,6 +29,30 @@ export function recoveryProjectionKey(session: RecoveryProjectionSession): strin
 		session.buildSessionProjection().entries.filter(e => e.messages.length).map(e => e.sourceEntry.id),
 		session.getBranch().filter(e => (e.type as string) === "context_edit").map(e => e.id)]);
 }
+export function recoveryOutputTokenLimit(model: { maxTokens?: number; contextWindow?: number }): number {
+	const output = Number.isSafeInteger(model.maxTokens) && model.maxTokens! > 0 ? model.maxTokens! : 16384;
+	const window = Number.isSafeInteger(model.contextWindow) && model.contextWindow! > 0 ? model.contextWindow! : 40960;
+	// Reserve substantial room for source input, transport framing and internal reasoning.
+	return Math.max(1, Math.min(output, 32768, Math.floor(window * 0.4)));
+}
+
+// More user input or an omitted failed attempt does not repair a rejected summary.
+// Pause automatic retries per summarizer for this session until a successful commit,
+// explicit /compact, or a different summarizer. An explicit manual retry bypasses this gate.
+export class RecoveryRetryGate {
+	private readonly failedKeys = new Set<string>();
+	private key(session: RecoveryProjectionSession, model: { provider: string; id: string }): string {
+		return JSON.stringify([session.getSessionId(), session.getSessionFile?.(), model.provider, model.id]);
+	}
+	paused(session: RecoveryProjectionSession, model: { provider: string; id: string }): boolean {
+		return this.failedKeys.has(this.key(session, model));
+	}
+	fail(session: RecoveryProjectionSession, model: { provider: string; id: string }): void {
+		this.failedKeys.add(this.key(session, model));
+	}
+	clear(): void { this.failedKeys.clear(); }
+}
+
 export interface RecoveryRequest { messages: { role: "system" | "user"; content: string; timestamp: number }[] }
 export async function prepareNativeRecovery(options: {
 	archives: ReturnType<typeof createRecoveryArchives>;
@@ -56,7 +80,8 @@ export async function prepareNativeRecovery(options: {
 		if (summaryBytes < 256) throw new Error("recovery:protected_context_exceeds_budget");
 		if (performance.now() - started >= options.timeoutMs) throw new Error("recovery:deadline");
 		const result = await prepareRecoveryCheckpoint({ source, isCurrent: current, signal: options.signal,
-			timeoutMs: Math.max(1, Math.floor(options.timeoutMs - (performance.now() - started))), maxPasses: 64, maxRequestBytes: budget.inputBytes - 2048, maxSummaryBytes: summaryBytes,
+			timeoutMs: Math.max(1, Math.floor(options.timeoutMs - (performance.now() - started))), maxPasses: 64, maxResponseRepairs: 1,
+			maxRequestBytes: budget.inputBytes - 2048, maxSummaryBytes: summaryBytes,
 			buildRequest: (previousCheckpoint: string, sources: readonly RecoverySourcePiece[]): RecoveryRequest => ({ messages: [
 				{ role: "system", content: prompt, timestamp: 0 },
 				{ role: "user", content: JSON.stringify({ previousCheckpoint, sources, compactionInstructions: options.customInstructions }), timestamp: 1 },
@@ -64,7 +89,7 @@ export async function prepareNativeRecovery(options: {
 			generate: options.generate,
 			validateFinal: summary => Buffer.byteLength(summary + notice) + options.protectedBytes + 2048 <= budget.inputBytes,
 		});
-		if (result.status !== "prepared") throw Object.assign(new Error(`recovery:${result.reason}`), { cause: result.error });
+		if (result.status !== "prepared") throw Object.assign(new Error(`recovery:${result.reason}${result.responseIssue ? `:${result.responseIssue}` : ""}`), { cause: result.error });
 		if (!current() || options.signal?.aborted) throw new Error("recovery:stale");
 		return { summary: result.summary + notice, details: { [RECOVERY_DETAIL]: descriptor }, descriptor,
 			passes: result.passes, acceptedPieces: result.acceptedPieces, isCurrent: current, inputBytes: budget.inputBytes };

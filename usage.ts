@@ -2,12 +2,22 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export type UsageFamily = "codex" | "anthropic" | "ollama" | "cursor" | "qwen" | "kimi-coding" | "xai" | "zai-coding-cn";
+export type UsageFamily =
+	| "codex"
+	| "anthropic"
+	| "ollama"
+	| "cursor"
+	| "qwen"
+	| "kimi-coding"
+	| "xai"
+	| "zai-coding-cn"
+	| "antigravity";
 
 export type UsageWindow = {
 	usedPercent: number;
 	resetAt: number;
 	windowSeconds?: number;
+	label?: string;
 };
 
 export type UsageSnapshot = {
@@ -47,6 +57,15 @@ export type UsageSnapshot = {
 		unlimited?: boolean;
 		balance?: string;
 	};
+	models?: Array<{
+		id: string;
+		name?: string;
+		remaining?: number;
+		reset?: string;
+		usedPercent?: number;
+		resetAt?: number;
+		label?: string;
+	}>;
 };
 
 export type UsageCredential = {
@@ -114,6 +133,11 @@ export function usageFamily(provider: string): UsageFamily | undefined {
 	if (provider === "kimi-coding" || /^kimi-coding-account-\d+$/.test(provider)) return "kimi-coding";
 	if (provider === "xai" || /^xai-account-\d+$/.test(provider)) return "xai";
 	if (provider === "zai-coding-cn" || /^zai-coding-cn-account-\d+$/.test(provider)) return "zai-coding-cn";
+	if (
+		provider === "google-antigravity" ||
+		/^google-antigravity-account-\d+$/.test(provider)
+	)
+		return "antigravity";
 	return undefined;
 }
 
@@ -855,6 +879,358 @@ async function fetchZaiCodingCnUsageSnapshot(
 	}
 }
 
+export const ANTIGRAVITY_MODELS_URL =
+	"https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
+
+export function shortenModelLabel(id: string): string {
+	if (id.includes("argon") || id.startsWith("gemini-4")) return "argon-4";
+	if (id.startsWith("gemini-3.8")) return "gemini-3.8";
+	if (id.startsWith("gemini-3.5")) return "gemini-3.5";
+	if (id.startsWith("gemini-2.5")) return "gemini-2.5";
+	if (id.startsWith("gemini-3")) return "gemini-3";
+	if (id.startsWith("claude-sonnet")) return "claude-sonnet";
+	if (id.startsWith("claude-opus")) return "claude-opus";
+	if (id.startsWith("gpt-oss")) return "gpt-oss";
+	const clean = id.replace(/-(high|medium|low)$/, "").replace(/^(gemini-|claude-|gpt-oss-)/, "");
+	return clean.length > 14 ? clean.slice(0, 13) + "…" : clean;
+}
+
+export function parseAntigravityUsageBody(
+	provider: string,
+	body: unknown,
+	fetchedAt = Date.now(),
+	credentialHash?: string,
+	account?: string,
+): UsageSnapshot | undefined {
+	const source = record(body);
+	const modelsList: Array<{
+		id: string;
+		name?: string;
+		remaining?: number;
+		reset?: string;
+		usedPercent?: number;
+		resetAt?: number;
+		label?: string;
+	}> = [];
+
+	if (Array.isArray(body)) {
+		for (const item of body) {
+			if (!record(item) || typeof item.id !== "string") continue;
+			const id = item.id;
+			const name = typeof item.name === "string" ? item.name : undefined;
+			const reset =
+				typeof item.reset === "string" && Number.isFinite(Date.parse(item.reset))
+					? item.reset
+					: undefined;
+			const resetAt = reset ? epochMs(reset) : undefined;
+			const remaining =
+				typeof item.remaining === "number" &&
+				Number.isFinite(item.remaining) &&
+				item.remaining >= 0 &&
+				item.remaining <= 1
+					? item.remaining
+					: undefined; // Stored entries already decoded protobuf defaults; absence remains unknown.
+			const usedPercent =
+				remaining !== undefined
+					? percent(Math.round((1 - remaining) * 10000) / 100)
+					: undefined;
+			const label = shortenModelLabel(id);
+			modelsList.push({ id, name, remaining, reset, resetAt, usedPercent, label });
+		}
+	} else if (record(source.models)) {
+		const rawModels = record(source.models);
+		for (const [id, m] of Object.entries(rawModels)) {
+			if (!record(m) || m.disabled === true) continue;
+			const q = record(m.quotaInfo);
+			const reset =
+				typeof q.resetTime === "string" && Number.isFinite(Date.parse(q.resetTime))
+					? new Date(q.resetTime).toISOString()
+					: undefined;
+			const remaining =
+				typeof q.remainingFraction === "number" &&
+				Number.isFinite(q.remainingFraction) &&
+				q.remainingFraction >= 0 &&
+				q.remainingFraction <= 1
+					? q.remainingFraction
+					: !Object.hasOwn(q, "remainingFraction") && reset !== undefined
+						? 0
+						: undefined;
+			const resetAt = reset ? epochMs(reset) : undefined;
+			const usedPercent =
+				remaining !== undefined
+					? percent(Math.round((1 - remaining) * 10000) / 100)
+					: undefined;
+			const name = typeof m.displayName === "string" ? m.displayName : id;
+			const label = shortenModelLabel(id);
+			modelsList.push({ id, name, remaining, reset, resetAt, usedPercent, label });
+		}
+	}
+
+	if (modelsList.length === 0) return undefined;
+
+	const toWindow = (m?: {
+		id: string;
+		usedPercent?: number;
+		resetAt?: number;
+		label?: string;
+	}): UsageWindow | undefined =>
+		m && m.usedPercent !== undefined && m.resetAt !== undefined
+			? {
+					usedPercent: m.usedPercent,
+					resetAt: m.resetAt,
+					label: m.label ?? shortenModelLabel(m.id),
+				}
+			: undefined;
+
+	const geminiStd = modelsList.find(
+		(m) =>
+			!m.id.includes("argon") &&
+			!m.id.startsWith("gemini-4") &&
+			m.id.startsWith("gemini") &&
+			m.usedPercent !== undefined &&
+			m.resetAt !== undefined,
+	);
+	const argon = modelsList.find(
+		(m) =>
+			(m.id.includes("argon") || m.id.startsWith("gemini-4")) &&
+			m.usedPercent !== undefined &&
+			m.resetAt !== undefined,
+	);
+	const claude = modelsList.find(
+		(m) =>
+			m.id.startsWith("claude") &&
+			m.usedPercent !== undefined &&
+			m.resetAt !== undefined,
+	);
+
+	const defaultCandidates = [
+		geminiStd ?? modelsList.find((m) => m.usedPercent !== undefined),
+		argon,
+		claude,
+	];
+	const defaultWindows: UsageWindow[] = [];
+	const seenDefault = new Set<string>();
+
+	for (const m of defaultCandidates) {
+		const w = toWindow(m);
+		if (w && !seenDefault.has(w.label!)) {
+			seenDefault.add(w.label!);
+			defaultWindows.push(w);
+		}
+	}
+
+	for (const m of modelsList) {
+		if (defaultWindows.length >= 3) break;
+		const w = toWindow(m);
+		if (w && !seenDefault.has(w.label!)) {
+			seenDefault.add(w.label!);
+			defaultWindows.push(w);
+		}
+	}
+
+	const modelsWithQuota = modelsList.filter((m) => m.usedPercent !== undefined);
+	const serviceable = modelsWithQuota.some((m) => m.usedPercent! < 100)
+		? true
+		: modelsWithQuota.length === modelsList.length ? false : undefined;
+
+	return {
+		provider,
+		family: "antigravity",
+		fetchedAt,
+		credentialHash,
+		account,
+		plan: "cloud-code",
+		serviceable,
+		primary: defaultWindows[0],
+		secondary: defaultWindows[1],
+		tertiary: defaultWindows[2],
+		models: modelsList,
+	};
+}
+
+export function displayAntigravityUsageSnapshot(
+	snapshot: UsageSnapshot,
+	currentModelId?: string,
+): UsageSnapshot {
+	if (!snapshot.models || snapshot.models.length === 0) {
+		return snapshot;
+	}
+	const modelsList = snapshot.models;
+	const modelId = currentModelId
+		? currentModelId.includes("/")
+			? currentModelId.slice(currentModelId.indexOf("/") + 1)
+			: currentModelId
+		: undefined;
+
+	const active = modelId ? modelsList.find((m) => m.id === modelId) : undefined;
+
+	const toWindow = (m?: (typeof modelsList)[0]): UsageWindow | undefined =>
+		m && m.usedPercent !== undefined && m.resetAt !== undefined
+			? {
+					usedPercent: m.usedPercent,
+					resetAt: m.resetAt,
+					label: m.label ?? shortenModelLabel(m.id),
+				}
+			: undefined;
+
+	const geminiStd = modelsList.find(
+		(m) =>
+			!m.id.includes("argon") &&
+			!m.id.startsWith("gemini-4") &&
+			m.id.startsWith("gemini") &&
+			m.usedPercent !== undefined &&
+			m.resetAt !== undefined,
+	);
+	const argon = modelsList.find(
+		(m) =>
+			(m.id.includes("argon") || m.id.startsWith("gemini-4")) &&
+			m.usedPercent !== undefined &&
+			m.resetAt !== undefined,
+	);
+	const claude = modelsList.find(
+		(m) =>
+			m.id.startsWith("claude") &&
+			m.usedPercent !== undefined &&
+			m.resetAt !== undefined,
+	);
+
+	let orderedModels: Array<(typeof modelsList)[0] | undefined>;
+	if (active && active.usedPercent !== undefined && active.resetAt !== undefined) {
+		if (active.id.includes("argon") || active.id.startsWith("gemini-4")) {
+			orderedModels = [active, geminiStd, claude];
+		} else if (active.id.startsWith("claude")) {
+			orderedModels = [active, geminiStd, argon];
+		} else {
+			orderedModels = [active, argon, claude];
+		}
+	} else {
+		orderedModels = [
+			geminiStd ?? modelsList.find((m) => m.usedPercent !== undefined),
+			argon,
+			claude,
+		];
+	}
+
+	const windows: UsageWindow[] = [];
+	const seenLabels = new Set<string>();
+
+	for (const m of orderedModels) {
+		const w = toWindow(m);
+		if (w && !seenLabels.has(w.label!)) {
+			seenLabels.add(w.label!);
+			windows.push(w);
+		}
+	}
+
+	for (const m of modelsList) {
+		if (windows.length >= 3) break;
+		const w = toWindow(m);
+		if (w && !seenLabels.has(w.label!)) {
+			seenLabels.add(w.label!);
+			windows.push(w);
+		}
+	}
+
+	return {
+		...snapshot,
+		primary: windows[0],
+		secondary: windows[1],
+		tertiary: windows[2],
+		serviceable: modelId
+			? active?.usedPercent === undefined ? undefined : active.usedPercent < 100
+			: snapshot.serviceable,
+	};
+}
+
+async function fetchAntigravityUsageSnapshot(
+	provider: string,
+	credential: UsageCredential,
+	options: {
+		fetchImpl?: typeof fetch;
+		timeoutMs?: number;
+		credentialHash?: string;
+	} = {},
+): Promise<UsageSnapshot> {
+	if (credential.type !== "oauth" || !credential.access) {
+		throw new UsageFetchError(`${provider} has no OAuth access token`);
+	}
+	const projectId = (credential as any).projectId;
+	const fallbackCatalog = () => {
+		const catalog = (credential as any).catalog;
+		if (Array.isArray(catalog) && catalog.length > 0) {
+			return parseAntigravityUsageBody(
+				provider,
+				catalog,
+				(credential as any).catalogAt ?? Date.now(),
+				options.credentialHash,
+				credential.accountId,
+			);
+		}
+		return undefined;
+	};
+
+	if (typeof projectId !== "string" || !projectId.trim()) {
+		const fallback = fallbackCatalog();
+		if (fallback) return fallback;
+		throw new UsageFetchError(`${provider} has no Antigravity project identifier`);
+	}
+
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 10_000);
+	const fetchImpl = options.fetchImpl ?? fetch;
+	try {
+		const response = await fetchImpl(ANTIGRAVITY_MODELS_URL, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${credential.access}`,
+				Accept: "application/json",
+				"Content-Type": "application/json",
+				"User-Agent": "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64)",
+			},
+			body: JSON.stringify({ project: projectId.trim() }),
+			signal: controller.signal,
+		});
+		if (response.status === 401) {
+			throw new UsageFetchError(
+				`${provider} Antigravity endpoint returned HTTP 401`,
+				401,
+			);
+		}
+		if (!response.ok) {
+			throw new UsageFetchError(
+				`${provider} usage endpoint returned HTTP ${response.status}`,
+				response.status,
+			);
+		}
+		const data = await response.json();
+		const snapshot = parseAntigravityUsageBody(
+			provider,
+			data,
+			Date.now(),
+			options.credentialHash,
+			credential.accountId,
+		);
+		if (!snapshot) {
+			const fallback = fallbackCatalog();
+			if (fallback) return fallback;
+			throw new UsageFetchError(`${provider} usage endpoint returned no model quota`);
+		}
+		return snapshot;
+	} catch (error) {
+		if (error instanceof UsageFetchError) throw error;
+		const fallback = fallbackCatalog();
+		if (fallback) return fallback;
+		if ((error as any)?.name === "AbortError") {
+			throw new UsageFetchError(`${provider} usage request timed out`);
+		}
+		throw new UsageFetchError(
+			`${provider} usage request failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 export async function fetchUsageSnapshot(
 	provider: string,
 	credential: UsageCredential,
@@ -866,6 +1242,10 @@ export async function fetchUsageSnapshot(
 ): Promise<UsageSnapshot> {
 	const family = usageFamily(provider);
 	if (!family) throw new UsageFetchError(`Usage is not supported for ${provider}`);
+
+	if (family === "antigravity") {
+		return fetchAntigravityUsageSnapshot(provider, credential, options);
+	}
 
 	if (family === "ollama") {
 		return fetchOllamaUsageSnapshot(provider, credential, options);
@@ -953,6 +1333,7 @@ export function providerUsageLabel(provider: string): string {
 	if (provider.startsWith("kimi-coding")) return index ? `Kimi A${index}` : "Kimi";
 	if (provider.startsWith("xai")) return index ? `xAI A${index}` : "xAI";
 	if (provider.startsWith("zai-coding-cn")) return index ? `GLM CN A${index}` : "GLM CN";
+	if (provider.startsWith("google-antigravity")) return index ? `Antigravity A${index}` : "Antigravity";
 	if (provider.startsWith("alibaba") || /^qwen/i.test(provider)) return index ? `Qwen A${index}` : "Qwen/Alibaba";
 	return provider;
 }
@@ -994,6 +1375,7 @@ export function windowLabel(
 	family: UsageFamily,
 	position: UsageWindowPosition,
 ): string {
+	if (window.label) return window.label;
 	// Cursor's pools are products, not durations: included models, the third-party pool, and the
 	// Grok Bot weekly bucket.
 	if (family === "cursor") {
@@ -1002,6 +1384,7 @@ export function windowLabel(
 		return "grok bot";
 	}
 	if (family === "ollama") return position === "primary" ? "session" : "weekly";
+	if (family === "antigravity") return position === "primary" ? "gemini" : "claude";
 	const seconds = window.windowSeconds;
 	if (!seconds) return position === "primary" ? "5h" : position === "secondary" ? "7d" : "usage";
 	if (seconds >= 20 * 86_400) return "30d";
@@ -1049,19 +1432,18 @@ export function formatUsageCompact(snapshot: UsageSnapshot, now = Date.now()): s
 	// `allowed: true`, and showing only the 0% is what makes a working account look dead.
 	if (snapshot.serviceable === true) parts.push("ok");
 	else if (snapshot.serviceable === false) parts.push("spent");
-	if (snapshot.primary) {
+	const seenWindowLabels = new Set<string>();
+	for (const [pos, win] of [
+		["primary", snapshot.primary],
+		["secondary", snapshot.secondary],
+		["tertiary", snapshot.tertiary],
+	] as const) {
+		if (!win) continue;
+		const lbl = windowLabel(win, snapshot.family, pos);
+		if (seenWindowLabels.has(lbl)) continue;
+		seenWindowLabels.add(lbl);
 		parts.push(
-			`${windowLabel(snapshot.primary, snapshot.family, "primary")} ${remainingPercent(snapshot.primary)}% left/${formatResetDuration(snapshot.primary.resetAt, now)}`,
-		);
-	}
-	if (snapshot.secondary) {
-		parts.push(
-			`${windowLabel(snapshot.secondary, snapshot.family, "secondary")} ${remainingPercent(snapshot.secondary)}% left/${formatResetDuration(snapshot.secondary.resetAt, now)}`,
-		);
-	}
-	if (snapshot.tertiary) {
-		parts.push(
-			`${windowLabel(snapshot.tertiary, snapshot.family, "tertiary")} ${remainingPercent(snapshot.tertiary)}% left/${formatResetDuration(snapshot.tertiary.resetAt, now)}`,
+			`${lbl} ${remainingPercent(win)}% left/${formatResetDuration(win.resetAt, now)}`,
 		);
 	}
 	if (!snapshot.primary && !snapshot.secondary && !snapshot.tertiary && snapshot.plan) {
@@ -1107,6 +1489,19 @@ export function formatUsageDetails(snapshot: UsageSnapshot, now = Date.now()): s
 			`${label}: ${remainingPercent(window)}% left (${Math.round(window.usedPercent)}% used), resets in ${formatResetDuration(window.resetAt, now)} at ${new Date(window.resetAt).toLocaleString()}`,
 		);
 	}
+	if (snapshot.family === "antigravity" && snapshot.models?.length) {
+		lines.push("Models:");
+		for (const m of snapshot.models) {
+			const rem =
+				m.remaining !== undefined
+					? `${Math.round(m.remaining * 100)}% left`
+					: "quota unknown";
+			const resetStr = m.resetAt
+				? `, resets in ${formatResetDuration(m.resetAt, now)} at ${new Date(m.resetAt).toLocaleString()}`
+				: "";
+			lines.push(`  ${m.name ?? m.id} (${m.id}): ${rem}${resetStr}`);
+		}
+	}
 	if (snapshot.credits?.unlimited) lines.push("Credits: unlimited");
 	else if (snapshot.credits?.balance !== undefined) lines.push(`Credits: ${snapshot.credits.balance}`);
 	lines.push(`Updated ${formatResetDuration(now, snapshot.fetchedAt)} ago`);
@@ -1114,6 +1509,12 @@ export function formatUsageDetails(snapshot: UsageSnapshot, now = Date.now()): s
 }
 
 export function usageColor(snapshot: UsageSnapshot): "success" | "warning" | "error" {
+	if (snapshot.family === "antigravity" && snapshot.primary) {
+		const rem = remainingPercent(snapshot.primary);
+		if (rem <= 10) return "error";
+		if (rem <= 30) return "warning";
+		return "success";
+	}
 	const remaining = [snapshot.primary, snapshot.secondary]
 		.filter((window): window is UsageWindow => !!window)
 		.map(remainingPercent);

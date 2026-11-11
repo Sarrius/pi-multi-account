@@ -7,6 +7,7 @@ import { antigravityProvider } from "../antigravity/provider.ts";
 import { authorization, REDIRECT } from "../antigravity/oauth.ts";
 import { BASE, ID, STREAM, PROJECT_HEADER, project } from "../antigravity/transport.ts";
 import { parseCatalog } from "../antigravity/catalog.ts";
+import { antigravityParameters } from "../antigravity/schema.ts";
 nodeTest("unsupported hosts reject Antigravity without guessing transcript compatibility", {skip:supportsNativeTranscript}, () => {
  assert.throws(() => antigravityProvider(), /requires modern native transcript APIs/);
 });
@@ -102,6 +103,65 @@ test("Antigravity translates nested literal schemas to protobuf enums without mu
  assert.deepEqual(schema.properties.approval.properties.const,{type:"string",enum:["literal-property"]});
  assert.deepEqual(schema.properties.items.items.anyOf,[{type:"string",enum:["a"]},{type:"integer",enum:["1","2"]}]);
  assert.deepEqual(parameters,before);
+});
+
+test("Antigravity maps anyOf to oneOf for Claude models and avoids strict mode anyOf null mutation", async () => {
+ const bodies: any[] = [];
+ const p = antigravityProvider({ credential, fetch: (async (_url, init) => {
+  bodies.push(JSON.parse(String(init?.body)));
+  return new Response('data: {"response":{"candidates":[{"content":{"parts":[{"text":"OK"}]},"finishReason":"STOP"}]}}\n\n');
+ }) as typeof fetch });
+ const parameters = {
+  type: "object",
+  properties: {
+   dynamic: { anyOf: [{ type: "boolean" }, { type: "object", properties: { maxMembers: { type: "integer" } } }] },
+   path: { type: "string" },
+   limit: { type: "integer" }
+  },
+  required: ["path"]
+ };
+ const claudeModel = p.getModels().find(m => m.id.startsWith("claude-"))!;
+ const result = await p.streamSimple(claudeModel, {
+  messages: [{ role: "system", content: "test", timestamp: 0, toolsAdded: [{ name: "test_tool", description: "test", parameters }] }, { role: "user", content: "hi", timestamp: 1 }]
+ } as any, { apiKey: credential.access, headers: { [PROJECT_HEADER]: credential.projectId } }).result();
+ assert.equal(result.stopReason, "stop");
+ const toolSchema = bodies[0].request.tools[0].functionDeclarations[0].parameters;
+ assert.ok(Array.isArray(toolSchema.properties.dynamic.oneOf), "anyOf must be converted to oneOf");
+ assert.equal(toolSchema.properties.dynamic.anyOf, undefined);
+ assert.deepEqual(toolSchema.required, ["path"]);
+ assert.equal(toolSchema.properties.limit.anyOf, undefined);
+ assert.equal(toolSchema.properties.limit.type, "integer");
+});
+
+nodeTest("Claude union projection preserves overlapping alternatives", () => {
+ const overlapping = { anyOf: [{ type: "number" }, { type: "integer" }] };
+ assert.deepEqual(antigravityParameters(overlapping, true), overlapping);
+ const disjoint = { anyOf: [{ type: "boolean" }, { type: "object" }] };
+ assert.deepEqual(antigravityParameters(disjoint, true), { oneOf: disjoint.anyOf });
+ assert.deepEqual(antigravityParameters(disjoint), disjoint);
+});
+
+for (const strict of ["prefer", "require"] as const) test(`Claude constrained sampling ${strict} honors unsupported strict capability`, async () => {
+ const bodies: any[] = [];
+ const p = antigravityProvider({ credential, fetch: (async (_url, init) => {
+  bodies.push(JSON.parse(String(init?.body)));
+  return new Response('data: {"response":{"candidates":[{"content":{"parts":[{"text":"OK"}]},"finishReason":"STOP"}]}}\n\n');
+ }) as typeof fetch });
+ const model = p.getModels().find(m => m.id.startsWith("claude-"))!;
+ const parameters = { type: "object", properties: { path: { type: "string" } } };
+ const result = await p.streamSimple(model, { messages: [
+  { role: "system", content: "test", timestamp: 0, toolsAdded: [{ name: "probe", description: "test", parameters, constrainedSampling: { type: "json_schema", strict } }] },
+  { role: "user", content: "hi", timestamp: 1 },
+ ] } as any, { apiKey: credential.access, headers: { [PROJECT_HEADER]: credential.projectId } }).result();
+ if (strict === "require") {
+  assert.equal(result.stopReason, "error");
+  assert.equal(bodies.length, 0);
+ } else {
+  assert.equal(result.stopReason, "stop");
+  const schema = bodies[0].request.tools[0].functionDeclarations[0].parameters;
+  assert.equal(schema.properties.path.anyOf, undefined);
+  assert.equal(schema.required, undefined);
+ }
 });
 
 test("catalog keeps distinct per-model quota; no family buckets or private payload",()=>{

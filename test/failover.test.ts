@@ -14500,6 +14500,21 @@ for (const text of [
 	});
 }
 
+test("an opaque Codex Bad Request retains response-status evidence without treating it as quota", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-6-astra" } });
+	try {
+		const start = readDebugLog().length;
+		await t.fire("after_provider_response", { status: 400, headers: {} });
+		await finishError(t, "openai-codex", "gpt-6-astra", '{"detail":"Bad Request"}');
+		const events = readDebugLog().slice(start);
+		assert.ok(events.some(e => e.kind === "foreground_provider_http_failure" && e.status === 400 && e.provider === "openai-codex"));
+		assert.ok(events.some(e => e.kind === "assistant_error" && e.classified === "unhandled"));
+		assert.ok(t.rec.notifies.some(n => /Bad Request.*not quota.*different model/i.test(n)), "explain the opaque refusal without claiming a root cause");
+		assert.equal(t.readState().exhaustedUntilByProvider?.["openai-codex"], undefined);
+		assert.deepEqual(t.rec.setModels, []);
+	} finally { await t.fire("session_shutdown"); }
+});
+
 test("reliability: unsupported ChatGPT/Codex model is a model failure, not an unhandled dead end", async () => {
 	const t = setup({ accounts: {
 		"openai-codex": { type: "oauth", access: "a", refresh: "r", accountId: "base" },

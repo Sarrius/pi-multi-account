@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
+### Added
+
+- **Google Antigravity quota and limits in the status footer and `/multi-account limits`.** Antigravity now joins `usageFamily`, displaying live per-model quota windows and reset countdowns in Pi's status bar for the active model (e.g. Gemini and Claude quotas) and reporting full model quotas under `/multi-account limits`. Stored catalog metadata seeds the footer immediately on startup and offline, and live catalog refreshes update usage telemetry across account slots.
+
+### Fixed
+
+- **Avoid Gemini-only strict-sampling mutations for Antigravity Claude tools.** Claude rejects required strict sampling before dispatch and leaves preferred strict sampling disabled. Disjoint-type unions use the legacy bridge's `oneOf` representation; overlapping unions retain `anyOf` rather than silently narrowing valid input. These are adapter compatibility checks, not a guarantee that every upstream schema is supported.
+- **Keep unknown stored Antigravity quota unknown.** Only the raw protobuf response can imply zero from an omitted fraction; normalized catalog entries cannot. Unknown quota is no longer labelled unmetered or used to claim all models are exhausted.
+- **Bound failed context-recovery retries and improve diagnostics.** Allow one response repair within the existing pass/deadline budget, pause repeated automatic failures per summarizer, and preserve manual retry. Cap summary output headroom by model limits and report opaque Codex Bad Request without treating it as quota evidence.
+
 ## [1.28.1] — 2026-11-02
 
 ### Compatibility

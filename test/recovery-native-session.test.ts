@@ -22,10 +22,11 @@ const fixtureModels = (providers: string[]) => providers.map((provider, i) => ({
 const supported = typeof (SessionManager.inMemory(dir) as any).buildSessionProjection === "function";
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 
-for (const mode of ["success", "base_provider", "delayed_quota", "preflight", "invalid_summary", "late_edit", "late_abort", "late_input", "coverage_replaced"] as const) test(`native automatic smaller-window recovery: ${mode}`, { skip: !supported }, async () => {
+for (const mode of ["success", "base_provider", "delayed_quota", "preflight", "reasoning_budget", "invalid_summary", "late_edit", "late_abort", "late_input", "coverage_replaced"] as const) test(`native automatic smaller-window recovery: ${mode}`, { skip: !supported }, async () => {
 	const providers = ["openai-codex-account-2", mode === "base_provider" ? "openai-codex" : "openai-codex-account-4"];
 	const models = fixtureModels(providers);
-	const failPreparation = mode === "invalid_summary", expectFailure = !["success", "base_provider", "delayed_quota", "preflight"].includes(mode);
+	if (mode === "reasoning_budget") models[1].maxTokens = 32768;
+	const failPreparation = mode === "invalid_summary", expectFailure = !["success", "base_provider", "delayed_quota", "preflight", "reasoning_budget"].includes(mode);
 	writeFileSync(join(dir, "models.json"), JSON.stringify({ providers: Object.fromEntries(models.map(model => [model.provider, { modelOverrides: { [model.id]: { contextWindow: model.contextWindow } } }])) }));
 	writeFileSync(join(dir, "auth.json"), JSON.stringify(Object.fromEntries(providers.map((p, i) => [p,
 		{ type: "oauth", access: `synthetic-${i}`, refresh: `synthetic-refresh-${i}`, accountId: `owned-${i}`, expires: 4102444800000 }]))));
@@ -57,6 +58,7 @@ for (const mode of ["success", "base_provider", "delayed_quota", "preflight", "i
 				if (model.provider === providers[0]) throw new Error("You have hit your ChatGPT usage limit (plus plan). Try again in ~147 min.");
 				if (preparation) {
 					summaries++;
+					if (mode === "reasoning_budget" && options.maxTokens <= 16384) message.stopReason = "length";
 					message.content = [{ type: "text", text: failPreparation ? " " : "Current task: read owned-proof.txt exactly once, then return OWNED_RECOVERY_OK. Historical BACKGROUND_FACT=ember is retained in the original archive. No deployment or provisioning is authorized. No read has yet occurred. Check the original evidence before acting." }];
 				} else {
 					const results = context.messages.filter((m: any) => m.role === "toolResult");
@@ -131,7 +133,8 @@ for (const mode of ["success", "base_provider", "delayed_quota", "preflight", "i
 		assert.equal(dispatched.filter(d => d.provider === providers[0]).length, mode === "preflight" ? 0 : 1);
 		assert.equal(foreignCalls, 0, "a wrapper replaced during activation cannot dispatch");
 		assert.equal(blocked.length, mode === "coverage_replaced" ? 0 : 1, "one rejected oversized attempt, no provider dispatch");
-		if (mode !== "coverage_replaced") assert.ok(summaries >= 1);
+		if (mode === "invalid_summary") assert.equal(summaries, 2, "one bounded repair only; no automatic restart of the same failed checkpoint");
+		else if (mode !== "coverage_replaced") assert.ok(summaries >= 1);
 		else assert.equal(dispatched.filter(d => d.provider === providers[1]).length, 0);
 		assert.ok(dispatched.filter(d => d.provider === providers[1]).every(d => d.bytes <= 44800));
 		const compactions = manager.getEntries().filter((e: any) => e.type === "compaction");
