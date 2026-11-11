@@ -883,7 +883,8 @@ export const ANTIGRAVITY_MODELS_URL =
 	"https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
 
 export function shortenModelLabel(id: string): string {
-	if (id.includes("argon") || id.startsWith("gemini-4")) return "argon-4";
+	if (/^gemini-4-carbon(?:-|$)/.test(id)) return "carbon-4";
+	if (/^gemini-4-argon(?:-|$)/.test(id)) return "argon-4";
 	if (id.startsWith("gemini-3.8")) return "gemini-3.8";
 	if (id.startsWith("gemini-3.5")) return "gemini-3.5";
 	if (id.startsWith("gemini-2.5")) return "gemini-2.5";

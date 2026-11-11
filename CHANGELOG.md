@@ -8,9 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Gemini 4 Carbon qualification and subscription guidance.** Account-discovered Carbon IDs retain their own metadata and signed tool replay; footer labels no longer confuse Carbon with Argon. Document AI Studio UI-only allowances, separate Gemini API billing/Cloud credits, and the unimplemented CLI integration boundary.
+
 - **Google Antigravity quota and limits in the status footer and `/multi-account limits`.** Antigravity now joins `usageFamily`, displaying live per-model quota windows and reset countdowns in Pi's status bar for the active model (e.g. Gemini and Claude quotas) and reporting full model quotas under `/multi-account limits`. Stored catalog metadata seeds the footer immediately on startup and offline, and live catalog refreshes update usage telemetry across account slots.
 
 ### Fixed
+
+- Update the Claude Code billing-header version to npm's reviewed `2.1.322` release (issue #116), superseding the older version in the automated report.
 
 - **Avoid Gemini-only strict-sampling mutations for Antigravity Claude tools.** Claude rejects required strict sampling before dispatch and leaves preferred strict sampling disabled. Disjoint-type unions use the legacy bridge's `oneOf` representation; overlapping unions retain `anyOf` rather than silently narrowing valid input. These are adapter compatibility checks, not a guarantee that every upstream schema is supported.
 - **Keep unknown stored Antigravity quota unknown.** Only the raw protobuf response can imply zero from an omitted fraction; normalized catalog entries cannot. Unknown quota is no longer labelled unmetered or used to claim all models are exhausted.

@@ -942,6 +942,19 @@ test("parses Antigravity catalog response with per-model quota windows", () => {
 	assert.match(compact, /^Antigravity · google:user-42 \| cloud-code \| ok \| argon-4 80% left\/4h \| claude-sonnet 30% left\/1d$/);
 });
 
+test("Carbon and Argon retain distinct quota labels and active-model availability", () => {
+	const reset = new Date(NOW + 3600000).toISOString();
+	const snapshot = parseAntigravityUsageBody("google-antigravity", [
+		{ id: "gemini-4-argon-high", remaining: .8, reset },
+		{ id: "gemini-4-carbon", remaining: .2, reset },
+	], NOW)!;
+	const display = displayAntigravityUsageSnapshot(snapshot, "gemini-4-carbon");
+	assert.equal(display.primary?.label, "carbon-4");
+	assert.equal(display.primary?.usedPercent, 80);
+	assert.match(formatUsageCompact(display, NOW), /carbon-4 20% left/);
+	assert.match(formatUsageCompact(display, NOW), /argon-4 80% left/);
+});
+
 test("Antigravity stored unknown quota is not reinterpreted as exhausted or available", () => {
 	const reset = new Date(NOW + 3600000).toISOString();
 	for (const remaining of [undefined, null, NaN]) {

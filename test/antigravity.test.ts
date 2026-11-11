@@ -56,9 +56,12 @@ for(const onboarding of [false,true])test(`complete Antigravity login resolves a
  const auth=await provider.auth.oauth!.toAuth(c);assert.equal(auth.baseUrl,BASE);assert.equal(auth.headers?.[PROJECT_HEADER],"fixture-project");
 });
 
-for(const modelId of ["gemini-4-argon-high","claude-opus-4-6-thinking"])test(`native signed tool/result/final round trip: ${modelId}`,async()=>{
+for(const modelId of ["gemini-4-argon-high","gemini-4-carbon","gemini-4-carbon-high","claude-opus-4-6-thinking"])test(`native signed tool/result/final round trip: ${modelId}`,async()=>{
  const bodies:any[]=[];
- const p=antigravityProvider({credential,fetch:(async(url,init)=>{
+ // Carbon is admitted only when the account catalog supplies its exact id and limits.
+ const carbonEntry = { ...credential.catalog[0], id: modelId, name: "Carbon", context: 1048576, output: 65536 };
+ const accountCredential = modelId.includes("carbon") ? { ...credential, catalog: [...credential.catalog, carbonEntry] } : credential;
+ const p=antigravityProvider({credential: accountCredential,fetch:(async(url,init)=>{
   assert.equal(url,STREAM);const body=JSON.parse(String(init?.body));bodies.push(body);
   assert.equal(body.project,"fixture-project");assert.equal(body.model,modelId);assert.equal(body.requestType,"agent");
   assert.deepEqual(body.enabled_credit_types,[]);assert.equal(body.request.enabledCreditTypes,undefined);assert.equal(body.request.enabled_credit_types,undefined);
