@@ -1,12 +1,37 @@
 /** Antigravity native stream; protocol reference: LICENSE.reference. */
 import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createProvider, createAssistantMessageEventStream,
  type Model, type Api, type AssistantMessage, type ToolCall, type OAuthAuth } from "@earendil-works/pi-ai";
 import { collapseSystemMessages, getCurrentTools, getCurrentSystemPrompt, requireNativeTranscript,
  type NativeContext as TranscriptContext, type NativeStreamOptions as SimpleStreamOptions } from "../google-transport/native.ts";
 // Resolve the public import export explicitly: the host's legacy jiti prefix alias
-// otherwise treats unknown pi-ai subpaths as children of compat.js.
-const loadGoogleHelpers = () => import(new URL("./api/google-shared.js", import.meta.resolve("@earendil-works/pi-ai/compat")).href) as Promise<typeof import("@earendil-works/pi-ai/api/google-shared") & {
+// otherwise treats unknown pi-ai subpaths as children of compat.js. Pi 1.5 maps the
+// compat alias to its own extension view and `import.meta.resolve` no longer sees the
+// loader aliases, so fall back to the host's own pi-ai install, located from the host
+// package directory through pi-ai's public `./api/*` export.
+async function googleSharedURL(): Promise<string> {
+ try {
+  const url = new URL("./api/google-shared.js", import.meta.resolve("@earendil-works/pi-ai/compat"));
+  if (existsSync(fileURLToPath(url))) return url.href;
+ } catch {}
+ const { getPackageDir } = await import("@earendil-works/pi-coding-agent") as { getPackageDir?: () => string };
+ if (typeof getPackageDir === "function") {
+  const host = createRequire(join(getPackageDir(), "package.json"));
+  for (const directory of host.resolve.paths("@earendil-works/pi-ai") ?? []) {
+   const root = join(directory, "@earendil-works", "pi-ai");
+   if (!existsSync(join(root, "package.json"))) continue;
+   const target = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).exports?.["./api/*"]?.import;
+   const file = typeof target === "string" ? join(root, target.replace("*", "google-shared")) : "";
+   if (file && existsSync(file)) return pathToFileURL(file).href;
+  }
+ }
+ throw new Error("Cannot locate the host's @earendil-works/pi-ai Google helpers");
+}
+const loadGoogleHelpers = async () => import(await googleSharedURL()) as Promise<typeof import("@earendil-works/pi-ai/api/google-shared") & {
  usesGoogleThinkingLevel(model: Model<"google-generative-ai">): boolean;
  toGoogleThinkingLevel(level: "minimal" | "low" | "medium" | "high"): string;
  getDisabledGoogleThinkingConfig(model: Model<"google-generative-ai">): unknown;
