@@ -60,6 +60,7 @@
     "google-transport",
     "antigravity",
     "docs/antigravity.md",
+    "docs/google-ai-subscriptions.md",
     "usage.ts",
     "cursor-bridge.ts",
     "cursor-model-name.ts",

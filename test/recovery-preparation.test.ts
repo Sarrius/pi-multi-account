@@ -41,6 +41,29 @@ test("blank, oversized, truncated and tool-call responses never expose a checkpo
 	for(const value of [response(" \n"),response("😀".repeat(100)),{...response(),stopReason:"length"},{...response(),hasToolCalls:true}]){const o=setup();o.generate=async()=>value;const result=blocked(await prepareRecoveryCheckpoint(o),"response");assert.equal(result.passes,1);assert.equal(result.acceptedPieces,0);}
 });
 
+test("response diagnostics distinguish rejection without leaking response text", async () => {
+	for (const [value, issue] of [[response(" \n"), "empty"], [response("😀".repeat(100)), "oversized"], [{...response(), stopReason: "length"}, "length"], [{...response(), hasToolCalls: true}, "tool_calls"]] as const) {
+		const o = setup(); o.generate = async () => value;
+		const result = blocked(await prepareRecoveryCheckpoint(o), "response");
+		assert.equal((result as any).responseIssue, issue);
+	}
+});
+
+test("bounded response repair repeats the exact source batch, never accepts truncation", async () => {
+	const o = setup(); let calls = 0; const requests: Request[] = [];
+	Object.assign(o, { maxResponseRepairs: 1 });
+	o.generate = async request => { requests.push(request); return ++calls === 1 ? response("x".repeat(200)) : response("short complete checkpoint"); };
+	const result = await prepareRecoveryCheckpoint(o);
+	assert.equal(result.status, "prepared"); assert.equal(result.passes, 2);
+	assert.deepEqual(requests[0].pieces, requests[1].pieces);
+	const bad = setup(); Object.assign(bad, { maxResponseRepairs: 1 }); bad.generate = async () => ({...response(), stopReason: "length"});
+	assert.equal(blocked(await prepareRecoveryCheckpoint(bad), "response").passes, 2);
+	const unsafe = setup(); Object.assign(unsafe, { maxResponseRepairs: 1 });
+	let attempts = 0; unsafe.generate = async () => { attempts++; return {...response(), hasToolCalls: true}; };
+	assert.equal(blocked(await prepareRecoveryCheckpoint(unsafe), "response").passes, 1);
+	assert.equal(attempts, 1, "a tool-call completion is not a retryable summarization attempt");
+});
+
 test("source failure, duplicate metadata and non-progressing/inconsistent pages block",async()=>{
 	const item={id:"e",handle:"h",role:"user",kind:"original"};
 	const brokenSources=[

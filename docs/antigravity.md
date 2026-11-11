@@ -14,6 +14,8 @@ Credentials and a whitelisted model/quota snapshot are persisted by native Pi cr
 
 ## Models and quotas
 
+Gemini 4 Carbon is supported through the same account-discovered catalog. Refresh with `/antigravity refresh` and select the exact returned ID; no guessed alias or API-derived limit is injected. Carbon and Argon have distinct footer labels. See [Google AI subscription boundaries](google-ai-subscriptions.md) for AI Studio, CLI and Cloud-credit feasibility.
+
 - No static Google API catalog is used. Only supported chat model IDs from the account response are exposed: Gemini, Claude and GPT-OSS; disabled/image-only/unsupported entries are omitted. Missing context metadata does not produce fabricated models.
 - Server context/output metadata is retained. When output metadata is absent, the local output cap is conservatively 8,192 (or context size if smaller), not a claim about the service's true maximum. Thinking requiring more output than this is refused rather than silently lowered.
 - `/antigravity` displays cached per-model quota observations and their timestamps. In this service's quotaInfo, a valid reset with an omitted numeric remainingFraction represents protobuf-default zero (confirmed on an exhausted Argon account). Missing quotaInfo or malformed values stay unknown.

@@ -44,7 +44,7 @@ export function createAntigravityStream(models: readonly Model<Api>[], options: 
     signal = operationSignal(signal, request.timeoutMs ?? 120000);
     signal.throwIfAborted(); options.assertConfiguration?.();
     const { convertMessages, convertTools, resolveGoogleThinkingLevel, usesGoogleThinkingLevel,
-     toGoogleThinkingLevel, getDisabledGoogleThinkingConfig, retainThoughtSignature } = await loadGoogleHelpers();
+     toGoogleThinkingLevel, getDisabledGoogleThinkingConfig, retainThoughtSignature, supportsGoogleStrictToolSampling } = await loadGoogleHelpers();
     signal.throwIfAborted();
     if (model.provider !== id || model.api !== api || model.baseUrl !== baseUrl)
      throw new Error("Google subscription requires its exact route");
@@ -79,9 +79,13 @@ export function createAntigravityStream(models: readonly Model<Api>[], options: 
      generationConfig.thinkingConfig = { include_thoughts:true, thinking_budget:budget };
      authHeaders.set("anthropic-beta", "interleaved-thinking-2025-05-14");
     }
+    const isClaude = nativeModel.id.startsWith("claude-");
+    const supportsStrict = typeof supportsGoogleStrictToolSampling === "function"
+     ? supportsGoogleStrictToolSampling(nativeModel.id)
+     : !isClaude && !nativeModel.id.startsWith("gpt-oss-");
     const payload = { contents: convertMessages(nativeModel, normalized),
      systemInstruction: { parts: [{ text: getCurrentSystemPrompt(normalized.messages) }] },
-     tools: convertTools(tools.map(tool => ({ ...tool, parameters: antigravityParameters(tool.parameters) as typeof tool.parameters })), true), generationConfig,
+     tools: convertTools(tools.map(tool => ({ ...tool, parameters: antigravityParameters(tool.parameters, isClaude) as typeof tool.parameters })), true, supportsStrict), generationConfig,
      ...(request.toolChoice ? { toolConfig: { functionCallingConfig: { mode: request.toolChoice === "none" ? "NONE" : "AUTO" } } } : {}) };
     const replacement = await cancellable(Promise.resolve(request.onPayload?.(payload, model)), signal);
     options.assertConfiguration?.(); signal.throwIfAborted();

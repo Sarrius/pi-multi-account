@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createRecoveryArchives, RECOVERY_DETAIL } from "../recovery-archive.ts";
-import { prepareNativeRecovery } from "../recovery-compaction.ts";
+import { prepareNativeRecovery, RecoveryRetryGate, recoveryOutputTokenLimit } from "../recovery-compaction.ts";
 import { recoveryTools } from "../recovery-tools.ts";
 const make = () => SessionManager.inMemory("/tmp/owned-recovery-archive");
 const supported = typeof (make() as any).buildSessionProjection === "function";
@@ -116,6 +116,40 @@ test("text preparation refuses native images instead of summarizing base64 fragm
 		generate: async () => { calls++; return { text: "wrong", stopReason: "stop", hasToolCalls: false }; } }), /multimodal_source_unsupported/);
 	assert.equal(calls, 0); assert.equal(archive.list().items.length, 0);
 	assert.equal(session.getEntries().some(e => e.type === "compaction"), false);
+});
+
+test("checkpoint generation reserves context but does not artificially cap capable models at 16k tokens", () => {
+	assert.equal(recoveryOutputTokenLimit({ maxTokens: 65536, contextWindow: 200000 }), 32768);
+	assert.equal(recoveryOutputTokenLimit({ maxTokens: 4096, contextWindow: 64000 }), 4096);
+	assert.equal(recoveryOutputTokenLimit({ maxTokens: 64000, contextWindow: 16000 }), 6400);
+});
+
+test("invalid native checkpoint reports only a fixed diagnostic and preserves the journal", { skip: !supported }, async () => {
+	const session = make(); session.appendMessage({ role: "user", content: "Sensitive owner work", timestamp: 1 });
+	const archive = createRecoveryArchives(() => session);
+	await assert.rejects(prepareNativeRecovery({ archives: archive, getSession: () => session, isCurrent: () => true,
+		model: { contextWindow: 16000 }, timeoutMs: 1000, protectedBytes: 0,
+		generate: async () => ({ text: " ", stopReason: "stop", hasToolCalls: false }) }), /recovery:response:empty/);
+	assert.equal(archive.list().items.length, 0);
+	assert.equal(session.getEntries().filter(e => e.type === "compaction").length, 0);
+});
+
+test("retry fence blocks automatic repeats even after a new message; different summarizers and manual retry remain possible", { skip: !supported }, () => {
+	const session = make(); const gate = new RecoveryRetryGate();
+	session.appendMessage({ role: "user", content: "Original task", timestamp: 1 });
+	const model = { provider: "codex", id: "gpt-sol" };
+	assert.equal(gate.paused(session, model), false);
+	gate.fail(session, model);
+	// An omitted failed assistant attempt and bookkeeping do not count as new owner input.
+	const failed = session.appendMessage({ role: "assistant", provider: "codex", model: "gpt-sol", api: "openai-codex-responses", content: [], stopReason: "error", errorMessage: "context overflow", timestamp: 2, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+	(session as any).appendContextEdit(failed, null);
+	assert.equal(gate.paused(session, model), true);
+	assert.equal(gate.paused(session, { ...model, id: "gpt-other" }), false);
+	gate.fail(session, { ...model, id: "gpt-other" });
+	assert.equal(gate.paused(session, model), true, "switching between failing summarizers must not clear prior refusals");
+	session.appendMessage({ role: "user", content: "New instruction", timestamp: 3 });
+	assert.equal(gate.paused(session, model), true, "more input does not repair a rejected summary");
+	gate.clear(); assert.equal(gate.paused(session, model), false);
 });
 
 test("retrieval tools are bounded, read-only and observe cancellation", { skip: !supported }, async () => {

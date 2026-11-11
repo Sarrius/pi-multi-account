@@ -5,7 +5,7 @@ import { record } from "../google-transport/http.ts";
  * Keep property-name maps separate from schema nodes (a property named `const` is legal).
  * This is a wire projection only; Pi still validates calls against the original schema.
  */
-export function antigravityParameters(schema: unknown): unknown {
+export function antigravityParameters(schema: unknown, forClaude = false): unknown {
  if (!record(schema)) return schema;
  const result: Record<string, unknown> = { ...schema };
  const enumValue = (value: unknown): string => {
@@ -19,15 +19,25 @@ export function antigravityParameters(schema: unknown): unknown {
   result.enum = [enumValue(schema.const)];
   delete result.const;
  } else if (Array.isArray(schema.enum)) result.enum = schema.enum.map(enumValue);
+ // oneOf is equivalent only for provably disjoint types. In particular,
+ // integer overlaps number; overlapping anyOf must never be narrowed silently.
+ const unionTypes = Array.isArray(schema.anyOf) ? schema.anyOf.map(child =>
+  record(child) && typeof child.type === "string" && ["string", "boolean", "object", "array", "number", "integer", "null"].includes(child.type)
+   ? child.type === "integer" ? "number" : child.type : undefined) : [];
+ const disjoint = unionTypes.length > 0 && unionTypes.every(type => type !== undefined) && new Set(unionTypes).size === unionTypes.length;
+ if (forClaude && disjoint && Array.isArray(schema.anyOf) && !Array.isArray(schema.oneOf)) {
+  result.oneOf = schema.anyOf;
+  delete result.anyOf;
+ }
  for (const key of ["properties", "$defs", "definitions", "patternProperties"]) {
-  if (record(schema[key])) result[key] = Object.fromEntries(
-   Object.entries(schema[key]).map(([name, child]) => [name, antigravityParameters(child)]));
+  if (record(result[key])) result[key] = Object.fromEntries(
+   Object.entries(result[key] as Record<string, unknown>).map(([name, child]) => [name, antigravityParameters(child, forClaude)]));
  }
  for (const key of ["items", "additionalProperties", "not", "if", "then", "else"]) {
-  if (record(schema[key])) result[key] = antigravityParameters(schema[key]);
+  if (record(result[key])) result[key] = antigravityParameters(result[key], forClaude);
  }
  for (const key of ["anyOf", "oneOf", "allOf", "prefixItems"]) {
-  if (Array.isArray(schema[key])) result[key] = schema[key].map(antigravityParameters);
+  if (Array.isArray(result[key])) result[key] = (result[key] as unknown[]).map(child => antigravityParameters(child, forClaude));
  }
  return result;
 }

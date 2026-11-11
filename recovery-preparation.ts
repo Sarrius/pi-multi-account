@@ -27,6 +27,8 @@ export interface RecoveryPreparationOptions<TRequest> {
   maxPasses: number;
   maxRequestBytes: number;
   maxSummaryBytes: number;
+  /** At most one extra model request for the same source batch after invalid output. */
+  maxResponseRepairs?: 0 | 1;
   buildRequest: (previousSummary: string, pieces: readonly RecoverySourcePiece[]) => TRequest;
   generate: (request: TRequest, signal: AbortSignal) => Promise<{
     text: string; stopReason: string; hasToolCalls: boolean;
@@ -42,15 +44,17 @@ export type RecoveryPreparationReason = "cancelled" | "stale" | "deadline" | "li
   "source" | "request_budget" | "pass_budget" | "response" | "final_validation" | "generation";
 export type RecoveryPreparationResult =
   | { status: "prepared"; summary: string; passes: number; acceptedPieces: number; sourceIds: string[] }
-  | { status: "blocked"; reason: RecoveryPreparationReason; passes: number; acceptedPieces: number; error?: unknown };
+  | { status: "blocked"; reason: RecoveryPreparationReason; passes: number; acceptedPieces: number; responseIssue?: "empty" | "oversized" | "length" | "tool_calls" | "invalid"; error?: unknown };
 
 class Blocked extends Error {
   readonly reason: RecoveryPreparationReason;
   readonly detail?: unknown;
-  constructor(reason: RecoveryPreparationReason, detail?: unknown) {
+  readonly responseIssue?: "empty" | "oversized" | "length" | "tool_calls" | "invalid";
+  constructor(reason: RecoveryPreparationReason, detail?: unknown, responseIssue?: Blocked["responseIssue"]) {
     super(reason);
     this.reason = reason;
     this.detail = detail;
+    this.responseIssue = responseIssue;
   }
 }
 const positiveInteger = (n: number) => Number.isSafeInteger(n) && n > 0;
@@ -125,7 +129,7 @@ export async function prepareRecoveryCheckpoint<TRequest>(
   try {
     if (options.signal?.aborted) throw new Blocked("cancelled");
     if (![options.timeoutMs, options.maxPasses, options.maxRequestBytes, options.maxSummaryBytes].every(positiveInteger) ||
-        options.timeoutMs > 2_147_483_647) throw new Blocked("limits");
+        options.timeoutMs > 2_147_483_647 || ![undefined, 0, 1].includes(options.maxResponseRepairs)) throw new Blocked("limits");
     expires = started + options.timeoutMs;
     fence();
     options.signal?.addEventListener("abort", cancel, { once: true });
@@ -203,17 +207,23 @@ export async function prepareRecoveryCheckpoint<TRequest>(
       // Recheck the exact selected request immediately before dispatch. No request
       // inferred from another candidate's size is ever sent.
       if (requestBytes(request as TRequest) > options.maxRequestBytes) throw new Blocked("request_budget");
-      const response = await awaitCall("generation", () => {
-        passes++;
-        return options.generate(request as TRequest, controller.signal);
-      });
-      invoke("response", () => {
-        if (!response || response.stopReason !== "stop" || response.hasToolCalls !== false ||
-            typeof response.text !== "string" || !response.text.trim() ||
-            Buffer.byteLength(response.text, "utf8") > options.maxSummaryBytes) {
-          throw new Error("Invalid checkpoint response");
-        }
-      });
+      let response: Awaited<ReturnType<typeof options.generate>>;
+      for (let repair = 0;; repair++) {
+        response = await awaitCall("generation", () => {
+          passes++;
+          return options.generate(request as TRequest, controller.signal);
+        });
+        const issue = !response || typeof response.text !== "string" ? "invalid"
+          : response.hasToolCalls !== false ? "tool_calls"
+          : response.stopReason !== "stop" ? (response.stopReason === "length" ? "length" : "invalid")
+          : !response.text.trim() ? "empty"
+          : Buffer.byteLength(response.text, "utf8") > options.maxSummaryBytes ? "oversized" : undefined;
+        if (!issue) break;
+        if ((issue !== "empty" && issue !== "length" && issue !== "oversized") ||
+            repair >= (options.maxResponseRepairs ?? 0) || passes >= options.maxPasses)
+          throw new Blocked("response", undefined, issue);
+        fence();
+      }
       fence();
       summary = response.text;
       acceptedPieces += batch.length;
@@ -226,7 +236,8 @@ export async function prepareRecoveryCheckpoint<TRequest>(
   } catch (error) {
     const failure = error instanceof Blocked ? error : new Blocked("source", error);
     return { status: "blocked", reason: failure.reason, passes, acceptedPieces,
-      ...(failure.detail === undefined ? {} : { error: failure.detail }) };
+      ...(failure.detail === undefined ? {} : { error: failure.detail }),
+      ...(failure.responseIssue === undefined ? {} : { responseIssue: failure.responseIssue }) };
   } finally {
     if (timer !== undefined) clearTimeout(timer);
     options.signal?.removeEventListener("abort", cancel);

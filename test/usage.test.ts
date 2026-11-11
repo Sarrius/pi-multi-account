@@ -19,6 +19,11 @@ import {
 	parseOllamaMeBody,
 	parseOllamaUsageBody,
 	UsageFetchError,
+	ANTIGRAVITY_MODELS_URL,
+	formatUsageDetails,
+	displayAntigravityUsageSnapshot,
+	parseAntigravityUsageBody,
+	providerUsageLabel,
 } from "../usage.ts";
 
 const NOW = Date.UTC(2026, 5, 13, 12, 0, 0);
@@ -889,4 +894,254 @@ test("xAI usage fetch refuses to send a request without a JWT user id", async ()
 		/no user id/i,
 	);
 	assert.equal(called, false);
+});
+
+test("Antigravity is a usage family for base slot and numbered aliases", () => {
+	assert.equal(usageFamily("google-antigravity"), "antigravity");
+	assert.equal(usageFamily("google-antigravity-account-2"), "antigravity");
+	assert.equal(providerUsageLabel("google-antigravity"), "Antigravity");
+	assert.equal(providerUsageLabel("google-antigravity-account-2"), "Antigravity A2");
+});
+
+test("parses Antigravity catalog response with per-model quota windows", () => {
+	const raw = {
+		models: {
+			"gemini-4-argon-high": {
+				displayName: "Gemini 4 Argon (High)",
+				maxTokens: 1000000,
+				quotaInfo: {
+					remainingFraction: 0.8,
+					resetTime: new Date(NOW + 4 * 3600000).toISOString(),
+				},
+			},
+			"claude-sonnet-5-5-high": {
+				displayName: "Claude Sonnet 5.5 (High)",
+				maxTokens: 200000,
+				quotaInfo: {
+					remainingFraction: 0.3,
+					resetTime: new Date(NOW + 24 * 3600000).toISOString(),
+				},
+			},
+			"disabled-model": { disabled: true },
+		},
+	};
+	const snapshot = parseAntigravityUsageBody("google-antigravity", raw, NOW, "hash-123", "google:user-42");
+	assert.ok(snapshot);
+	assert.equal(snapshot.family, "antigravity");
+	assert.equal(snapshot.provider, "google-antigravity");
+	assert.equal(snapshot.account, "google:user-42");
+	assert.equal(snapshot.plan, "cloud-code");
+	assert.equal(snapshot.serviceable, true);
+	assert.equal(snapshot.primary?.usedPercent, 20); // 1 - 0.8 = 0.2 -> 20% used
+	assert.equal(snapshot.primary?.label, "argon-4");
+	assert.equal(snapshot.secondary?.usedPercent, 70); // 1 - 0.3 = 0.7 -> 70% used
+	assert.equal(snapshot.secondary?.label, "claude-sonnet");
+	assert.equal(snapshot.models?.length, 2);
+
+	const compact = formatUsageCompact(snapshot, NOW);
+	assert.match(compact, /^Antigravity · google:user-42 \| cloud-code \| ok \| argon-4 80% left\/4h \| claude-sonnet 30% left\/1d$/);
+});
+
+test("Carbon and Argon retain distinct quota labels and active-model availability", () => {
+	const reset = new Date(NOW + 3600000).toISOString();
+	const snapshot = parseAntigravityUsageBody("google-antigravity", [
+		{ id: "gemini-4-argon-high", remaining: .8, reset },
+		{ id: "gemini-4-carbon", remaining: .2, reset },
+	], NOW)!;
+	const display = displayAntigravityUsageSnapshot(snapshot, "gemini-4-carbon");
+	assert.equal(display.primary?.label, "carbon-4");
+	assert.equal(display.primary?.usedPercent, 80);
+	assert.match(formatUsageCompact(display, NOW), /carbon-4 20% left/);
+	assert.match(formatUsageCompact(display, NOW), /argon-4 80% left/);
+});
+
+test("Antigravity stored unknown quota is not reinterpreted as exhausted or available", () => {
+	const reset = new Date(NOW + 3600000).toISOString();
+	for (const remaining of [undefined, null, NaN]) {
+		const snapshot = parseAntigravityUsageBody("google-antigravity", [{ id: "gemini-4-argon-high", remaining, reset }], NOW)!;
+		assert.equal(snapshot.models?.[0].remaining, undefined);
+		assert.equal(snapshot.serviceable, undefined);
+		assert.doesNotMatch(formatUsageDetails(snapshot, NOW), /unmetered/);
+	}
+	const mixed = parseAntigravityUsageBody("google-antigravity", [
+		{ id: "gemini-4-argon-high", remaining: 0, reset },
+		{ id: "claude-opus-5", reset },
+	], NOW)!;
+	assert.equal(mixed.serviceable, undefined, "unknown models prevent an all-exhausted claim");
+	assert.equal(displayAntigravityUsageSnapshot(mixed, "claude-opus-5").serviceable, undefined);
+	const wire = parseAntigravityUsageBody("google-antigravity", { models: {
+		"gemini-4-argon-high": { quotaInfo: { resetTime: reset } },
+	} }, NOW)!;
+	assert.equal(wire.models?.[0].remaining, 0, "only raw protobuf omission denotes zero");
+});
+
+test("parses Antigravity stored catalog array", () => {
+	const catalog = [
+		{
+			id: "gemini-3.8-flash-medium",
+			name: "Gemini 3.8 Flash (Medium)",
+			remaining: 1,
+			reset: new Date(NOW + 3600000).toISOString(),
+		},
+		{
+			id: "claude-opus-5-5-high",
+			name: "Claude Opus 5.5 (High)",
+			remaining: 0,
+			reset: new Date(NOW + 7200000).toISOString(),
+		},
+	];
+	const snapshot = parseAntigravityUsageBody("google-antigravity", catalog, NOW, "hash-abc");
+	assert.ok(snapshot);
+	assert.equal(snapshot.primary?.usedPercent, 0); // 100% left
+	assert.equal(snapshot.primary?.label, "gemini-3.8");
+	assert.equal(snapshot.secondary?.usedPercent, 100); // 0% left
+	assert.equal(snapshot.secondary?.label, "claude-opus");
+	assert.equal(snapshot.serviceable, true); // at least one model has quota
+
+	const compact = formatUsageCompact(snapshot, NOW);
+	assert.match(compact, /^Antigravity \| cloud-code \| ok \| gemini-3.8 100% left\/1h \| claude-opus 0% left\/2h$/);
+});
+
+test("displayAntigravityUsageSnapshot specializes primary window to the active model", () => {
+	const catalog = [
+		{
+			id: "gemini-3.8-flash-medium",
+			name: "Gemini 3.8 Flash (Medium)",
+			remaining: 0.9,
+			reset: new Date(NOW + 3600000).toISOString(),
+		},
+		{
+			id: "gemini-4-argon-high",
+			name: "Gemini 4 Argon (High)",
+			remaining: 0.1,
+			reset: new Date(NOW + 5 * 3600000).toISOString(),
+		},
+		{
+			id: "claude-sonnet-5-5-high",
+			name: "Claude Sonnet 5.5 (High)",
+			remaining: 0.4,
+			reset: new Date(NOW + 7200000).toISOString(),
+		},
+	];
+	const snapshot = parseAntigravityUsageBody("google-antigravity", catalog, NOW)!;
+	// By default: primary is gemini-3.8, secondary is argon-4, tertiary is claude-sonnet
+	assert.equal(snapshot.primary?.label, "gemini-3.8");
+	assert.equal(snapshot.secondary?.label, "argon-4");
+	assert.equal(snapshot.tertiary?.label, "claude-sonnet");
+
+	// Active model is gemini-4-argon-high
+	const argonDisplay = displayAntigravityUsageSnapshot(snapshot, "google-antigravity/gemini-4-argon-high");
+	assert.equal(argonDisplay.primary?.label, "argon-4");
+	assert.equal(argonDisplay.primary?.usedPercent, 90); // 10% left
+	assert.equal(argonDisplay.secondary?.label, "gemini-3.8");
+	assert.equal(argonDisplay.secondary?.usedPercent, 10); // 90% left
+	assert.equal(argonDisplay.tertiary?.label, "claude-sonnet");
+	assert.equal(argonDisplay.tertiary?.usedPercent, 60); // 40% left
+
+	// Active model is claude-sonnet-5-5-high
+	const claudeDisplay = displayAntigravityUsageSnapshot(snapshot, "google-antigravity/claude-sonnet-5-5-high");
+	assert.equal(claudeDisplay.primary?.label, "claude-sonnet");
+	assert.equal(claudeDisplay.primary?.usedPercent, 60); // 40% left
+	assert.equal(claudeDisplay.secondary?.label, "gemini-3.8");
+	assert.equal(claudeDisplay.secondary?.usedPercent, 10);
+	assert.equal(claudeDisplay.tertiary?.label, "argon-4");
+	assert.equal(claudeDisplay.tertiary?.usedPercent, 90);
+
+	// Active model is gemini-3.8-flash-medium
+	const geminiDisplay = displayAntigravityUsageSnapshot(snapshot, "gemini-3.8-flash-medium");
+	assert.equal(geminiDisplay.primary?.label, "gemini-3.8");
+	assert.equal(geminiDisplay.primary?.usedPercent, 10);
+	assert.equal(geminiDisplay.secondary?.label, "argon-4");
+	assert.equal(geminiDisplay.secondary?.usedPercent, 90);
+	assert.equal(geminiDisplay.tertiary?.label, "claude-sonnet");
+	assert.equal(geminiDisplay.tertiary?.usedPercent, 60);
+});
+
+test("Antigravity usage fetch calls v1internal:fetchAvailableModels with projectId and OAuth bearer", async () => {
+	const calls: Array<{ url: string; authorization: string | null; body: any }> = [];
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const headers = new Headers(init?.headers);
+		calls.push({
+			url: String(input),
+			authorization: headers.get("authorization"),
+			body: JSON.parse(String(init?.body)),
+		});
+		return new Response(
+			JSON.stringify({
+				models: {
+					"gemini-3.8-flash-medium": {
+						quotaInfo: {
+							remainingFraction: 1,
+							resetTime: new Date(NOW + 3600000).toISOString(),
+						},
+					},
+				},
+			}),
+			{ status: 200, headers: { "content-type": "application/json" } },
+		);
+	}) as typeof fetch;
+
+	const snapshot = await fetchUsageSnapshot(
+		"google-antigravity",
+		{
+			type: "oauth",
+			access: "secret-token",
+			accountId: "google:123",
+			projectId: "test-proj",
+		} as any,
+		{ fetchImpl },
+	);
+
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].url, ANTIGRAVITY_MODELS_URL);
+	assert.equal(calls[0].authorization, "Bearer secret-token");
+	assert.deepEqual(calls[0].body, { project: "test-proj" });
+	assert.equal(snapshot.family, "antigravity");
+	assert.equal(snapshot.primary?.label, "gemini-3.8");
+	assert.equal(snapshot.primary?.usedPercent, 0);
+	assert.ok(!JSON.stringify(snapshot).includes("secret-token"));
+});
+
+test("Antigravity 401 error is surfaced as UsageFetchError with status 401", async () => {
+	const fetchImpl = (async () => new Response("{}", { status: 401 })) as typeof fetch;
+	await assert.rejects(
+		fetchUsageSnapshot(
+			"google-antigravity",
+			{
+				type: "oauth",
+				access: "expired-token",
+				projectId: "test-proj",
+			} as any,
+			{ fetchImpl },
+		),
+		(err: unknown) => err instanceof UsageFetchError && err.status === 401,
+	);
+});
+
+test("Antigravity usage fetch falls back to stored catalog on network failure", async () => {
+	const fetchImpl = (async () => {
+		throw new Error("network down");
+	}) as typeof fetch;
+	const snapshot = await fetchUsageSnapshot(
+		"google-antigravity",
+		{
+			type: "oauth",
+			access: "secret-token",
+			projectId: "test-proj",
+			catalog: [
+				{
+					id: "gemini-3.8-flash-medium",
+					name: "Gemini 3.8",
+					remaining: 0.85,
+					reset: new Date(NOW + 3600000).toISOString(),
+				},
+			],
+			catalogAt: NOW,
+		} as any,
+		{ fetchImpl },
+	);
+
+	assert.equal(snapshot.family, "antigravity");
+	assert.equal(snapshot.primary?.label, "gemini-3.8");
+	assert.equal(snapshot.primary?.usedPercent, 15); // 85% left
 });
