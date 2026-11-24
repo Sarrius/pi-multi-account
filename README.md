@@ -46,11 +46,9 @@ Kimi child OAuth proxy those aliases would be resolvable but unauthenticated. On
 Kimi slots are published for extension-free children. Existing user entries are not deleted;
 a previously generated unused Kimi alias can be removed from `models.json` and will not reappear.
 
-> **Anthropic (Claude Pro/Max) works out of the box.** OAuth login and request
-> shaping for the base `anthropic` provider and every `anthropic-account-*` alias
-> are built in — no separate `pi-anthropic-auth` install is required. If you
-> already have `pi-anthropic-auth`, the two coexist safely (the shaping is
-> idempotent). OpenAI Codex / ChatGPT and Qwen accounts work as well.
+> **Anthropic requests use the running host’s native transport.** Multi Account does not generate Claude Code billing metadata, claim a Claude Code version, or rewrite your system instructions. Subscription availability is determined by the provider and the client it authorizes. If Anthropic requires its official client, use Claude Code; an API key is a separate billing choice, never an automatic substitution.
+
+Numbered Kimi slots copy the host’s chat catalog and model limits when the registry becomes available and on `/multi-account rediscover` or `reload`. No re-login is needed. A confirmed native Kimi summary quota refusal records a retry backoff for that account. Cancellation alone is not a quota verdict; the extension does not replay the failed summary.
 
 ### Recommended setting
 
