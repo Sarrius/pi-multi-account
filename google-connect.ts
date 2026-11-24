@@ -20,10 +20,14 @@ export async function persistGoogleConnection(authPath: string, sidecarPath: str
  },'restore',{signal});
 }
 
+function checkGoogleAuthorizationURL(url: string): void {
+ const parsed = new URL(url);
+ if (parsed.href !== url || parsed.origin !== 'https://accounts.google.com' || parsed.pathname !== '/o/oauth2/v2/auth' || parsed.username || parsed.password || parsed.hash) throw new Error('Unexpected Google authorization URL');
+}
+
 /** Open the OS default browser, never an empty profile or a debugging browser. */
 export function googleBrowserCommand(url: string, platform: NodeJS.Platform = process.platform): [string, string[]] {
- const parsed = new URL(url);
- if (parsed.origin !== 'https://accounts.google.com' || parsed.pathname !== '/o/oauth2/v2/auth' || parsed.username || parsed.password || parsed.hash) throw new Error('Unexpected Google authorization URL');
+ checkGoogleAuthorizationURL(url);
  if (platform === 'darwin') return ['open', [url]];
  if (platform === 'win32') return ['rundll32.exe', ['url.dll,FileProtocolHandler', url]];
  if (platform === 'linux') return ['xdg-open', [url]];
@@ -64,6 +68,7 @@ export function registerGoogleConnection(pi: ExtensionAPI, options: Options): vo
   if (!action) {
    if (!ctx.hasUI) { show(ctx); return; }
    action = (await ctx.ui.select('Google account', ['Connect Google account', 'Refresh connected services', 'Show connections'], {signal})) ?? '';
+   signal.throwIfAborted();
    action = ({'Connect Google account':'connect', 'Refresh connected services':'refresh', 'Show connections':'status'} as Record<string,string>)[action] ?? '';
   }
   if (!action) return;
@@ -92,6 +97,8 @@ export function registerGoogleConnection(pi: ExtensionAPI, options: Options): vo
     notify(event) {
      if (signal.aborted) return;
      if (event.type === 'auth_url') {
+      // Only an already validated destination may be displayed if the OS launch fails.
+      checkGoogleAuthorizationURL(event.url);
       const task = (async () => {
        try {
         signal.throwIfAborted();

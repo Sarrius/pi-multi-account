@@ -122,6 +122,9 @@ Optional companion validation: `test/goal-quota-recovery.integration.test.ts` ex
 | 87 | **Unknown stored Antigravity quota stays unknown.** Normalized catalog absence is not protobuf zero; unknown models cannot justify an all-exhausted verdict or an unmetered claim. | `Antigravity stored unknown quota is not reinterpreted as exhausted or available` |
 | 88 | **Failed source recovery remains bounded and retains original history.** One response repair shares the existing invocation/deadline budget; per-summarizer automatic retry pauses survive new input, while manual retry remains possible. Opaque Codex Bad Request is not quota evidence. | `bounded response repair repeats the exact source batch, never accepts truncation` · `retry fence blocks automatic repeats even after a new message; different summarizers and manual retry remain possible` · `an opaque Codex Bad Request retains response-status evidence without treating it as quota` |
 
+| 89 | **On supported Node installations the Google message/tool helpers come from Pi, even if the extension has no SDK or a stale nested peer.** A missing public host export reports an error rather than loading a different SDK. | `Antigravity tool/result round trip through bundled Pi with no local pi-ai` · `Antigravity tool/result round trip through node Pi with stale nested pi-ai` · `#117: a host without pi-ai or its public Google helper fails without using unrelated packages` |
+| 90 | **A new Google connection cannot replace another process's occupied slot or duplicate a connected identity.** Unrelated credentials remain untouched. | `a Google connection never overwrites a concurrently occupied slot` · `concurrent same-account connections have exactly one persisted winner` |
+
 ## How to keep this honest
 
 - **Every bug fix adds a row here and a test.** A fix without a locking test is not done.

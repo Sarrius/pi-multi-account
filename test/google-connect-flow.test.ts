@@ -36,6 +36,11 @@ test('connection uses the normal browser, preserves risk consent, persists once 
  }finally{f.cleanup();}
 });
 
+test('a rejected sign-in destination is never opened or offered as a manual link',async()=>{
+ const f=fixture(async interaction=>{interaction.notify({type:'auth_url',url:'https://untrusted.invalid/sign-in'});throw new Error('unavailable');});
+ try { await f.handler('connect',f.ctx); assert.deepEqual(f.launches,[]); assert.ok(f.notices.every(n=>!n.includes('untrusted.invalid'))); assert.equal(existsSync(f.authPath),false); } finally {f.cleanup();}
+});
+
 test('cancelled UI never saves credentials or launches another browser',async()=>{
  const f=fixture();try{f.ctx.ui.select=async()=>undefined;await f.handler('connect',f.ctx);assert.equal(existsSync(f.authPath),false);assert.deepEqual(f.launches,[]);}finally{f.cleanup();}
 });

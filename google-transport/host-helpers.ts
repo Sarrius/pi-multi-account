@@ -1,5 +1,5 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
-import { findPackageJSON } from "node:module";
+import * as nodeModule from "node:module";
 import { dirname, join, relative, isAbsolute, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -8,7 +8,7 @@ export function googleHelpersURL(hostDir: string): string {
 	try {
 		const hostManifest = join(hostDir, "package.json");
 		if (JSON.parse(readFileSync(hostManifest, "utf8")).name !== "@earendil-works/pi-coding-agent") throw new Error();
-		const manifest = findPackageJSON("@earendil-works/pi-ai", pathToFileURL(hostManifest));
+		const manifest = nodeModule.findPackageJSON?.("@earendil-works/pi-ai", pathToFileURL(hostManifest));
 		if (!manifest) throw new Error();
 		const pkg = JSON.parse(readFileSync(manifest, "utf8"));
 		if (pkg.name !== "@earendil-works/pi-ai") throw new Error();
