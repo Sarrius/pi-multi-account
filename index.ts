@@ -33,6 +33,7 @@ import { recoveryTools, RECOVERY_TOOL_NAMES } from "./recovery-tools.ts";
 import { prepareNativeRecovery, recoveryBudget, guardRecoveryCommit, RecoveryRetryGate, recoveryOutputTokenLimit } from "./recovery-compaction.ts";
 import { recoveryProviderAPI, hasRecoveryAdmission, type RecoveryProviderCoverage } from "./recovery-provider.ts";
 import { mutateProxyAuth, mutateProxyAuthAsync } from "./auth-file-transaction.ts";
+import { registerGoogleConnection } from "./google-connect.ts";
 import { mergeStateDeltas, mutateStateFile } from "./state-file-transaction.ts";
 import { normalizeModelPins, persistModelPin, validModelPinScope } from "./model-pins.ts";
 import { assertOpenAIChatGPTConfiguration, cloneOpenAIChatGPTProvider, isOpenAIChatGPTCredential, OPENAI_CHATGPT_URL, supportsOpenAIChatGPT } from "./openai-chatgpt.ts";
@@ -1042,6 +1043,8 @@ const DEFAULT_INVALID_COOLDOWN_MS = 365 * 24 * 60 * 60 * 1000; // effectively "u
 const DEFAULT_TRANSIENT_COOLDOWN_MS = 60 * 1000;
 const DEFAULT_USAGE_REFRESH_MS = 5 * 60 * 1000;
 const DEFAULT_USAGE_STATUS_REFRESH_MS = 60 * 1000;
+/** Footer repaint cadence; display-only, never fetches. */
+const USAGE_PAINT_INTERVAL_MS = 2 * 1000;
 const CODEX_MODEL_CATALOG_TTL_MS = 5 * 60 * 1000;
 const OLLAMA_MODEL_CATALOG_TTL_MS = 30 * 60 * 1000;
 const MIN_ANTHROPIC_USAGE_REFRESH_MS = 10 * 60 * 1000;
@@ -4403,6 +4406,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let pendingWakeTimer: ReturnType<typeof setTimeout> | undefined;
 	let queuedInputWakeTimer: ReturnType<typeof setTimeout> | undefined;
 	let usageStatusTimer: ReturnType<typeof setInterval> | undefined;
+	/** Cheap repaint of already-fetched data. Separate from the network refresh timer: Pi wipes
+	 * extension statuses whenever it resets extension UI (reload/rebind/session switch), and a
+	 * 60s-only refresh left the quota footer blank for up to a minute at a time. */
+	let usagePaintTimer: ReturnType<typeof setInterval> | undefined;
 	// Pending work is session-local. The shared state file may contain another Pi window's marker;
 	// using that marker as this window's runtime state makes two unrelated tasks resume each other.
 	type PendingResumeMode = "auto-continue" | "quota-recovery";
@@ -5749,6 +5756,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function clearUsageStatusTimer() {
+		if (usagePaintTimer) {
+			clearInterval(usagePaintTimer);
+			usagePaintTimer = undefined;
+		}
 		if (!usageStatusTimer) return;
 		clearInterval(usageStatusTimer);
 		usageStatusTimer = undefined;
@@ -5763,6 +5774,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			updateUsageStatus(ctx);
 			return;
 		}
+		// Repaint from memory so a host-side status wipe is repaired within a second or two,
+		// without adding any network traffic or recomputing catalog snapshots.
+		usagePaintTimer = setInterval(() => {
+			updateUsageStatus(ctx);
+		}, USAGE_PAINT_INTERVAL_MS);
+		(usagePaintTimer as any).unref?.();
 		usageStatusTimer = setInterval(() => {
 			runBackground("rotation metadata refresh", ctx, async () => {
 				await refreshRotationUsage(ctx);
@@ -13392,6 +13409,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				if (snapshot) usageByProvider.set(id, snapshot);
 			}
 		}
+		registerGoogleConnection(pi, {
+			authPath: AUTH_PATH,
+			sidecarPath: PROXY_OAUTH_PATH,
+			accounts: readAuthFile,
+			providers: () => registered,
+		});
 		pi.registerCommand("antigravity", {
 			description: "Account-discovered models and individual model quotas; /antigravity refresh fetches current evidence",
 			handler: async (args, ctx) => {

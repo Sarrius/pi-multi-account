@@ -58,6 +58,7 @@
     "command-completions.ts",
     "openai-chatgpt.ts",
     "google-transport",
+    "google-connect.ts",
     "antigravity",
     "docs/antigravity.md",
     "docs/google-ai-subscriptions.md",
