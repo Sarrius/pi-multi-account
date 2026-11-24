@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
+## [1.29.0] — 2026-11-24
+
 ### Added
 
 - **Google account connection entrypoint (`/google`).** Use the OS default browser and existing Antigravity OAuth/risk consent, then save a new account under the shared auth lock and refresh its discovered models. Preserve occupied slots, reject duplicate identities including proxy shadows, and cancel/join pending login on shutdown. Show Studio and CLI as not yet connected without inferring subscription eligibility or enabling paid APIs. This first slice does not yet unlock Studio web allowance.
