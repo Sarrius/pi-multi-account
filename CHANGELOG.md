@@ -8,11 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Google account connection entrypoint (`/google`).** Use the OS default browser and existing Antigravity OAuth/risk consent, then save a new account under the shared auth lock and refresh its discovered models. Preserve occupied slots, reject duplicate identities including proxy shadows, and cancel/join pending login on shutdown. Show Studio and CLI as not yet connected without inferring subscription eligibility or enabling paid APIs. This first slice does not yet unlock Studio web allowance.
+
 - **Gemini 4 Carbon qualification and subscription guidance.** Account-discovered Carbon IDs retain their own metadata and signed tool replay; footer labels no longer confuse Carbon with Argon. Document AI Studio UI-only allowances, separate Gemini API billing/Cloud credits, and the unimplemented CLI integration boundary.
 
 - **Google Antigravity quota and limits in the status footer and `/multi-account limits`.** Antigravity now joins `usageFamily`, displaying live per-model quota windows and reset countdowns in Pi's status bar for the active model (e.g. Gemini and Claude quotas) and reporting full model quotas under `/multi-account limits`. Stored catalog metadata seeds the footer immediately on startup and offline, and live catalog refreshes update usage telemetry across account slots.
 
 ### Fixed
+
+- Resolve the Google message/tool helpers from the running Pi host's public exports, not the extension directory or a file next to the compat alias. Covers managed installs and stale nested SDKs on Node and npm-bundled Pi, including Pi 1.5.1 and 1.6.0 ([#117](https://github.com/Sarrius/pi-multi-account/issues/117), based on [#118](https://github.com/Sarrius/pi-multi-account/pull/118) by @elijah7x).
+- Repaint cached quota status after Pi clears the footer without issuing additional network requests.
 
 - Update the Claude Code billing-header version to npm's reviewed `2.1.322` release (issue #116), superseding the older version in the automated report.
 

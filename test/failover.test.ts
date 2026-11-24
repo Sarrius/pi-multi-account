@@ -1439,6 +1439,46 @@ test("usage footer countdown refreshes while the session is idle", async () => {
 });
 
 test(
+	"footer repaints from memory long before the 60s network refresh (host UI reset must not blank it)",
+	async () => {
+		const provider = "openai-codex-account-2";
+		const now = Date.now();
+		// Production default: the network refresh is a minute apart. Pi wipes every extension status
+		// whenever it resets extension UI, so without a cheap repaint the quota footer stayed blank
+		// for up to a minute and looked like it was blinking.
+		const t = setup({
+			current: { provider, id: "gpt-5.5" },
+			config: { showUsage: true, usageStatusRefreshMs: 60_000 },
+			seedState: {
+				stateVersion: 5,
+				exhaustedUntilByProvider: {},
+				usageByProvider: {
+					[provider]: {
+						provider,
+						family: "codex",
+						fetchedAt: now,
+						primary: { usedPercent: 1, resetAt: now + 61_000 },
+					},
+				},
+				lastSwitches: [],
+			},
+		});
+		await t.fire("session_start");
+		const afterStart = t.rec.statuses.filter((s) => s.key === "multi-account-quota").length;
+		assert.ok(afterStart > 0, "startup must publish the footer");
+		await wait(2_600);
+		const afterWait = t.rec.statuses.filter((s) => s.key === "multi-account-quota").length;
+		assert.ok(
+			afterWait > afterStart,
+			`the footer must be repainted without waiting for the network refresh: ${afterStart} -> ${afterWait}`,
+		);
+		const last = t.rec.statuses.filter((s) => s.key === "multi-account-quota").at(-1)?.value;
+		assert.match(last ?? "", /Codex A2/, "repaint must keep showing the same quota line");
+		await t.fire("session_shutdown");
+	},
+);
+
+test(
 	"background usage refresh discovers an early Codex reset or plan upgrade on every benched account",
 	{ concurrency: false },
 	async () => {
