@@ -16,9 +16,7 @@
  *
  * Anthropic OAuth (Claude Pro/Max) works out of the box: this package enables
  * OAuth login on the base `anthropic` provider and on every `anthropic-account-*`
- * alias, and shapes the outgoing requests itself (billing header + system-prompt
- * normalization, vendored from gotgenes/pi-anthropic-auth, MIT). No separate
- * pi-anthropic-auth install is needed; if you have one, both coexist (idempotent).
+ * alias. The running host owns the Anthropic protocol, client identity and billing metadata.
  *
  * Config:  ~/.pi/agent/provider-failover.json
  * State:   ~/.pi/agent/provider-failover-state.json
@@ -3156,15 +3154,18 @@ function kimiOAuthOverride(providerId: string, name: string) {
 function registerKimiSlot(
 	pi: ExtensionAPI,
 	id: string,
-	modelIds: string[] = DEFAULT_KIMI_MODELS,
+	models: any[],
+	streamSimple: any,
 ) {
-	if (id === KIMI_BASE) return; // base provider is native to Pi (pi-ai ships it)
+	if (id === KIMI_BASE) return;
+	const first = models[0];
 	pi.registerProvider(id, {
 		name: `Kimi For Coding (${id})`,
-		baseUrl: KIMI_BASE_URL,
-		api: "anthropic-messages" as any,
+		baseUrl: first.baseUrl,
+		api: first.api,
+		streamSimple,
 		oauth: kimiOAuthOverride(id, `Kimi For Coding (${id})`),
-		models: modelIds.map((m) => kimiModelDef(m, id)) as any,
+		models,
 	});
 }
 
@@ -3541,262 +3542,6 @@ function lastAssistantStopReason(messages: any[]): string | undefined {
 	return undefined;
 }
 
-// ===========================================================================
-// Anthropic OAuth request shaping (vendored)
-//
-// Makes Claude Pro/Max (OAuth) accounts work out of the box — no separate
-// pi-anthropic-auth install required. Ported from gotgenes/pi-anthropic-auth
-// (MIT). The logic is idempotent: if pi-anthropic-auth is ALSO installed, both
-// before_provider_request hooks run, but the second sees the request already
-// shaped (billing header present, Pi preamble already replaced) and no-ops.
-//
-// CLAUDE_CODE_VERSION must track the current Claude Code release; if it drifts
-// too far Anthropic may reject or miscount OAuth requests. Check `claude
-// --version` or https://github.com/anthropics/claude-code.
-// ===========================================================================
-
-const PI_DEFAULT_PROMPT_PREFIX =
-	"You are an expert coding assistant operating inside pi, a coding agent harness.";
-const PI_DEFAULT_PROMPT_TERMINATOR =
-	"- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)";
-const MINIMAL_ANTHROPIC_OAUTH_PROMPT_PREFIX =
-	"You are an expert coding assistant.";
-const MINIMAL_ANTHROPIC_OAUTH_PROMPT = [
-	MINIMAL_ANTHROPIC_OAUTH_PROMPT_PREFIX,
-	"Be concise and helpful.",
-	"Use the available tools to answer the user's request.",
-	"Show file paths clearly when working with files.",
-].join("\n");
-const CLAUDE_CODE_IDENTITY_PREFIX =
-	"You are Claude Code, Anthropic's official CLI";
-const CLAUDE_CODE_VERSION = "2.1.322";
-const BILLING_HEADER_SALT = "59cf53e54c78";
-const BILLING_HEADER_POSITIONS = [4, 7, 20] as const;
-const CLAUDE_CODE_ENTRYPOINT = "sdk-cli";
-const PARAGRAPH_REMOVAL_ANCHORS: readonly string[] = [
-	"operating inside pi, a coding agent harness",
-	"In addition to the tools above",
-	"Pi documentation (read only when the user asks about pi itself",
-];
-const TEXT_REPLACEMENTS: readonly { match: string; replacement: string }[] = [
-	{
-		match:
-			"Here is some useful information about the environment you are running in:",
-		replacement: "Environment context you are running in:",
-	},
-];
-
-type ShapeTextBlock = { type: "text"; text: string; [key: string]: unknown };
-type ShapeMessageBlock = {
-	type?: string;
-	text?: string;
-	[key: string]: unknown;
-};
-type ShapeMessageParam = {
-	role?: string;
-	content?: string | ShapeMessageBlock[];
-	[key: string]: unknown;
-};
-type ShapeAnthropicPayload = {
-	model?: unknown;
-	messages?: unknown;
-	system?: unknown;
-	stream?: unknown;
-	[key: string]: unknown;
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function isAnthropicMessagesPayload(
-	payload: unknown,
-): payload is ShapeAnthropicPayload {
-	return (
-		isRecord(payload) &&
-		typeof payload.model === "string" &&
-		Array.isArray(payload.messages) &&
-		typeof payload.stream === "boolean"
-	);
-}
-
-function hasOAuthAnthropicSystemMarker(block: unknown): boolean {
-	if (
-		!isRecord(block) ||
-		block.type !== "text" ||
-		typeof block.text !== "string"
-	)
-		return false;
-	return (
-		block.text.includes(CLAUDE_CODE_IDENTITY_PREFIX) ||
-		block.text.includes("x-anthropic-billing-header:") ||
-		block.text.startsWith(MINIMAL_ANTHROPIC_OAUTH_PROMPT_PREFIX)
-	);
-}
-
-// Only requests that Pi already marked as OAuth (Claude Code identity block, or
-// already-shaped) are touched — API-key Anthropic requests pass through untouched.
-function isOAuthAnthropicPayload(payload: ShapeAnthropicPayload): boolean {
-	if (!Array.isArray(payload.system)) return false;
-	return payload.system.some(hasOAuthAnthropicSystemMarker);
-}
-
-function getFirstUserText(messages: ShapeMessageParam[]): string {
-	const firstUserMessage = messages.find((message) => message.role === "user");
-	if (!firstUserMessage) return "";
-	if (typeof firstUserMessage.content === "string")
-		return firstUserMessage.content;
-	if (!Array.isArray(firstUserMessage.content)) return "";
-	const firstTextBlock = firstUserMessage.content.find(
-		(block) => block.type === "text" && typeof block.text === "string",
-	);
-	return typeof firstTextBlock?.text === "string" ? firstTextBlock.text : "";
-}
-
-function buildBillingHeaderValue(
-	messages: ShapeMessageParam[],
-): string | undefined {
-	const messageText = getFirstUserText(messages);
-	if (!messageText) return undefined;
-	const cch = createHash("sha256")
-		.update(messageText)
-		.digest("hex")
-		.slice(0, 5);
-	const sampledCharacters = BILLING_HEADER_POSITIONS.map(
-		(index) => messageText[index] || "0",
-	).join("");
-	const suffix = createHash("sha256")
-		.update(`${BILLING_HEADER_SALT}${sampledCharacters}${CLAUDE_CODE_VERSION}`)
-		.digest("hex")
-		.slice(0, 3);
-	return [
-		"x-anthropic-billing-header:",
-		`cc_version=${CLAUDE_CODE_VERSION}.${suffix};`,
-		`cc_entrypoint=${CLAUDE_CODE_ENTRYPOINT};`,
-		`cch=${cch};`,
-	].join(" ");
-}
-
-function normalizeSystemBlock(block: unknown): ShapeTextBlock {
-	if (typeof block === "string") return { type: "text", text: block };
-	if (isRecord(block) && typeof block.text === "string")
-		return { ...block, type: "text", text: block.text };
-	return { type: "text", text: "" };
-}
-
-function prependBillingHeader(
-	system: unknown,
-	messages: ShapeMessageParam[],
-): unknown {
-	const billingHeader = buildBillingHeaderValue(messages);
-	if (!billingHeader) return system;
-	const systemBlocks = Array.isArray(system)
-		? system.map(normalizeSystemBlock)
-		: system == null
-			? []
-			: [normalizeSystemBlock(system)];
-	// Idempotent: don't add a second billing header (e.g. pi-anthropic-auth also ran).
-	if (
-		systemBlocks.some((block) =>
-			block.text.includes("x-anthropic-billing-header:"),
-		)
-	)
-		return systemBlocks;
-	const billingBlock: ShapeTextBlock = { type: "text", text: billingHeader };
-	return [billingBlock, ...systemBlocks];
-}
-
-// The Anthropic API rejects assistant turns where non-tool_use blocks follow a
-// tool_use block; Pi's serializer can produce that, so split into two turns.
-function splitAssistantToolUseTrailingContent(
-	messages: ShapeMessageParam[],
-): ShapeMessageParam[] {
-	return messages.flatMap((message) => {
-		if (message.role !== "assistant" || !Array.isArray(message.content))
-			return [message];
-		const firstToolUseIndex = message.content.findIndex(
-			(block) => block.type === "tool_use",
-		);
-		if (firstToolUseIndex === -1) return [message];
-		const trailingBlocks = message.content.slice(firstToolUseIndex);
-		if (!trailingBlocks.some((block) => block.type !== "tool_use"))
-			return [message];
-		const nonToolUseBlocks = message.content.filter(
-			(block) => block.type !== "tool_use",
-		);
-		const toolUseBlocks = message.content.filter(
-			(block) => block.type === "tool_use",
-		);
-		return [
-			{ ...message, content: nonToolUseBlocks },
-			{ ...message, content: toolUseBlocks },
-		];
-	});
-}
-
-function sanitizeSystemText(text: string): string {
-	const paragraphs = text.split(/\n\n+/);
-	const filtered = paragraphs.filter(
-		(paragraph) =>
-			!PARAGRAPH_REMOVAL_ANCHORS.some((anchor) => paragraph.includes(anchor)),
-	);
-	let result = filtered.join("\n\n");
-	for (const rule of TEXT_REPLACEMENTS)
-		result = result.replaceAll(rule.match, rule.replacement);
-	return result.trim();
-}
-
-function findProjectContextStart(systemPrompt: string): number {
-	return systemPrompt.indexOf("\n\n# Project Context\n\n");
-}
-
-function shapeAnthropicOAuthSystemPrompt(systemPrompt: string): string {
-	const prefixIdx = systemPrompt.indexOf(PI_DEFAULT_PROMPT_PREFIX);
-	if (prefixIdx === -1) return systemPrompt;
-	const terminatorIdx = systemPrompt.indexOf(
-		PI_DEFAULT_PROMPT_TERMINATOR,
-		prefixIdx,
-	);
-	if (terminatorIdx !== -1) {
-		const terminatorEnd = terminatorIdx + PI_DEFAULT_PROMPT_TERMINATOR.length;
-		const preamble = systemPrompt.slice(prefixIdx, terminatorEnd);
-		const sanitized = sanitizeSystemText(preamble);
-		const shapedPreamble = sanitized
-			? `${MINIMAL_ANTHROPIC_OAUTH_PROMPT}\n\n${sanitized}`
-			: MINIMAL_ANTHROPIC_OAUTH_PROMPT;
-		return (
-			systemPrompt.slice(0, prefixIdx) +
-			shapedPreamble +
-			systemPrompt.slice(terminatorEnd)
-		);
-	}
-	// Pi reworded its preamble terminator → fall back to slicing from project context.
-	const projectContextStart = findProjectContextStart(systemPrompt);
-	if (projectContextStart === -1) return MINIMAL_ANTHROPIC_OAUTH_PROMPT;
-	return `${MINIMAL_ANTHROPIC_OAUTH_PROMPT}${systemPrompt.slice(projectContextStart)}`;
-}
-
-function shapeSystemBlocks(blocks: ShapeTextBlock[]): ShapeTextBlock[] {
-	return blocks.map((block) => {
-		if (block.type !== "text" || !block.text.includes(PI_DEFAULT_PROMPT_PREFIX))
-			return block;
-		return { ...block, text: shapeAnthropicOAuthSystemPrompt(block.text) };
-	});
-}
-
-/** before_provider_request shaper: makes Claude Pro/Max OAuth requests acceptable. */
-function shapeAnthropicOAuthPayload(payload: unknown): unknown {
-	if (!isAnthropicMessagesPayload(payload)) return payload;
-	const messages = payload.messages as ShapeMessageParam[];
-	if (!isOAuthAnthropicPayload(payload)) return payload; // API-key / non-OAuth → untouched
-	const normalizedMessages = splitAssistantToolUseTrailingContent(messages);
-	const shapedSystem = Array.isArray(payload.system)
-		? shapeSystemBlocks(payload.system as ShapeTextBlock[])
-		: payload.system;
-	const finalSystem = prependBillingHeader(shapedSystem, normalizedMessages);
-	return { ...payload, messages: normalizedMessages, system: finalSystem };
-}
-
 /**
  * before_provider_request shaper for Qwen/Alibaba (OpenAI-compatible). Pi sends the system
  * instructions with the OpenAI-only `developer` role (the o1+/Codex convention), but Qwen's
@@ -3823,7 +3568,8 @@ function rewriteDeveloperRoleToSystem(payload: unknown): boolean {
 	return changed;
 }
 
-const anthropicPayloadStream = createPayloadStream((payload) => shapeAnthropicOAuthPayload(payload));
+// Preserve admission/cancellation, but leave the native client's payload untouched.
+const anthropicPayloadStream = createPayloadStream(() => undefined);
 const qwenPayloadStream = createPayloadStream((payload) => {
 	rewriteDeveloperRoleToSystem(payload);
 	return payload;
@@ -4340,6 +4086,35 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	const registeredSlots = new Set<string>();
 	// Host model list an api-key slot was last registered with, so it is refreshed, not re-done.
 	const apiKeySlotHostSignature = new Map<string, string>();
+	const kimiSlotSignatures = new Map<string, string>();
+	const kimiBuiltin = builtinProviders().find(provider => provider.id === KIMI_BASE);
+	const kimiBootstrap = kimiBuiltin?.getModels?.() ?? [];
+	let lastKimiCatalog: any[] = [];
+	function kimiCatalog(ctx: any, id: string) {
+		const live = (ctx?.modelRegistry?.getAll?.() ?? []).filter((m:any) => m?.provider === KIMI_BASE && typeof m.id === 'string' && (!m.type || m.type === 'chat'));
+		if (live.length) lastKimiCatalog = live;
+		const source = lastKimiCatalog.length ? lastKimiCatalog : kimiBootstrap;
+		const rows = new Map<string, any>();
+		for (const model of source) {
+			if (!model.id || rows.has(model.id)) continue;
+			const canonical = kimiModelDef(model.id, id);
+			const api = model.api ?? canonical.api;
+			if (api !== 'openai-completions' && api !== 'anthropic-messages') continue;
+			// Never copy a base slot's destination, auth, or private headers into another slot.
+			const baseUrl = api === 'openai-completions' ? `${KIMI_BASE_URL}/v1` : KIMI_BASE_URL;
+			rows.set(model.id, {...nativeModelEntry(canonical), ...nativeModelEntry(model), provider:id, api, baseUrl});
+		}
+		if (!rows.size) for (const name of DEFAULT_KIMI_MODELS) rows.set(name,kimiModelDef(name,id));
+		return [...rows.values()];
+	}
+	function updateKimiSlot(id: string, ctx: any) {
+		const models = kimiCatalog(ctx,id);
+		const signature = JSON.stringify(models);
+		if (kimiSlotSignatures.get(id) === signature) return false;
+		registerKimiSlot(pi,id,models,trackedKimiStream);
+		kimiSlotSignatures.set(id,signature);
+		return true;
+	}
 	// One notice per process when the optional Cursor provider cannot be loaded.
 	let cursorSetupFailureNotified = false;
 	// Strongest-first order learned from OpenAI's live per-account catalogs. It feeds the same
@@ -6638,6 +6413,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// An api-key slot registered before a ctx existed carries only the built-in tag.
 				// Once the host registry is reachable its models must be folded in, so those slots
 				// are re-registered whenever the host set changes rather than skipped forever.
+				if (family === 'kimi-coding') {
+					updateKimiSlot(id,ctx);
+					if (ownsSharedChildPublication() && auth[id]?.type === 'api_key' && isEntryUsable(auth[id])) {
+						publishKimiAlias(id,ctx);
+					}
+					registeredSlots.add(id);
+					continue;
+				}
 				if (registeredSlots.has(id)) {
 					if (family === "openai") {
 						const models = openaiCatalogFromHost(ctx);
@@ -6670,20 +6453,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					);
 				} else if (family === "openai") {
 					registerOpenAISlot(id, numberedOpenAIBaseUrl(id), openaiCatalogFromHost(ctx));
-				} else if (family === "kimi-coding") {
-					const kimiModels = [
-						...new Set([...DEFAULT_KIMI_MODELS, ...hostModelIdsFor(ctx, KIMI_BASE)]),
-					];
-					registerKimiSlot(pi, id, kimiModels);
-					// An in-memory OAuth spare belongs in /login, not in models.json. Kimi has
-					// no child OAuth proxy, so only a real API-key slot is usable by a bare child.
-					if (ownsSharedChildPublication() && auth[id]?.type === "api_key" && isEntryUsable(auth[id])) {
-						provisionNativeSlot(id, {
-							api: "anthropic-messages",
-							baseUrl: KIMI_BASE_URL,
-							models: kimiModels.map((modelId) => kimiModelDef(modelId, id)),
-						});
-					}
 				} else if (family === "ollama" || family === "qwen") {
 					registerApiKeySlot(pi, id, family, config.qwenProvider, ctx);
 				}
@@ -6706,20 +6475,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * entries there. Replaying the Kimi publication here also repairs legacy string-only model
 	 * arrays once ownership is known.
 	 */
+	function publishKimiAlias(id:string, ctx:any) {
+		const models = kimiCatalog(ctx,id);
+		provisionNativeSlot(id, {api:models[0].api, baseUrl:models[0].baseUrl, models});
+	}
+
 	function publishOwnedNativeAliases(ctx?: any): void {
 		if (!ownsSharedChildPublication()) return;
 		const auth = readAuthFile();
 		for (const id of registeredSlots) {
 			if (classifyProvider(id, config.qwenProvider) !== "kimi-coding") continue;
 			if (auth[id]?.type !== "api_key" || !isEntryUsable(auth[id])) continue;
-			const kimiModels = [
-				...new Set([...DEFAULT_KIMI_MODELS, ...hostModelIdsFor(ctx, KIMI_BASE)]),
-			];
-			provisionNativeSlot(id, {
-				api: "anthropic-messages",
-				baseUrl: KIMI_BASE_URL,
-				models: kimiModels.map((modelId) => kimiModelDef(modelId, id)),
-			});
+			publishKimiAlias(id,ctx);
 		}
 	}
 
@@ -8060,6 +7827,47 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (until > now) return true;
 		compactionUnfitUntil.delete(provider);
 		return false;
+	}
+
+	// Negative evidence only: no new provider calls, account switch or summary replay.
+	function recordNativeQuota(model: RouteModelRef, error: unknown, retryAfterMs?: number, status?: number) {
+		if (!automaticFailoverEnabled() || compactionObservation?.quotaRecorded || isFailoverExempt(model.provider) ||
+			!classifyProvider(model.provider,config.qwenProvider) || typeof error !== 'string' || compactionAccessFailure(error)) return;
+		const code = status ?? Number(error.match(/\bHTTP(?:\/\d(?:\.\d)?)?\s+(\d{3})\b/i)?.[1] ?? error.match(/(?:^|:\s*)([45]\d\d)\b/)?.[1]);
+		if (Number.isFinite(code) ? code !== 429 : !/\bexceeded_current_quota_error\b/i.test(error)) return;
+		const now=Date.now();
+		const reported=Math.max(cooldownFromErrorText(error) ?? 0,retryAfterMs ?? 0);
+		const retryAt=now+Math.max(1000,Number.isSafeInteger(now+reported) && reported>0 ? reported : config.cooldownMs);
+		const prior=limitRefusalByProvider.get(model.provider);
+		if (compactionObservation) compactionObservation.quotaRecorded=true;
+		limitRefusalByProvider.set(model.provider,{observedAt:now,retryAt:Math.max(prior?.retryAt ?? 0,retryAt),
+			...(reported>0 && Number.isSafeInteger(now+reported) ? {reportedUntil:now+reported} : {})});
+		persist();
+	}
+
+	function trackedKimiStream(model:any, context:any, options:any = {}) {
+		// Stock Pi does not attach requestModel to session_compact_failed. Only observe a
+		// stream carrying this exact compaction's cancellation signal, never a concurrent turn.
+		const observation=compactionObservation;
+		const track=!!observation?.signal && observation.signal === options.signal && !observation.signal.aborted;
+		let status: number | undefined, retryAfterMs: number | undefined;
+		const opts=track ? {...options,onResponse: async (response:any, actual:any) => {
+			status=response.status;
+			if (status===429) retryAfterMs=cooldownFromHeaders(response.headers ?? {});
+			return options.onResponse?.(response,actual);
+		}} : options;
+		const native = kimiBootstrap.some(m => m.api === model.api) ? kimiBuiltin?.streamSimple : undefined;
+		const stream=(native ?? anthropicPayloadStream)(model,context,opts);
+		if (track) {
+			observation.observeNativeRequest(model);
+			void stream.result().then((message:any) => {
+				if (compactionObservation !== observation || options.signal.aborted) return;
+				if (message.stopReason === 'error' && typeof message.errorMessage === 'string') {
+					observation.refusal = { model: {provider:model.provider,id:model.id}, error:message.errorMessage, retryAfterMs, status };
+				} else if (message.stopReason === 'stop') observation.refusal = undefined;
+			}).catch(() => {});
+		}
+		return stream;
 	}
 
 	function noteCompactionRefusal(provider: string, error: string) {
@@ -10647,11 +10455,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		});
 	}
 
-	// ----- Anthropic OAuth out of the box -----------------------------------
-	// Enable Claude Pro/Max OAuth login on the base `anthropic` provider and shape
-	// every Anthropic OAuth request so subscription tokens are accepted — without
-	// requiring a separate pi-anthropic-auth install. Idempotent, so it coexists
-	// safely if pi-anthropic-auth is also present.
+	// Register account authentication; do not manufacture Claude Code metadata or alter prompts.
+	// Keep the host Kimi base catalog and auth; wrap only its stream on an installed, authenticated base.
+	if (kimiBuiltin?.streamSimple && kimiBootstrap[0]?.api && isEntryUsable(readAuthFile()[KIMI_BASE])) {
+		pi.registerProvider(KIMI_BASE,{api:kimiBootstrap[0].api,streamSimple:trackedKimiStream} as any);
+	}
 	if (nativeOpenAI && recoveryProjectionSupported) (pi.registerProvider as any)(nativeOpenAI);
 	pi.registerProvider("anthropic", {
 		baseUrl: "https://api.anthropic.com",
@@ -11235,7 +11043,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let compactionWakeRetrySequence = 0;
 	let compactionWakeSubmissionFailures = 0;
 	let recoveryUiContext: any;
-	let compactionObservation: { owner: symbol; startedAt: number; cleanup: () => void;
+	let compactionObservation: { owner: symbol; startedAt: number; signal?: AbortSignal; quotaRecorded?: boolean;
+		refusal?: { model: RouteModelRef; error: string; retryAfterMs?: number; status?: number }; cleanup: () => void;
 		nativeAttempt?: { provider: string; id: string };
 		observeNativeRequest: (model: { provider: string; id: string }) => void;
 		phase: (route: string, timeoutMs: number) => void } | undefined;
@@ -11330,6 +11139,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	function finishCompactionObservation(outcome: string, error?: string, owner?: symbol) {
 		const observation = compactionObservation;
 		if (!observation || (owner && owner !== observation.owner)) return;
+		const receipt = observation.refusal;
+		if (receipt && (outcome === 'failed' || outcome === 'aborted') && !compactionAccessFailure(error)) {
+			recordNativeQuota(receipt.model, receipt.error, receipt.retryAfterMs, receipt.status);
+		}
 		compactionObservation = undefined;
 		try { observation.cleanup(); } catch (failure) { reportExtensionError("compaction observation cleanup", failure); }
 		logEvent("compaction_end", { session: sessionInstanceId, outcome, elapsedMs: Date.now() - observation.startedAt,
@@ -11358,7 +11171,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const timer = setInterval(() => {
 			try { publish(); } catch (error) { reportExtensionError("compaction observation", error, ctx); }
 		}, 60_000); timer.unref?.();
-		compactionObservation = { owner, startedAt,
+		compactionObservation = { owner, startedAt, signal:event?.signal,
 			observeNativeRequest: model => {
 				if (!routed && compactionObservation?.owner === owner) {
 					compactionObservation.nativeAttempt = { provider: model.provider, id: model.id };
@@ -11480,8 +11293,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			noteProviderRequestObserved();
 			if (request?.model?.provider && request.model.id) compactionObservation?.observeNativeRequest(request.model);
 		}
-		const shaped = shapeAnthropicOAuthPayload(event.payload);
-		const payload = (shaped ?? event.payload) as
+		const payload = event.payload as
 			| Record<string, unknown>
 			| undefined;
 		const provider = request?.model?.provider ?? ctx?.model?.provider;
@@ -11495,7 +11307,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				rewriteDeveloperRoleToSystem(payload);
 			}
 		}
-		return shaped;
+		return payload;
 	});
 
 	// ----- lifecycle hooks --------------------------------------------------
@@ -11775,18 +11587,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 		let body: Buffer | undefined =
 			req.method === "GET" || req.method === "HEAD" ? undefined : await readRequestBody(req);
-		if (body && verdict.route.family === "anthropic" && credential?.type === "oauth") {
-			// The extension-owned billing shaping also applies to bare children. Their native
-			// host supplies OAuth identity/tool mapping through the token-shaped placeholder,
-			// but does not load this extension's billing-header maintenance.
-			try {
-				const parsed = JSON.parse(body.toString("utf8"));
-				const reshaped = shapeAnthropicOAuthPayload(parsed);
-				if (reshaped && reshaped !== parsed) body = Buffer.from(JSON.stringify(reshaped));
-			} catch {
-				// Not JSON, or not a messages payload — forward exactly as received.
-			}
-		}
 
 		if (body?.length && verdict.route.family === "openai") {
 			try {
@@ -12463,6 +12263,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// disk snapshot before a placeholder-backed route can serve its first request.
 		await ctx.modelRegistry.refresh?.({ allowNetwork: false });
 		if (sessionClosed || chainEpoch !== startEpoch) return;
+		let kimiChanged = false;
+		for (const id of registeredSlots) if (/^kimi-coding-account-\d+$/.test(id)) {
+			if (updateKimiSlot(id,ctx)) kimiChanged = true;
+		}
+		if (kimiChanged) {
+			publishOwnedNativeAliases(ctx);
+			await ctx.modelRegistry.refresh?.({allowNetwork:false});
+			if (sessionClosed || chainEpoch !== startEpoch) return;
+		}
 		// Not installed → silent skip (refreshCursorSlots warns only on the explicit path).
 		if (config.includeCursor) await refreshCursorSlots(readAuthFile(), ctx);
 		applyOnlyActiveFilter(ctx);
@@ -12650,6 +12459,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			typeof event?.requestModel?.provider === "string" && typeof event?.requestModel?.id === "string"
 			? { provider: event.requestModel.provider, id: event.requestModel.id } : undefined;
 		if (nativeAttempt) compactionObservation?.observeNativeRequest(nativeAttempt);
+		if (event?.fromExtension === false && event?.aborted === false && nativeAttempt && !compactionObservation?.refusal) {
+			recordNativeQuota(nativeAttempt,event.errorMessage);
+		}
 		if (contextGuardWantsCompaction || contextGuardCompactionInFlight) {
 			failContextGuardCompaction(
 				"context_guard_compaction_failed",

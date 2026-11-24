@@ -530,9 +530,9 @@ function setup(opts: {
 						return opts.hostCodexModels.map((id) => mkModel(provider, id));
 					}
 					return (
-						registeredModels.get(provider) ?? [
-							mkModel(provider, "claude-opus-4-8"),
-						]
+						registeredModels.get(provider) ?? (provider === 'kimi-coding'
+							? [{ ...mkModel(provider,'k3'), api:'anthropic-messages' }]
+							: [mkModel(provider, "claude-opus-4-8")])
 					);
 				}),
 			authStorage:
@@ -3750,7 +3750,7 @@ test("a 429 whose error body carries a weeks-away resets_at is capped at the cei
 // Anthropic OAuth request shaping
 // ---------------------------------------------------------------------------
 
-test("OAuth-marked Anthropic payload gets one billing header", () => {
+test("issue120: Anthropic request metadata and system instructions belong to the native client", () => {
 	const t = setup({
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
 	});
@@ -3765,30 +3765,16 @@ test("OAuth-marked Anthropic payload gets one billing header", () => {
 			},
 		],
 	};
-	const once = t.beforeReq(payload) as any;
-	assert.match(once.system[0].text, /^x-anthropic-billing-header:/);
-	// Pinned to the constant in index.ts, never a literal: the weekly version-check workflow bumps
-	// that constant, and a hardcoded copy here would turn every automated bump into a red CI run.
-	const expectedCcVersion = readFileSync(
-		new URL("../index.ts", import.meta.url),
-		"utf8",
-	).match(/CLAUDE_CODE_VERSION = "([^"]+)"/)![1]!;
-	assert.ok(
-		once.system[0].text.includes(`cc_version=${expectedCcVersion}.`),
-		`billing header must carry CLAUDE_CODE_VERSION (${expectedCcVersion}), got: ${once.system[0].text}`,
-	);
-	const billingCount = (system: any[]) =>
-		system.filter((block) => /x-anthropic-billing-header:/.test(block.text))
-			.length;
-	assert.equal(billingCount(once.system), 1);
-	assert.equal(
-		billingCount((t.beforeReq(once) as any).system),
-		1,
-		"shaping is idempotent",
-	);
+	for (const supplied of [false, true]) {
+		const input = structuredClone(payload);
+		if (supplied) input.system.unshift({ type: "text", text: "x-anthropic-billing-header: opaque-host-owned-fixture" });
+		const original = structuredClone(input);
+		assert.deepEqual(t.beforeReq(input) ?? input, original);
+		assert.deepEqual(input, original, "no in-place impersonation or prompt edits");
+	}
 });
 
-test("public Anthropic and Qwen provider streams shape native requests without session hooks", async () => {
+test("public streams preserve native Anthropic metadata and normalize only Qwen roles", async () => {
 	const t = setup({ accounts: {
 		anthropic: { type: "oauth", access: "sk-ant-oat01-fixture", refresh: "fixture" },
 		"anthropic-account-2": { type: "oauth", access: "sk-ant-oat01-fixture-two", refresh: "fixture-two" },
@@ -3797,7 +3783,7 @@ test("public Anthropic and Qwen provider streams shape native requests without s
 	}, config: { qwenProvider: "qwen", includeQwen: true } });
 	for (const provider of ["anthropic", "anthropic-account-2", "qwen", "qwen-account-2"]) {
 		const anthropic = provider.startsWith("anthropic");
-		let body: any;
+		let body: any, callerPayload: any;
 		const stream = t.providerConfigs.get(provider).streamSimple({ provider,
 			api: anthropic ? "anthropic-messages" : "openai-completions",
 			id: anthropic ? "claude-sonnet-4-6" : "qwen-max", baseUrl: "https://fixture.invalid/v1",
@@ -3807,7 +3793,10 @@ test("public Anthropic and Qwen provider streams shape native requests without s
 			? { messages: [{ role: "system", content: "fixture instructions", timestamp: 0 }, { role: "user", content: "fixture task", timestamp: 1 }] }
 			: { systemPrompt: "fixture instructions", messages: [{ role: "user", content: "fixture task", timestamp: 0 }] }, {
 			apiKey: anthropic ? "sk-ant-oat01-fixture" : "fixture", maxRetries: 0,
-			onPayload: async (payload: any) => ({ ...payload, callerMarker: true }),
+			onPayload: async (payload: any) => {
+				callerPayload = JSON.parse(JSON.stringify({ ...payload, callerMarker: true }));
+				return structuredClone(callerPayload);
+			},
 			fetch: async (_url: any, init: any) => {
 				body = JSON.parse(init.body);
 				return new Response(JSON.stringify({ error: { message: "fixture finished" } }), { status: 400 });
@@ -3816,8 +3805,11 @@ test("public Anthropic and Qwen provider streams shape native requests without s
 		await stream.result();
 		assert.ok(body, `${provider} must reach the native request boundary`);
 		assert.equal(body.callerMarker, true);
-		if (anthropic) assert.equal(body.system.filter((b: any) => b.text.startsWith("x-anthropic-billing-header:")).length, 1);
-		else {
+		if (anthropic) {
+			// The native SDK lifts its beta field into HTTP headers after onPayload.
+			assert.deepEqual(body.system,callerPayload.system,'no extension billing block or system rewrite');
+			assert.deepEqual(body.messages,callerPayload.messages,'no extension message rewrite');
+		} else {
 			assert.ok(body.messages.some((m: any) => m.role === "system"));
 			assert.ok(body.messages.every((m: any) => m.role !== "developer"));
 		}
@@ -4028,6 +4020,34 @@ test("Alibaba/Qwen alias slots (alibaba-account-2) join the rotation", async () 
 	);
 });
 
+test("issue123: Kimi aliases adopt the delayed host catalog and its metadata on startup and reload", async () => {
+	const base = 'kimi-coding', alias = 'kimi-coding-account-2';
+	const t = setup({ accounts: { [base]: { type: 'oauth', access: 'fixture-a', refresh: 'fixture-r' }, [alias]: { type: 'oauth', access: 'fixture-b', refresh: 'fixture-s' } }, current: {provider:base, id:'k3.1-pro'}, config:{onlyActive:false,childProxy:false} });
+	const all = t.ctx.modelRegistry.getAll.bind(t.ctx.modelRegistry);
+	let max = 8192, ready = false;
+	t.ctx.modelRegistry.refresh = async () => { ready = true; };
+	t.ctx.modelRegistry.getAll = () => [...all().filter((m:any)=>m.provider!==base), ...(ready ? [{provider:base,id:'k3.1-pro',name:'Kimi Pro',api:'anthropic-messages',baseUrl:'https://do-not-inherit.invalid',headers:{ Authorization:'fixture-do-not-copy' },maxTokens:max,contextWindow:256000,input:['text'],reasoning:true}] : [])];
+	try {
+		await t.fire('session_start');
+		const current = () => t.providerConfigs.get(alias).models.find((m:any)=>m.id==='k3.1-pro');
+		assert.ok(current(), 'startup must hydrate the existing alias after the offline registry refresh');
+		assert.equal(current().name,'Kimi Pro'); assert.equal(current().maxTokens,8192);
+		assert.equal(current().baseUrl,'https://api.kimi.com/coding'); assert.equal(current().headers,undefined);
+		max=16384; await t.command('reload'); assert.equal(current().maxTokens,16384,'same ID, changed limits');
+		await t.command('next'); assert.equal(t.ctx.model.provider,alias); assert.equal(t.ctx.model.id,'k3.1-pro');
+	} finally { await t.fire('session_shutdown'); }
+});
+
+test("issue123: automatic model recovery retains the exact Kimi Pro on the authorized sibling", async () => {
+	const base='kimi-coding',alias='kimi-coding-account-2',id='k3.1-pro';
+	const t=setup({accounts:{[base]:{type:'api_key',key:'fixture-a'},[alias]:{type:'api_key',key:'fixture-b'}},hostModelsByProvider:{[base]:['k3',id]},current:{provider:base,id},config:{onlyActive:false,childProxy:false,preferLatestModel:false,autoContinue:false}});
+	try {
+		await t.fire('session_start');
+		await finishError(t,base,id,'404 model_not_found: the requested model is unavailable on this route');
+		assert.equal(t.ctx.model.provider,alias); assert.equal(t.ctx.model.id,id);
+	} finally {await t.fire('session_shutdown');}
+});
+
 test("Kimi alias slots (kimi-coding-account-2) join the rotation", async () => {
 	const accounts = {
 		"kimi-coding": { type: "oauth", access: "k1", refresh: "kr1" },
@@ -4093,12 +4113,12 @@ test("a Kimi subscription slot is registered so /login can offer it", async () =
 		"tok",
 		"requests must authenticate with THIS slot's access token",
 	);
-	// The base provider is Pi's own; the extension must not shadow it.
-	assert.equal(
-		t.providerConfigs.has("kimi-coding"),
-		false,
-		"the native base Kimi provider must be left alone",
-	);
+	// A stream observer must never override the base catalog, endpoint or auth.
+	const base = t.providerConfigs.get('kimi-coding');
+	assert.equal(base?.models,undefined);
+	assert.equal(base?.baseUrl,undefined);
+	assert.equal(base?.oauth,undefined);
+	assert.equal(base?.apiKey,undefined);
 });
 
 test("native session model ignores shared preferences on startup, prompts and shutdown", async () => {
@@ -13297,9 +13317,10 @@ test("numbered Anthropic parent and bare native streams preserve OAuth identity 
 				upstream.push({ headers: Object.fromEntries(new Headers(init.headers)), body: JSON.parse(Buffer.from(init.body).toString("utf8")) });
 				return new Response(anthropicOAuthFixtureResponse(model.id, upstream.length === 1), { headers: { "content-type": "text/event-stream" } });
 			}) as typeof fetch;
-			const clientUrls: string[] = [];
+			const clientUrls: string[] = [], clientBodies: any[] = [];
 			const options: any = { apiKey: slot.apiKey, maxRetries: 0, fetch: async (url: any, init: any) => {
 				clientUrls.push(String(url));
+				clientBodies.push(JSON.parse(init.body));
 				const requested = new URL(String(url));
 				const published = new URL(slot.baseUrl);
 				assert.equal(requested.origin, published.origin);
@@ -13326,7 +13347,7 @@ test("numbered Anthropic parent and bare native streams preserve OAuth identity 
 				assert.equal(request.headers.authorization, "Bearer sk-ant-oat01-private-fixture");
 				assert.equal(request.headers["x-api-key"], undefined);
 				assert.equal(request.headers["x-app"], "cli");
-				assert.match(JSON.stringify(request.body), /x-anthropic-billing-header:/);
+				assert.deepEqual(request.body, clientBodies[upstream.indexOf(request)], 'the proxy must not generate billing metadata');
 				assert.match(JSON.stringify(request.body), /OAUTH_SYSTEM_FIXTURE/);
 				assert.equal(request.body.tools.find((item: any) => /read/i.test(item.name))?.name, "Read");
 				assert.equal(JSON.stringify(request).includes(slot.apiKey), false);
@@ -13500,7 +13521,7 @@ test("an extension-free Pi subprocess authenticates a numbered Anthropic slot an
 		for (const request of requests) {
 			assert.equal(request.headers.authorization, "Bearer sk-ant-oat01-private-cli-fixture");
 			assert.equal(request.headers["x-app"], "cli");
-			assert.match(JSON.stringify(request.body), /x-anthropic-billing-header:/);
+			assert.match(JSON.stringify(request.body), /OAUTH_CLI_SYSTEM/);
 			assert.equal(request.body.tools.find((tool: any) => /read/i.test(tool.name))?.name, "Read");
 			assert.equal(JSON.stringify(request).includes(slot.apiKey), false);
 		}
@@ -13986,6 +14007,23 @@ test("an account with no balance is not asked to summarize again five seconds la
 		`an empty wallet does not refill in seconds; it was asked again: ${asked.join(", ")}`,
 	);
 	await t.fire("session_shutdown");
+});
+
+test("issue122: only an attributable native quota refusal writes a compaction cooldown", async () => {
+	const provider='kimi-coding', sibling='kimi-coding-account-2';
+	const t=setup({accounts:{[provider]:{type:'api_key',key:'fixture-a'},[sibling]:{type:'api_key',key:'fixture-b'}},current:{provider:sibling,id:'k3.1-pro'},config:{autoContinue:false,cooldownMs:60000}});
+	const base={reason:'manual',fromExtension:false,willRetry:false,aborted:false};
+	const requestModel={provider,id:'k3.1-pro'},errorMessage='Turn prefix summarization failed: HTTP 429 exceeded_current_quota_error';
+	try {
+		for (const event of [{...base,errorMessage},{...base,requestModel,aborted:true,errorMessage},{...base,fromExtension:true,requestModel,errorMessage},{...base,requestModel,errorMessage:'403 permission denied'},{...base,requestModel,errorMessage:'HTTP 400 invalid value 429'},{...base,requestModel,errorMessage:'This content was flagged for possible cybersecurity risk. HTTP 429'}]) {
+			await t.fire('session_compact_failed',event);
+			assert.equal(t.readState().limitRefusalByProvider?.[provider],undefined);
+		}
+		await t.fire('session_compact_failed',{...base,requestModel,errorMessage});
+		const fence=t.readState().limitRefusalByProvider?.[provider]; assert.ok(fence?.retryAt>Date.now(),'persist confirmed native quota refusal');
+		assert.equal(t.readState().limitRefusalByProvider[sibling],undefined,'the selected model is not the failed request');
+		assert.deepEqual(t.rec.setModels,[]); assert.equal(t.rec.compacts.length,0,'no automatic replay');
+	} finally { await t.fire('session_shutdown'); }
 });
 
 test("compaction recovery subscribes to Pi's public failure event, not its internal event", () => {
