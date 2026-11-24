@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Resolve the Google message/tool helpers from the running Pi host's public exports, not the extension directory or a file next to the compat alias. Covers managed installs and stale nested SDKs on Node and npm-bundled Pi, including Pi 1.5.1 and 1.6.0 ([#117](https://github.com/Sarrius/pi-multi-account/issues/117), based on [#118](https://github.com/Sarrius/pi-multi-account/pull/118) by @elijah7x).
+- Repaint cached quota status after Pi clears the footer without issuing additional network requests.
+
 - Update the Claude Code billing-header version to npm's reviewed `2.1.322` release (issue #116), superseding the older version in the automated report.
 
 - **Avoid Gemini-only strict-sampling mutations for Antigravity Claude tools.** Claude rejects required strict sampling before dispatch and leaves preferred strict sampling disabled. Disjoint-type unions use the legacy bridge's `oneOf` representation; overlapping unions retain `anyOf` rather than silently narrowing valid input. These are adapter compatibility checks, not a guarantee that every upstream schema is supported.

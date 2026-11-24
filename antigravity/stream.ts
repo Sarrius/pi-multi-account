@@ -4,13 +4,16 @@ import { createProvider, createAssistantMessageEventStream,
  type Model, type Api, type AssistantMessage, type ToolCall, type OAuthAuth } from "@earendil-works/pi-ai";
 import { collapseSystemMessages, getCurrentTools, getCurrentSystemPrompt, requireNativeTranscript,
  type NativeContext as TranscriptContext, type NativeStreamOptions as SimpleStreamOptions } from "../google-transport/native.ts";
-// Resolve the public import export explicitly: the host's legacy jiti prefix alias
-// otherwise treats unknown pi-ai subpaths as children of compat.js.
-const loadGoogleHelpers = () => import(new URL("./api/google-shared.js", import.meta.resolve("@earendil-works/pi-ai/compat")).href) as Promise<typeof import("@earendil-works/pi-ai/api/google-shared") & {
+import { googleHelpersURL } from "../google-transport/host-helpers.ts";
+// Pi binds this bare import to its host. The extension may have no physical SDK, or a stale peer.
+const loadGoogleHelpers = async () => {
+ const { getPackageDir } = await import("@earendil-works/pi-coding-agent");
+ return import(googleHelpersURL(getPackageDir())) as Promise<typeof import("@earendil-works/pi-ai/api/google-shared") & {
  usesGoogleThinkingLevel(model: Model<"google-generative-ai">): boolean;
  toGoogleThinkingLevel(level: "minimal" | "low" | "medium" | "high"): string;
  getDisabledGoogleThinkingConfig(model: Model<"google-generative-ai">): unknown;
-}>;
+ }>;
+};
 import { createGoogleReplayCache } from "../google-transport/replay.ts";
 import { events } from "../google-transport/sse.ts";
 import { operationSignal, record, cancellable } from "../google-transport/http.ts";

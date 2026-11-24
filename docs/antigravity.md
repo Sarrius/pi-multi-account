@@ -27,6 +27,8 @@ Gemini 4 Carbon is supported through the same account-discovered catalog. Refres
 
 ## Transport and Broker
 
+The extension loads the Google transcript helpers from the running Pi installation's public `pi-ai` export. No extension-local SDK is required. This is tested with both the Node and bundled JavaScript loaders from the npm distribution. A standalone executable with no on-disk host SDK is not qualified for this adapter and reports that the helpers are unavailable; do not install a second SDK next to the extension to work around it.
+
 Gemini-native message conversion handles Google-hosted Gemini/Claude/GPT-OSS; Claude uses the native helper's parameters schema and signature-aware tool/result representation. Signed tool calls are withheld until stream framing and terminal completion validate. Parent-only canonical replay receipts remain bounded and route/account/model/session bound. Live support for every advertised model is not established by catalog visibility or synthetic replay.
 
 Broker classifies Antigravity as a mixed included subscription, not an API-key or pay-as-you-go route. Hosted Claude/GPT retain their actual developer provenance while becoming eligible as included subscription models; current-generation evidence, quality, actual qualification and leases remain mandatory. Gemini Argon, Pro, Flash and Flash-Lite are separate product families for generation comparisons. A newer Argon does not retire Flash.

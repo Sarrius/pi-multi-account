@@ -102,8 +102,8 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.4.0",
-    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-ai": "1.6.0",
+    "@earendil-works/pi-coding-agent": "1.6.0",
     "@types/node": "^22.20.5",
     "typescript": "^6.0.3"
   },
@@ -117,7 +117,7 @@
     "proper-lockfile": "4.1.2"
   },
   "overrides": {
-    "protobufjs": "7.6.5",
-    "undici": "8.12.2"
+    "protobufjs": "7.6.6",
+    "undici": "8.12.4"
   }
 }
