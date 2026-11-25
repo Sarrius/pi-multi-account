@@ -119,7 +119,7 @@ All three names are aliases for the same command: `/multi-account`, `/provider-f
 | `save-default` | Save the current model and effective thinking level together as global startup defaults for new sessions. Preserves other models' thinking preferences. Project overrides, explicit CLI options, and resumed-session settings still take precedence. Automatic rotation never invokes this command; the opt-in `followLastSuccessfulModel` policy separately updates the global model after a successful answer. |
 | `only-active [on\|off]` | Legacy picker preference; use `pick` for a current-account-only menu. The complete Pi model registry remains available to all clients. Alias: `focus`. |
 | `stop` | Abort and cancel automatic failover/resume for the current task. |
-| `reset` | Clear all cooldowns, invalidations and any pending auto-resume. |
+| `reset [provider]` | With a provider ID, clear only that provider's account and model cooldowns. This leaves invalidations and pending auto-resume alone. With no argument, clear all cooldowns, invalidations and any pending auto-resume. |
 | `reload` | Reload config from disk and re-discover accounts. |
 | `enable` / `disable` | Turn failover on/off for the current Pi process. |
 
@@ -195,7 +195,8 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 | `followLastSuccessfulModel` | `false` | Opt-in terminal-Pi policy: after a successful foreground answer, save its actual provider/model as the global startup default (without changing thinking). A fresh session follows the latest successful model across project directories; resumed/explicit CLI sessions retain their own selection. If Pi resolves a missing saved model to direct `openai/gpt-5.5`, try a ready managed account instead; otherwise block interactive input with a warning rather than silently spend direct API credits. Other SDK/print/child sessions are unaffected. Project settings overrides may still win during Pi's initial resolution. |
 | `childProxy` | `true` | Serve OAuth rotation slots to processes that do not load this extension (a memory extension consolidating its notes, an external CLI, any `pi -p --no-extensions` call) through a loopback route this process owns. A bare child launched without `--model` inherits Pi's **saved global default**, which since Pi 0.84.3 intentionally may differ from this session's live rotation; an explicitly pinned child uses its requested slot. Without a usable publication either form can fail authentication and fall back to whichever provider Pi finds first. The published route carries a non-secret placeholder; the real credential never leaves the parent. |
 | `providerOrder` | `["anthropic","openai-codex","qwen","ollama"]` | Preferred family order in the rotation. |
-| `cooldownMs` | 6 h | Default cooldown when no reset metadata is provided. |
+| `cooldownMs` | 6 h | Default managed account cooldown when no reset metadata is provided. Also applies to refreshable unmanaged authentication failures. |
+| `transientCooldownMs` | 1 min | Default backoff for temporary errors and unmanaged limits without `Retry-After`. |
 | `showUsage` | `true` | Show active Codex/Claude/xAI limits in Pi's footer. |
 | `usageRefreshMs` | 5 min | Per-account usage cache TTL; every authenticated rotation account is refreshed independently, and Anthropic is clamped to at least 10 min to avoid endpoint throttling. |
 | `usageStatusRefreshMs` | 1 min | Re-render the footer and sweep idle sessions for stale usage/model catalogs; network refreshes remain limited by their five-minute (Anthropic: ten-minute) TTLs. |
@@ -218,7 +219,9 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 | `preferredModels` | `{}` | Optional manual strongest-first override per family; when present it wins over live catalog priority. A model pin leads this order without rewriting it. |
 | `pinnedModels` | `{}` | One explicit model ID per account group, managed by `pin` / `unpin`. Inactive when unavailable/incompatible; never grants account health or a different automatic quality band. |
 
-State (cooldowns, actual-refusal timestamps/retry bounds/provider reset estimates, invalidations, recent switches, credential-free Codex model catalogs, and a diagnostic pending marker) is persisted to `~/.pi/agent/provider-failover-state.json`. The actual pending task is session-local: one Pi window never consumes or resumes another window's work. Pending work is discarded when its owning session closes.
+For unmanaged providers without quota telemetry, such as `claude-code`, a rate or quota refusal triggers failover for that task. The refusing provider is not picked again during the same task. The next user prompt retries the original model unless the provider sent `Retry-After` and that delay is still active. If no fallback is ready during `Retry-After`, the prompt is not sent and its text is returned to the editor. Send it after the delay or select another provider. This also applies to "out of credits" refusals, because the extension cannot measure these providers: one that stays out of credits is tried once per new message. Exclude it or add it to `neverFailoverProviders` to stop that. This backoff is session-local. `/multi-account reset <provider>` clears the delay without changing other accounts. If an older version already switched you away, clear the old cooldown and reselect the original model with `/model`.
+
+State (persisted cooldowns, actual-refusal timestamps/retry bounds/provider reset estimates, invalidations, recent switches, credential-free Codex model catalogs, and a diagnostic pending marker) is persisted to `~/.pi/agent/provider-failover-state.json`. The actual pending task is session-local: one Pi window never consumes or resumes another window's work. Pending work is discarded when its owning session closes.
 
 ### Session model ownership
 

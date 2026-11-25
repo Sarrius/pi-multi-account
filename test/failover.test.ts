@@ -7837,40 +7837,204 @@ test("a quota error on the ACTIVE unmanaged provider (e.g. plain openai API) sti
 	);
 });
 
-test("a bodyless 429 on an active unmanaged provider retries the same route", async () => {
-	const t = setup({
-		current: { provider: "cerebras", id: "qwen-3.8-27b" },
-		config: { transientCooldownMs: 60_000 },
-	});
-	await finishError(t, "cerebras", "qwen-3.8-27b", "429 status code (no body)");
+const EXTERNAL_CLAUDE_MODEL = { provider: "claude-code", id: "claude-opus-4-8" };
+const EXTERNAL_CLAUDE_429 = "Incomplete Claude Code upstream response (status 429, capture incomplete, upstream said: This request would exceed your account's rate limit. Please try again later.)";
 
-	assert.deepEqual(t.rec.setModels, [], "a bodyless throttle must not authorize failover");
-	const state = t.readState();
-	assert.equal(state.pendingFrom, "cerebras/qwen-3.8-27b");
-	assert.equal(
-		state.exhaustedUntilByProvider?.cerebras,
-		undefined,
-		"a bodyless rate limit must not poison the whole provider",
-	);
-	assert.equal(state.exhaustedUntilByModel?.["cerebras/qwen-3.8-27b"], undefined);
-	assert.match(t.rec.notifies.join("\n"), /temporary error.*cerebras\/qwen-3\.8-27b/i);
-	assert.doesNotMatch(t.rec.notifies.join("\n"), /out of quota/i);
+function externalClaudeSetup(config: Record<string, unknown> = {}) {
+	return setup({
+		current: EXTERNAL_CLAUDE_MODEL,
+		accounts: {
+			anthropic: { type: "oauth", access: "a-fixture", refresh: "a-refresh" },
+			"claude-code": { type: "oauth", access: "c-fixture", refresh: "c-refresh" },
+		},
+		hostModelsByProvider: { "claude-code": [EXTERNAL_CLAUDE_MODEL.id] },
+		config: { childProxy: false, autoContinue: false, ...config },
+	});
+}
+
+for (const [label, error] of [["with a body", EXTERNAL_CLAUDE_429], ["without a body", "429 status code (no body)"]]) {
+	test(`unmanaged 429 ${label} fails over for the task and retries the selected model on the next prompt`, async () => {
+		const t = externalClaudeSetup();
+		t.ctx.sessionManager = { getBranch: () => [] };
+		try {
+			await t.fire("session_start");
+			await t.input("first prompt");
+			await t.fire("before_agent_start");
+			await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, error);
+			assert.equal(t.ctx.model.provider, "anthropic");
+			assert.equal(t.readState().exhaustedUntilByProvider?.[EXTERNAL_CLAUDE_MODEL.provider], undefined);
+			await t.input("next prompt");
+			assert.deepEqual(t.ctx.model, EXTERNAL_CLAUDE_MODEL, "restore before the host validates the route");
+			await t.fire("before_agent_start", { messageType: "user" });
+			assert.deepEqual(t.ctx.model, EXTERNAL_CLAUDE_MODEL);
+		} finally { await t.fire("session_shutdown"); }
+	});
+}
+
+test("unmanaged 429 Retry-After defers the selected model and explains the preflight skip", async () => {
+	const t = externalClaudeSetup();
+	try {
+		const beforeResponse = Date.now();
+		await t.fire("after_provider_response", { status: 429, headers: { "Retry-After": "120" } });
+		const afterResponse = Date.now();
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, "Upstream refused request");
+		assert.equal(t.ctx.model.provider, "anthropic");
+		assert.equal(t.readState().exhaustedUntilByProvider?.[EXTERNAL_CLAUDE_MODEL.provider], undefined);
+		const beforePreflight = t.rec.notifies.length;
+		await t.input("next prompt before Retry-After expires");
+		await t.fire("before_agent_start");
+		assert.equal(t.ctx.model.provider, "anthropic");
+		const notices = t.rec.notifies.slice(beforePreflight).join("\n");
+		assert.match(notices, /claude-code.*rate or quota limit.*\/multi-account reset claude-code/i);
+		assert.ok(afterResponse - beforeResponse < 60_000);
+		assert.match(notices, /expires at \S.* \(in ~2m\)/, notices);
+		assert.doesNotMatch(notices, /\d{4}-\d\d-\d\dT/, "expiry is shown in local time, not raw ISO");
+		await t.command("reset claude-code");
+		await t.input("try again after reset");
+		await t.fire("before_agent_start");
+		assert.deepEqual(t.ctx.model, EXTERNAL_CLAUDE_MODEL);
+	} finally { await t.fire("session_shutdown"); }
 });
 
-test("a bodyless unmanaged 429 honors Retry-After on the same-route retry", async () => {
-	const t = setup({
-		current: { provider: "cerebras", id: "qwen-3.8-27b" },
-		config: { transientCooldownMs: 60_000 },
-	});
-	await t.fire("after_provider_response", {
-		status: 429,
-		headers: { "retry-after": "120" },
-	});
-	await finishError(t, "cerebras", "qwen-3.8-27b", "429 status code (no body)");
+test("an opaque error cannot borrow a structured 429 from another model or a prior response", async () => {
+	const t = externalClaudeSetup();
+	try {
+		const rateLimit = { status: 429, headers: { "Retry-After": "120" } };
+		await t.fire("after_provider_response", rateLimit);
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, "claude-sonnet-4-6", "Upstream refused request");
+		assert.deepEqual(t.rec.setModels, []);
+		await t.fire("after_provider_response", rateLimit);
+		await t.fire("after_provider_response", { status: 500, headers: {} });
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, "Stream ended unexpectedly");
+		assert.deepEqual(t.rec.setModels, []);
+		await t.fire("after_provider_response", rateLimit);
+		t.beforeReq({}); // The next request failed before receiving any response headers.
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, "Connection ended unexpectedly");
+		assert.deepEqual(t.rec.setModels, []);
+	} finally { await t.fire("session_shutdown"); }
+});
 
-	assert.deepEqual(t.rec.setModels, []);
-	assert.equal(t.readState().pendingFrom, "cerebras/qwen-3.8-27b");
-	assert.match(t.rec.notifies.join("\n"), /same account and model in ~2m/i);
+test("unmanaged Retry-After blocks a new dispatch if no fallback is ready", async () => {
+	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
+	try {
+		await t.fire("after_provider_response", { status: 429, headers: { "Retry-After": "120" } });
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
+		const since = t.rec.notifies.length;
+		const editor: string[] = [];
+		t.ctx.ui.setEditorText = (text: string) => { editor.push(text); };
+		assert.deepEqual(await t.input("should not dispatch"), { action: "handled" });
+		const notices = t.rec.notifies.slice(since).join("\n");
+		assert.match(notices, /claude-code.*rate or quota limit.*expires at.*\/multi-account reset claude-code/i);
+		assert.match(notices, /prompt was not sent.*Retry-After.*back in the editor/i);
+		assert.deepEqual(editor, ["should not dispatch"], "the held prompt is handed back, not dropped");
+		assert.doesNotMatch(notices, /resume automatically/i);
+		await t.command("reset claude-code");
+		assert.deepEqual(await t.input("retry now"), { action: "continue" });
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("unmanaged limit restoration respects a provider exclusion", async () => {
+	const t = externalClaudeSetup();
+	try {
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
+		assert.equal(t.ctx.model.provider, "anthropic");
+		await t.command("exclude claude-code");
+		await t.input("keep the original provider excluded");
+		await t.fire("before_agent_start", { messageType: "user" });
+		assert.equal(t.ctx.model.provider, "anthropic");
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("a legacy unmanaged cooldown explains startup failover and can be reset without touching its sibling", async () => {
+	const provider = EXTERNAL_CLAUDE_MODEL.provider;
+	const t = setup({ current: EXTERNAL_CLAUDE_MODEL,
+		accounts: { ...TWO_ACCOUNTS, [provider]: { type: "api_key", key: "fixture-legacy" } },
+		hostModelsByProvider: { [provider]: [EXTERNAL_CLAUDE_MODEL.id] },
+		seedCooldownsMsFromNow: { [provider]: 6 * 60 * 60_000, "unrelated-provider": 60_000 },
+		config: { childProxy: false },
+	});
+	t.ctx.sessionManager = { getBranch: () => [] };
+	try {
+		const expiry = "(in ~6h)";
+		await t.fire("session_start");
+		assert.notEqual(t.ctx.model.provider, provider);
+		assert.ok(t.rec.notifies.some(message => message.includes(expiry) &&
+			message.includes("original cause unavailable") && message.includes(`/multi-account reset ${provider}`)));
+		await t.command(`reset ${provider}`);
+		assert.equal(t.readState().exhaustedUntilByProvider?.[provider], undefined);
+		assert.ok(t.readState().exhaustedUntilByProvider?.["unrelated-provider"] > Date.now());
+		await t.setModel(provider, EXTERNAL_CLAUDE_MODEL.id);
+		await t.input("retry on the manually reselected provider");
+		assert.deepEqual(t.ctx.model, EXTERNAL_CLAUDE_MODEL);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("an unmanaged refusal with no fallback does not arm a retry in the same task", async () => {
+	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider], autoContinue: true });
+	try {
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
+		assert.deepEqual(t.rec.setModels, []);
+		assert.equal(t.readState().pendingFrom, undefined);
+		assert.match(t.rec.notifies.join("\n"), /no immediately available fallback.*claude-code.*Cooldown expires at/);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("unmanaged OAuth auth failures still get the long cooldown", async () => {
+	const t = externalClaudeSetup();
+	try {
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, "401 unauthorized");
+		assert.equal(t.ctx.model.provider, "anthropic");
+		const until = t.readState().exhaustedUntilByProvider?.[EXTERNAL_CLAUDE_MODEL.provider] ?? 0;
+		assert.ok(until > Date.now() + 5 * 60 * 60_000);
+		assert.ok(t.rec.notifies.some(notice => /expires at \S.* \(in ~[56]h/.test(notice) &&
+			notice.includes("authentication failed") && notice.includes("/multi-account reset claude-code")));
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("reset with a provider clears just that provider's cooldowns", async () => {
+	const target = EXTERNAL_CLAUDE_MODEL.provider;
+	const other = "claude-code-account-2";
+	const until = Date.now() + 60_000;
+	const modelCooldowns = { [`${target}/vendor/model`]: until, [`${other}/vendor/model`]: until };
+	const deadKey = "fixture-dead";
+	const tokenHash = createHash("sha256").update(deadKey).digest("hex").slice(0, 12);
+	const invalidated = { "dead-account": { tokenHash, reason: "fixture refusal", at: Date.now() } };
+	const t = setup({ current: EXTERNAL_CLAUDE_MODEL,
+		accounts: { "dead-account": { type: "api_key", key: deadKey } },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: { [target]: until, [other]: until },
+			exhaustedUntilByModel: modelCooldowns,
+			invalidatedByProvider: invalidated,
+		},
+	});
+	try {
+		await t.command(`reset ${target}`);
+		const state = t.readState();
+		assert.deepEqual(state.exhaustedUntilByProvider, { [other]: until });
+		assert.deepEqual(state.exhaustedUntilByModel, { [`${other}/vendor/model`]: until });
+		assert.deepEqual(state.invalidatedByProvider, invalidated);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("reset with an unknown provider changes nothing and says so", async () => {
+	const until = Date.now() + 60_000;
+	const t = setup({ current: EXTERNAL_CLAUDE_MODEL,
+		seedState: { stateVersion: 5, exhaustedUntilByProvider: { [EXTERNAL_CLAUDE_MODEL.provider]: until } } });
+	try {
+		await t.command("reset claud-code");
+		assert.equal(t.readState().exhaustedUntilByProvider?.[EXTERNAL_CLAUDE_MODEL.provider], until);
+		assert.match(t.rec.notifies.at(-1) ?? "", /unknown provider "claud-code"; nothing was reset/);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("resetting a provider that refused the current task explains it stays skipped until the next message", async () => {
+	const t = externalClaudeSetup();
+	try {
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
+		await t.command("reset claude-code");
+		assert.match(t.rec.notifies.at(-1) ?? "", /cleared cooldowns for claude-code\. .*until your next message/);
+	} finally { await t.fire("session_shutdown"); }
 });
 
 test("neverFailoverProviders leaves an unmanaged provider's own retry logic alone", async () => {
@@ -7976,7 +8140,7 @@ test("adding neverFailoverProviders while a retry is pending cancels that extens
 		accounts: { ...TWO_ACCOUNTS, cerebras: { type: "api_key", key: "fixture-only" } },
 		config: { childProxy: false, transientCooldownMs: 25, pendingPollMs: 25 } });
 	try {
-		await finishError(t, "cerebras", "qwen-3.8-27b", "429 status code (no body)");
+		await finishError(t, "cerebras", "qwen-3.8-27b", "503 service unavailable");
 		assert.equal(t.readState().pendingFrom, "cerebras/qwen-3.8-27b");
 		const config = JSON.parse(readFileSync(CONFIG, "utf8"));
 		writeFileSync(CONFIG, JSON.stringify({ ...config, neverFailoverProviders: ["cerebras"] }));
@@ -10473,11 +10637,15 @@ test("a provider that is out of credits is benched, so failover cannot land back
 	await t.fire("session_start");
 	await finishError(t, "openrouter", "ai21/jamba-large-1.7", OPENROUTER_402);
 
-	const cooldown = t.readState().exhaustedUntilByProvider?.openrouter ?? 0;
-	assert.ok(
-		cooldown > Date.now(),
-		"the refusing account must be benched so the rotation stops returning to it",
-	);
+	assert.equal(t.readState().exhaustedUntilByProvider?.openrouter, undefined);
+	const fallback = t.ctx.model;
+	assert.notEqual(fallback.provider, "openrouter");
+	// Even if the short backoff has elapsed, an exhausted provider cannot return in this task.
+	const realNow = Date.now;
+	try {
+		Date.now = () => realNow() + 120_000;
+		await finishError(t, fallback.provider, fallback.id, "429 quota exceeded");
+	} finally { Date.now = realNow; }
 	assert.ok(
 		!t.rec.setModels.some((target: string) => target.startsWith("openrouter/")),
 		`and must never be chosen as the failover target; switches were ${JSON.stringify(t.rec.setModels)}`,
@@ -10503,17 +10671,17 @@ test("native model selection retries DeepSeek through both preflights despite a 
 	} finally { await t.fire("session_shutdown"); }
 });
 
-for (const error of ["401 unauthorized", "429 quota exceeded"]) test(`unmanaged provider retains recoverable/auth versus quota distinction: ${error}`, async () => {
+test("a bare unmanaged API-key 401 keeps its recoverable auth cooldown", async () => {
 	const model = { provider: "deepseek", id: "deepseek-flash" };
 	const t = setup({ current: model,
 		accounts: { ...TWO_ACCOUNTS, deepseek: { type: "api_key", key: "fixture-key" } },
 		hostModelsByProvider: { deepseek: [model.id] }, config: { childProxy: false, autoContinue: false } });
 	try {
-		await finishError(t, model.provider, model.id, error);
+		await finishError(t, model.provider, model.id, "401 unauthorized");
 		assert.equal(t.readState().invalidatedByProvider?.deepseek, undefined);
 		const remaining = t.readState().exhaustedUntilByProvider.deepseek - Date.now();
-		if (error.startsWith("401")) { assert.ok(remaining > 0 && remaining <= 60000); assert.doesNotMatch(t.rec.notifies.join("\n"), /out of quota/); }
-		else assert.ok(remaining > 5 * 60 * 60 * 1000, "actual quota refusal must keep its long cooldown");
+		assert.ok(remaining > 0 && remaining <= 60_000);
+		assert.match(t.rec.notifies.join("\n"), /authentication failed/);
 	} finally { await t.fire("session_shutdown"); }
 });
 
@@ -11507,7 +11675,23 @@ test("xAI cooldowns honour the cheap usage-probe recheck ceiling", async () => {
 	);
 });
 
-test("an xAI API key is not treated as a cheap subscription usage probe", async () => {
+test("telemetry-backed xAI OAuth retains its existing bodyless 429 retry", async () => {
+	const t = setup({
+		current: { provider: "xai", id: "grok-4.6" },
+		accounts: { ...TWO_ACCOUNTS, xai: { type: "oauth", access: xaiAccessToken("xai-user-123"), refresh: "xai-refresh" } },
+		config: { childProxy: false },
+	});
+	try {
+		await t.fire("after_provider_response", { status: 429, headers: { "retry-after": "120" } });
+		await finishError(t, "xai", "grok-4.6", "429 status code (no body)");
+		assert.deepEqual(t.rec.setModels, []);
+		assert.equal(t.readState().pendingFrom, "xai/grok-4.6");
+		assert.equal(t.readState().exhaustedUntilByProvider?.xai, undefined);
+		assert.match(t.rec.notifies.join("\n"), /same account and model in ~2m/i);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("an xAI API key limit does not persist a subscription cooldown based on the error body", async () => {
 	const t = setup({
 		accounts: {
 			xai: { type: "api_key", key: "xai-test-key" },
@@ -11524,12 +11708,8 @@ test("an xAI API key is not treated as a cheap subscription usage probe", async 
 		"You have reached your usage limit. Try again in ~40000 min.",
 	);
 
-	const until = t.readState().exhaustedUntilByProvider?.xai ?? 0;
-	const minutes = Math.round((until - Date.now()) / 60_000);
-	assert.ok(
-		minutes > 30,
-		`an xAI API key cannot be re-probed without spending a user turn; got ${minutes}m`,
-	);
+	assert.equal(t.readState().exhaustedUntilByProvider?.xai, undefined);
+	await t.fire("session_shutdown");
 });
 
 test("switch accepts the name people actually type", async () => {

@@ -3524,6 +3524,16 @@ function formatUntil(timestamp: number) {
 }
 
 /** Human-readable wait duration: "45s", "12m", "2h 20m" — never the misleading hours-only ceil. */
+/** Local wall-clock expiry plus the remaining delay, e.g. "at 14:51 (in ~12m)". */
+function formatCooldownExpiry(until: number, now: number): string {
+	const at = new Date(until);
+	const sameDay = at.toDateString() === new Date(now).toDateString();
+	const clock = sameDay
+		? at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+		: at.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+	return `at ${clock} (in ~${formatDelay(Math.max(0, until - now))})`;
+}
+
 function formatDelay(ms: number): string {
 	if (ms < 60_000) return `${Math.ceil(ms / 1000)}s`;
 	const totalMinutes = Math.ceil(ms / 60_000);
@@ -3971,6 +3981,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// Response headers arrive before the final assistant message. Keep their cooldown hints, but
 	// never switch accounts from that early hook: Pi may still be retrying the same HTTP request.
 	const responseCooldownHints = new Map<string, number>();
+	let unmanaged429: { model: ModelRef; epoch: number; retryAt?: number } | undefined;
+	// A refusal blocks automatic reselection for this task, even if the short backoff expires.
+	// Only a server hint carries over to a new prompt. Neither is persisted.
+	const unmanagedLimitBackoffs = new Map<string, { until: number; hinted: boolean; refusedThisTask: boolean }>();
+	const activeCooldownFailureByProvider = new Map<string, string>();
+	let deferredUnmanagedModel: { provider: string; id: string } | undefined;
 	const handledAssistantErrors = new Set<string>();
 	// Consecutive limit-error accounting per provider (in-memory, reset on any success). Two limit
 	// errors in a row prove the usage-% window is not seeing this account's real limit, so usage is
@@ -4541,6 +4557,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		options: {
 			clearPending?: "owned" | "owned-or-legacy";
 			writeUserPreferences?: boolean;
+			resetProviderCooldowns?: string;
 		} = {},
 	) {
 		let next: ProviderFailoverState = {
@@ -4571,6 +4588,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		try {
 			next = mutateStateFile<ProviderFailoverState>(STATE_PATH, (disk) => {
 				next = mergeStateDeltas(lastSavedState, next, disk);
+				// An explicit reset can clear a cooldown another session wrote after our last read.
+				if (options.resetProviderCooldowns) {
+					const provider = options.resetProviderCooldowns;
+					for (const map of [next.exhaustedUntilByProvider, next.limitRefusalByProvider, next.usageUntrustedUntilByProvider]) {
+						if (map) delete map[provider];
+					}
+					const modelCooldowns = next.exhaustedUntilByModel ?? {};
+					for (const key of Object.keys(modelCooldowns)) {
+						if (key.startsWith(`${provider}/`)) delete modelCooldowns[key];
+					}
+				}
 				// Background telemetry and older windows may not roll back global recency.
 				if ((disk.lastSuccessfulModel?.at ?? 0) > (next.lastSuccessfulModel?.at ?? 0)) {
 					next.lastSuccessfulModel = disk.lastSuccessfulModel;
@@ -5578,6 +5606,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		let changed = authFailures.delete(provider);
 		changed = invalidatedByProvider.delete(provider) || changed;
 		if (inferenceCompleted) {
+			activeCooldownFailureByProvider.delete(provider);
 			limitStreakByProvider.delete(provider);
 			changed = usageUntrustedUntilByProvider.delete(provider) || changed;
 			changed = limitRefusalByProvider.delete(provider) || changed;
@@ -5663,6 +5692,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		for (const [provider, until] of exhaustedUntilByProvider) {
 			if (until <= now && !isInvalidated(provider)) {
 				exhaustedUntilByProvider.delete(provider);
+				activeCooldownFailureByProvider.delete(provider);
 				changed = true;
 			} else if (until > ceiling) {
 				// A far-future cooldown (mis-parsed long/rolling reset) never gets re-probed on its
@@ -5788,6 +5818,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				? at
 				: Math.max(now, Math.min(at, takenAt + config.maxRecheckIntervalMs));
 		let at = Math.max(now, exhaustedUntilByProvider.get(provider) ?? now);
+		const unmanagedUntil = unmanagedLimitBackoffs.get(provider)?.until ?? 0;
+		if (unmanagedUntil > now) return Math.max(at, unmanagedUntil);
 		// Quota metadata (even a newer allowed:true) cannot erase an actual inference
 		// refusal during its retry backoff. The fence survives restart and sibling roots.
 		if (refusalBackoffActive(provider, now))
@@ -5842,6 +5874,21 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (cached?.serviceable === false || (cached && (cooldownMsFromUsage(cached, now) ?? 0) > 0))
 			return `recheck due · last usage blocked${estimate}`;
 		return `eligible · ${cached?.serviceable === true ? "usage permits; inference unverified" : "availability unverified"}${usageErrors.has(provider) ? "; usage unavailable" : ""}`;
+	}
+
+	function cooldownSkipDescription(model: { provider?: string; id?: string } | undefined, cause?: string): string | undefined {
+		const provider = model?.provider;
+		if (!provider) return undefined;
+		const now = Date.now();
+		const until = Math.max(providerRecoveryAt(provider, now),
+			model.id ? exhaustedUntilByModel.get(ref(provider, model.id)) ?? 0 : 0);
+		if (until <= now || !Number.isFinite(new Date(until).getTime())) return undefined;
+		const backoff = unmanagedLimitBackoffs.get(provider);
+		const failure = cause ?? (backoff && backoff.until === until ? "rate or quota limit" :
+			limitRefusalByProvider.has(provider) ? "provider limit refusal" :
+			activeCooldownFailureByProvider.get(provider) ?? "previous cooldown (original cause unavailable)");
+		const freshPrompt = backoff && !backoff.hinted && backoff.until === until ? " or when you send a new prompt" : "";
+		return `${provider}: ${failure}. Cooldown expires ${formatCooldownExpiry(until, now)}${freshPrompt}. Run /multi-account reset ${provider} to clear it.`;
 	}
 
 	/** Human-readable next-check schedule, not a promise that an account will recover. */
@@ -5990,6 +6037,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			family === "ollama" ||
 			family === "cursor"
 		);
+	}
+
+	function hasUnmanagedQuotaTelemetry(provider: string): boolean {
+		return usageFamily(provider) === "antigravity" || hasCheapAvailabilityProbe(provider);
 	}
 
 	function markExhausted(provider: string, cooldownMs: number) {
@@ -6808,6 +6859,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			let models = resolveTargets(ctx, fallbacks[i], currentModel).filter(
 				(model: any) =>
 					!options.excludeProviders?.has(model.provider) &&
+					(options.manualRoundRobin || !unmanagedLimitBackoffs.get(model.provider)?.refusedThisTask) &&
 					!isRotationExcluded(model) &&
 					!isInvalidated(model.provider) &&
 					providerHasUsableAuth(ctx, model.provider),
@@ -7007,7 +7059,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		sourceModel: any,
 		candidates: any[],
 		reason: string,
-		options: { armContinuation?: boolean; manual?: boolean; allowExcluded?: boolean } = {},
+		options: { armContinuation?: boolean; manual?: boolean; allowExcluded?: boolean; cooldownNotice?: string } = {},
 	) {
 		// All automatic foreground switches share this boundary. Explicit user switches
 		// remain allowed; an opted-out route belongs to Pi/the provider, not this router.
@@ -7031,6 +7083,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		for (const fallback of candidates) {
 			if (stale()) return false;
 			if (!options.allowExcluded && isRotationExcluded(fallback)) continue;
+			if (!options.manual && unmanagedLimitBackoffs.get(fallback.provider)?.refusedThisTask) continue;
 			if (failedProviders.has(fallback.provider)) continue;
 			const to = ref(fallback.provider, fallback.id);
 			const needsRecoveryAdmission = !options.manual && recoveryEnabled(ctx) && (!Number.isFinite(sourceWindow) || !Number.isFinite(fallback.contextWindow) || fallback.contextWindow < sourceWindow || !!recoveryTarget);
@@ -7086,14 +7139,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 			if (stale()) return false;
 			if (!ok) {
-				ctx.ui.notify(
-					`Provider failover: ${to} could not be activated; skipping it briefly`,
-					"warning",
-				);
-				// A setModel failure is not a quota/rate-limit and must not receive the normal
-				// multi-hour cooldown. Still cool it briefly so a broken or half-logged-in slot
-				// does not get retried on every failover attempt.
+				// Activation can fail before any request reaches the account. Use a brief backoff.
 				markExhausted(fallback.provider, config.transientCooldownMs);
+				const cause = "model could not be activated";
+				activeCooldownFailureByProvider.set(fallback.provider, cause);
+				ctx.ui.notify(`Provider failover: ${cooldownSkipDescription(fallback, cause) ?? `${to}: ${cause}`}`, "warning");
 				failedProviders.add(fallback.provider);
 				continue;
 			}
@@ -7128,7 +7178,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				),
 			});
 			ctx.ui.notify(
-				`Provider failover [v${VERSION}]: ${from} → ${to} (${reason})`,
+				`Provider failover [v${VERSION}]: ${from} → ${to} (${reason})${options.cooldownNotice ? `. ${options.cooldownNotice}` : ""}`,
 				"warning",
 			);
 			return true;
@@ -7146,6 +7196,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			scope?: "provider" | "model";
 			excludeProviders?: Iterable<string>;
 			allowFailedRouteResume?: boolean;
+			cooldownCause?: string;
 			/** This failure is real quota evidence; if no route is ready, use the separate wait option. */
 			waitForQuotaRecovery?: boolean;
 		} = {},
@@ -7163,13 +7214,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			lastLeftProvider = failedModel.provider;
 			lastLeftAt = Date.now();
 		}
+		if (cooldownMs > 0 && options.scope !== "model" && options.cooldownCause) {
+			activeCooldownFailureByProvider.set(failedModel.provider, options.cooldownCause);
+		}
+		const cooldownNotice = cooldownSkipDescription(failedModel, options.cooldownCause);
 
 		if (
 			!options.manual &&
 			autoContinuesThisPrompt >= config.maxAutoContinuesPerPrompt
 		) {
 			ctx.ui.notify(
-				`Provider failover: stopped after ${autoContinuesThisPrompt} auto-continues. Send a new message or run /multi-account reset to retry.`,
+				`Provider failover: stopped after ${autoContinuesThisPrompt} auto-continues. Send a new message or run /multi-account reset to retry.${cooldownNotice ? ` ${cooldownNotice}` : ""}`,
 				"warning",
 			);
 			return false;
@@ -7195,12 +7250,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				armSameAccountResumeIfReady(ctx, failedModel, reason, options)
 			)
 				return false;
-			const cooldowns = [...exhaustedUntilByProvider.entries()]
-				.filter(
-					([provider, until]) => until > Date.now() && !isInvalidated(provider),
-				)
-				.map(([provider]) => `${provider}: ${providerAvailabilityDescription(provider)}`)
-				.join(", ");
+			const cooldowns = [cooldownNotice, ...[...new Set([
+				...exhaustedUntilByProvider.keys(), ...unmanagedLimitBackoffs.keys(),
+			])].filter(provider => provider !== failedModel.provider && !isInvalidated(provider))
+				.map(provider => cooldownSkipDescription({ provider }))].filter(Boolean).join(" ");
 			const invalids = [...invalidatedByProvider.keys()].join(", ");
 			const availability = [
 				cooldowns ? `Cooldowns: ${cooldowns}` : undefined,
@@ -7237,9 +7290,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			failedModel,
 			candidates,
 			reason,
-			{ armContinuation: !options.manual, manual: options.manual },
+			{ armContinuation: !options.manual, manual: options.manual, cooldownNotice },
 		);
 		if (switchEpoch !== chainEpoch || userAbortedChain || ctx.signal?.aborted) return false;
+		if (!switched && cooldownNotice) ctx.ui.notify(`Provider failover: ${cooldownNotice}`, "warning");
 		if (
 			!switched &&
 			!options.manual &&
@@ -7280,7 +7334,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (!model?.provider || !model?.id) return false;
 		if (
 			!providerHasUsableAuth(ctx, model.provider) ||
-			isInvalidated(model.provider)
+			isInvalidated(model.provider) ||
+			unmanagedLimitBackoffs.get(model.provider)?.refusedThisTask
 		)
 			return false;
 		const now = Date.now();
@@ -7462,6 +7517,35 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return false;
 	}
 
+	/** Restore the route displaced by an unmanaged limit only on a genuine new prompt. */
+	async function retryDeferredUnmanagedModel(ctx: any): Promise<boolean> {
+		const model = deferredUnmanagedModel;
+		if (!model || subagentChild || (ctx.model && !isAccountChatModel(ctx.model))) return false;
+		if (isRotationExcluded(model) || !providerHasUsableAuth(ctx, model.provider) || isInvalidated(model.provider)) {
+			deferredUnmanagedModel = undefined;
+			return false;
+		}
+		const cooldown = !isFailoverExempt(model.provider) && cooldownSkipDescription(model);
+		if (cooldown) {
+			if (ctx.model?.provider !== model.provider) ctx.ui.notify(`Provider preflight: ${cooldown}`, "warning");
+			return false;
+		}
+		if (ctx.model?.provider === model.provider && ctx.model?.id === model.id) return true;
+		const found = findModelIncludingHidden(ctx, model.provider, model.id);
+		if (!found || !isAccountChatModel(found) || !allowAction("restore selected unmanaged model", ctx)) return false;
+		const epoch = chainEpoch;
+		const target = ref(model.provider, model.id);
+		automaticModelTarget = target;
+		let ok = false;
+		try { ok = await setModelEnsuringVisible(found, ctx); }
+		catch { /* keep the current model if the original route is no longer selectable */ }
+		finally { if (automaticModelTarget === target) automaticModelTarget = undefined; }
+		if (!ok || epoch !== chainEpoch || sessionClosed || ctx.signal?.aborted) return false;
+		restoreDesiredThinking(ctx);
+		applyOnlyActiveFilter(ctx, model.provider);
+		return true;
+	}
+
 	async function ensureReadyModel(ctx: any, reason: string) {
 		if (ctx.model && !isAccountChatModel(ctx.model)) return true;
 		// The launch candidate is authoritative in a pi-subagents child. Let the
@@ -7478,7 +7562,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// Pi's createAgentSession often parks us on kimi/anthropic because Cursor was not
 		// in the registry yet. That fallback is not the user's choice — restore first,
 		// otherwise startup preflight failovers *away* from the accidental model.
-		if (!hostOwnsSessionModel && intended && !onIntended) {
+		if (!hostOwnsSessionModel && intended && !onIntended && !deferredUnmanagedModel &&
+			!unmanagedLimitBackoffs.get(intended.provider)?.refusedThisTask) {
 			await restoreRememberedModel(ctx);
 		}
 		// Restoration can change the provider on legacy hosts. Opt-out means pass the
@@ -7492,7 +7577,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			markManualPinUsed(ctx.model?.provider);
 			return true;
 		}
-		if (hasFailoverPin(ctx.model?.provider)) {
+		if (hasFailoverPin(ctx.model?.provider) && !unmanagedLimitBackoffs.get(ctx.model.provider)?.refusedThisTask) {
 			markFailoverPinUsed(ctx.model?.provider);
 			return true;
 		}
@@ -7501,9 +7586,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			includeCurrent: true,
 			preserveQualityBand: true,
 		});
-		if (candidates.length === 0) return false;
+		const cooldown = cooldownSkipDescription(ctx.model);
+		if (candidates.length === 0) {
+			if (cooldown) ctx.ui.notify(`Provider preflight: ${cooldown}`, "warning");
+			return false;
+		}
 		return activateFallback(ctx, ctx.model, candidates, reason, {
-			armContinuation: false,
+			armContinuation: false, cooldownNotice: cooldown,
 		});
 	}
 
@@ -8650,11 +8739,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function pendingWakeProviders(): string[] {
+		const eligible = (provider: string) => !isInvalidated(provider) && !unmanagedLimitBackoffs.get(provider)?.refusedThisTask;
 		if (isSameModelResumeReason(pendingResume?.reason ?? "")) {
 			const parsed = pendingResume?.from
 				? parseTarget(pendingResume.from)
 				: undefined;
-			return parsed?.provider && !isInvalidated(parsed.provider)
+			return parsed?.provider && eligible(parsed.provider)
 				? [parsed.provider]
 				: [];
 		}
@@ -8664,7 +8754,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					.map((target) => parseTarget(target)?.provider)
 					.filter((p): p is string => !!p),
 			),
-		].filter((provider) => !isInvalidated(provider));
+		].filter(eligible);
 	}
 
 	function nextPendingWakeDelayMs(): number | undefined {
@@ -8706,6 +8796,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		resetPendingWakeBackoff();
 	}
 
+	function releaseUnmanagedTaskBackoffs() {
+		const now = Date.now();
+		for (const [provider, backoff] of unmanagedLimitBackoffs) {
+			if (!backoff.hinted || backoff.until <= now) unmanagedLimitBackoffs.delete(provider);
+			else backoff.refusedThisTask = false;
+		}
+	}
+
 	/**
 	 * A real user action owns the session from this point forward.
 	 *
@@ -8719,8 +8817,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		chainEpoch++;
 		if (reason === "interactive input" || reason.startsWith("manual")) {
 			contextGuardAccessFailure = undefined;
+			releaseUnmanagedTaskBackoffs();
 		}
-		if (reason.startsWith("manual")) manualRouteOwnsErrors = true;
+		if (reason.startsWith("manual")) {
+			manualRouteOwnsErrors = true;
+			deferredUnmanagedModel = undefined;
+		}
 		autoContinuesThisPrompt = 0;
 		clearAutoContinueBudgetNotice();
 		clearRejectedCompactionWake();
@@ -8835,6 +8937,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// never rotate to a sibling model (which would silently downgrade e.g. gpt-5.5 → gpt-5.4
 		// on the same account, whose quota is shared, so the downgrade escapes nothing).
 		if (isSameModelResumeReason(pendingSnapshot?.reason ?? "")) {
+			if (unmanagedLimitBackoffs.get(sourceModel.provider)?.refusedThisTask) {
+				clearPendingContinuation();
+				return;
+			}
 			const now = Date.now();
 			if (providerRecoveryAt(sourceModel.provider, now) <= now && (pendingSnapshot?.retryAt ?? now) <= now) {
 				const resumeReason = pendingSnapshot?.reason;
@@ -8898,6 +9004,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const sourceRef = ref(sourceModel.provider, sourceModel.id);
 		const sourceRecovered =
 			!isAuthPendingReason(pendingReason) &&
+			!unmanagedLimitBackoffs.get(sourceModel.provider)?.refusedThisTask &&
 			providerRecoveryAt(sourceModel.provider, now) <= now &&
 			(exhaustedUntilByModel.get(sourceRef) ?? 0) <= now &&
 			providerHasUsableAuth(ctx, sourceModel.provider) &&
@@ -9288,6 +9395,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// ----- command ----------------------------------------------------------
 
 	function clearProviderRuntimeState(provider: string) {
+		activeCooldownFailureByProvider.delete(provider);
+		unmanagedLimitBackoffs.delete(provider);
+		if (deferredUnmanagedModel?.provider === provider) deferredUnmanagedModel = undefined;
 		invalidatedByProvider.delete(provider);
 		exhaustedUntilByProvider.delete(provider);
 		limitRefusalByProvider.delete(provider);
@@ -9843,6 +9953,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// Forget every alias slot we ever registered with Pi — they no longer
 			// have credentials, so re-discovery will not pick them up.
 			registeredSlots.clear();
+			unmanagedLimitBackoffs.clear();
+			activeCooldownFailureByProvider.clear();
+			deferredUnmanagedModel = undefined;
 			limitRefusalByProvider.clear();
 			usageUntrustedUntilByProvider.clear();
 			limitStreakByProvider.clear();
@@ -9855,6 +9968,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			codexModelCatalogByProvider.clear();
 			discoveredCodexModelOrder = [];
 			responseCooldownHints.clear();
+			unmanaged429 = undefined;
 			handledAssistantErrors.clear();
 			currentPromptSwitch = undefined;
 			chainEpoch++;
@@ -9886,7 +10000,44 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		if (command === "reset") {
+			if (arg1) {
+				if (parts.length !== 2 || arg1.includes("/")) {
+					ctx.ui.notify("pi-multi-account: usage: /multi-account reset [provider]", "warning");
+					return;
+				}
+				const known = new Set<string>([
+					...rotation, ...Object.keys(readAuthFile()), ...exhaustedUntilByProvider.keys(),
+					...limitRefusalByProvider.keys(), ...unmanagedLimitBackoffs.keys(),
+					...[...exhaustedUntilByModel.keys()].flatMap(key => parseTarget(key)?.provider ?? []),
+					...((ctx.modelRegistry?.getAll?.() ?? []) as any[]).map(model => model?.provider).filter(Boolean),
+				]);
+				if (!known.has(arg1)) {
+					ctx.ui.notify(`pi-multi-account: unknown provider "${arg1}"; nothing was reset. Known providers: ${[...known].sort().join(", ") || "none"}.`, "warning");
+					return;
+				}
+				const backoff = unmanagedLimitBackoffs.get(arg1);
+				const stillRefusedThisTask = !!backoff?.refusedThisTask;
+				if (backoff?.refusedThisTask) backoff.until = 0;
+				else unmanagedLimitBackoffs.delete(arg1);
+				responseCooldownHints.delete(arg1);
+				if (unmanaged429 && parseTarget(unmanaged429.model)?.provider === arg1) unmanaged429 = undefined;
+				activeCooldownFailureByProvider.delete(arg1);
+				limitStreakByProvider.delete(arg1);
+				exhaustedUntilByProvider.delete(arg1);
+				limitRefusalByProvider.delete(arg1);
+				usageUntrustedUntilByProvider.delete(arg1);
+				for (const key of exhaustedUntilByModel.keys()) {
+					if (key.startsWith(`${arg1}/`)) exhaustedUntilByModel.delete(key);
+				}
+				persist(undefined, { resetProviderCooldowns: arg1 });
+				ctx.ui.notify(stillRefusedThisTask
+					? `pi-multi-account: cleared cooldowns for ${arg1}. It refused the current task, so automatic failover will not return to it until your next message; select it with /model to use it now.`
+					: `pi-multi-account: cleared cooldowns for ${arg1}.`, "info");
+				return;
+			}
 			chainEpoch++;
+			unmanagedLimitBackoffs.clear();
+			activeCooldownFailureByProvider.clear();
 			limitRefusalByProvider.clear();
 			usageUntrustedUntilByProvider.clear();
 			limitStreakByProvider.clear();
@@ -9902,6 +10053,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			expectingInjectedContinuation = false;
 			authFailures.clear();
 			responseCooldownHints.clear();
+			unmanaged429 = undefined;
 			handledAssistantErrors.clear();
 			usageByProvider.clear();
 			usageErrors.clear();
@@ -10423,7 +10575,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// was the only way anyone found to reach a chosen account.
 				`Switch accounts: /multi-account best — jump straight to an account that can work now · /multi-account switch <provider> — e.g. /multi-account switch ${rotation.find((p) => p !== ctx.model?.provider) ?? rotation[0] ?? "<provider>"} · /multi-account next steps through the rotation in order`,
 				`Model pins: ${Object.entries(config.pinnedModels).map(([scope, id]) => `${scope}/${id}`).join(", ") || "none"} · /multi-account pins to inspect`,
-				`Other commands: status | accounts [refresh] | best | priority [...] | limits [refresh] | models | pick | pin <provider/model> | unpin <provider-or-family> | pins [list] | save-default | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | exclude <provider-id|provider-id/model-id> | include <provider-id|provider-id/model-id> | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
+				`Other commands: status | accounts [refresh] | best | priority [...] | limits [refresh] | models | pick | pin <provider/model> | unpin <provider-or-family> | pins [list] | save-default | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | exclude <provider-id|provider-id/model-id> | include <provider-id|provider-id/model-id> | revive <provider|all> | clear | stop | reset [provider] | reload | enable | disable`,
 			].join("\n"),
 			"info",
 		);
@@ -10450,6 +10602,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				rotation,
 				invalidated: [...invalidatedByProvider.keys()],
 				excluded: [...config.excludedProviders, ...config.excludedModels],
+				cooldownProviders: [...new Set([
+					...exhaustedUntilByProvider.keys(), ...limitRefusalByProvider.keys(), ...unmanagedLimitBackoffs.keys(),
+					...[...exhaustedUntilByModel.keys()].flatMap(key => parseTarget(key)?.provider ?? []),
+				])],
 			}),
 			handler: safeHandleCommand,
 		});
@@ -11290,6 +11446,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			| { kind?: string; sessionId?: string; cwd?: string; model?: RouteModelRef }
 			| undefined;
 		if (request?.kind !== "background") {
+			unmanaged429 = undefined; // A new dispatch cannot inherit a previous request's 429.
 			noteProviderRequestObserved();
 			if (request?.model?.provider && request.model.id) compactionObservation?.observeNativeRequest(request.model);
 		}
@@ -12169,6 +12326,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (recoveryEnabled(ctx) && archives.list().items.length) activateRecoveryTools();
 		const startEpoch = ++chainEpoch;
 		sessionClosed = false;
+		unmanagedLimitBackoffs.clear();
+		activeCooldownFailureByProvider.clear();
+		deferredUnmanagedModel = undefined;
 		hostOwnsSessionModel = typeof ctx?.sessionManager?.getBranch === "function";
 		const rawSessionId = ctx?.sessionManager?.getSessionId?.();
 		const sessionId = typeof rawSessionId === "string" && rawSessionId.length > 0
@@ -12297,6 +12457,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		recoveryFailures = 0;
 		breakerOpenUntil = 0;
 		responseCooldownHints.clear();
+		unmanaged429 = undefined;
 		handledAssistantErrors.clear();
 		clearQueuedInputs();
 		logEvent("session_start", {
@@ -12386,6 +12547,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		manualPinnedProvider = undefined;
 		failoverPinnedProvider = undefined;
 		responseCooldownHints.clear();
+		unmanaged429 = undefined;
 		handledAssistantErrors.clear();
 		ctx?.ui?.setStatus?.("multi-account-quota", undefined);
 	});
@@ -12554,6 +12716,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 
 		if (
+			await retryDeferredUnmanagedModel(ctx) ||
 			await ensureReadyModel(ctx, "preflight: selected account unavailable")
 		) {
 			// Readiness preflight awaits auth/catalog work. The session may have become busy while it
@@ -12567,6 +12730,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				}
 			}
 			return { action: "continue" as const };
+		}
+
+		const backoff = unmanagedLimitBackoffs.get(ctx.model?.provider);
+		if (backoff?.hinted && backoff.until > Date.now()) {
+			// Sending now would only collect another refusal. Do not hide the prompt in extension
+			// memory either: hand the text back to the editor so nothing the user typed is lost.
+			const restored = text.trim().length > 0 && typeof ctx.ui?.setEditorText === "function";
+			if (restored) ctx.ui.setEditorText(text);
+			const images = (event as any).images?.length ? " Attached images were not kept; attach them again." : "";
+			ctx.ui.notify(`pi-multi-account: your prompt was not sent because ${ctx.model.provider} asked to wait (Retry-After) until ${formatCooldownExpiry(backoff.until, Date.now())}. ${restored ? "Your text is back in the editor; send it after that time, " : "Send it again after that time, "}or select another provider, or run /multi-account reset ${ctx.model.provider} to try now.${images}`, "warning");
+			return { action: "handled" as const };
 		}
 
 		const delay = nextModelAvailabilityDelayMs(ctx);
@@ -12667,6 +12841,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		currentPromptSwitch = undefined;
 		automaticModelTarget = undefined;
 		responseCooldownHints.clear();
+		unmanaged429 = undefined;
 		handledAssistantErrors.clear();
 		captureDesiredThinking(ctx); // remember the level BEFORE any failover can clamp it
 		refreshDiscovery(false, ctx); // also refresh Pi's in-memory AuthStorage
@@ -12834,6 +13009,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			logEvent("foreground_provider_http_failure", { status, provider: ctx.model.provider, model: ctx.model.id });
 		}
 		if (!automaticFailoverEnabled()) return;
+		const route = request?.model ?? ctx.model;
+		if (route?.provider && route.id && !classifyProvider(route.provider, config.qwenProvider) &&
+			!hasUnmanagedQuotaTelemetry(route.provider)) {
+			const model = ref(route.provider, route.id);
+			if (unmanaged429?.model === model) unmanaged429 = undefined;
+			if (status === 429) {
+				const headers: Record<string, string> = event.headers ?? {};
+				const delay = retryAfterToMs(Object.entries(headers).find(([name]) => name.toLowerCase() === "retry-after")?.[1]);
+				unmanaged429 = { model, epoch: chainEpoch,
+					retryAt: delay === undefined ? undefined : Date.now() + Math.min(delay, MAX_LIVE_COOLDOWN_MS) };
+			}
+		}
 		if (status < 400 && ctx.model) {
 			noteProviderSuccessObserved();
 			noteAuthSuccess(ctx.model.provider, ctx.model.id);
@@ -12842,14 +13029,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		if ((status === 429 || status === 402 || status === 403) && ctx.model) {
-			// Managed providers use these hints for every limit response. For unmanaged
-			// providers retain only 429 hints: they let a bodyless rate limit use the
-			// server's Retry-After instead of the six-hour quota cooldown.
-			if (
-				status !== 429 &&
-				!classifyProvider(ctx.model.provider, config.qwenProvider)
-			) return;
-			const cooldownMs = cooldownFromHeaders((event as any).headers ?? {});
+			// Keep the existing quota hints for providers with telemetry.
+			const managed = !!classifyProvider(ctx.model.provider, config.qwenProvider);
+			if (!managed && (status !== 429 || !hasUnmanagedQuotaTelemetry(ctx.model.provider))) return;
+			const cooldownMs = cooldownFromHeaders(event.headers ?? {});
 			if (cooldownMs !== undefined) {
 				responseCooldownHints.set(
 					ctx.model.provider,
@@ -12878,6 +13061,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// differently cannot make a healthy session look like a spinning one.
 			noteProviderSuccessObserved();
 			noteRecoveryProgress();
+			if (message.provider && deferredUnmanagedModel?.provider === message.provider &&
+				deferredUnmanagedModel?.id === message.model) deferredUnmanagedModel = undefined;
 			if (message.provider) noteAuthSuccess(message.provider, message.model, true);
 			return;
 		}
@@ -12897,6 +13082,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// errors from unmanaged providers that are NOT the model the user is currently on (those
 		// are unrelated background errors we must not hijack).
 		const managed = !!classifyProvider(provider, config.qwenProvider);
+		const external429 = unmanaged429?.model === ref(provider, modelId) && unmanaged429.epoch === chainEpoch
+			? unmanaged429 : undefined;
+		if (external429) unmanaged429 = undefined;
 		const isCurrentModelProvider = provider === ctx.model?.provider;
 		if (!managed && !isCurrentModelProvider) return;
 		// A manual selection owns the route. Automatic preflight may also have moved ctx.model,
@@ -12920,6 +13108,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				dispatched: true,
 				stopReason: "error",
 				errorMessage: errorText,
+				response: external429 ? { status: 429 } : undefined,
 			},
 			completionFailurePatterns(),
 		);
@@ -12935,10 +13124,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			ctx.ui?.notify?.("Codex returned an opaque Bad Request; this is not quota evidence. The server did not identify the rejected field. Avoid repeating the same request; choose a different model or compact the context.", "warning");
 		}
 
-		// Unmanaged active provider (e.g. plain `openai` API quota): we cannot manage its
-		// cooldown/refresh lifecycle, but we rescue the task by switching to a managed account on
-		// any actionable error. scope:"model" + a short cooldown so we never poison a provider we
-		// don't own.
+		if (deferredUnmanagedModel?.provider === provider && deferredUnmanagedModel?.id === modelId &&
+			failureKind !== "limit") deferredUnmanagedModel = undefined;
 		if (!managed) {
 			// Opt-out for unmanaged providers that run their own retry logic (usually a companion
 			// extension owning retries for that provider). Switching accounts underneath it would
@@ -12955,23 +13142,28 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				retryTemporaryFailure(ctx, failedModel, errorText);
 				return;
 			}
-			// A bodyless 429 proves throttling, not account-level credit exhaustion.
-			// Retry the same route after Retry-After (or the normal transient minute)
-			// instead of poisoning the whole provider for six hours.
-			if (/^429 status code \(no body\)$/i.test(errorText.trim())) {
-				const retryDelayMs =
-					responseCooldownHints.get(provider) ?? config.transientCooldownMs;
+			const hasTelemetry = hasUnmanagedQuotaTelemetry(provider);
+			// Keep the old same-route retry on telemetry-backed accounts only. For an
+			// unmetered provider, bodyless and body-bearing 429s follow the same policy.
+			if (hasTelemetry && /^429 status code \(no body\)$/i.test(errorText.trim())) {
+				const delay = responseCooldownHints.get(provider) ?? config.transientCooldownMs;
 				responseCooldownHints.delete(provider);
-				retryTemporaryFailure(ctx, failedModel, errorText, retryDelayMs);
+				retryTemporaryFailure(ctx, failedModel, errorText, delay);
 				return;
 			}
-			// A quota or authorization refusal is about the ACCOUNT, not the model, and it does not
-			// clear in a minute: an unmanaged account out of credits refuses everything until it is
-			// topped up. Benching only the model for `transientCooldownMs` let the very next switch
-			// pick the same account, get the same refusal, and close the loop — which is precisely
-			// how a session ended up answering every user message with the same "out of credits"
-			// error while live accounts sat unused. Transient blips and model-specific errors keep
-			// the light touch, because those genuinely are momentary or model-scoped.
+			if (failureKind === "limit" && !hasTelemetry) {
+				const retryAt = external429?.retryAt;
+				const until = retryAt ?? Date.now() + Math.min(config.transientCooldownMs, MAX_LIVE_COOLDOWN_MS);
+				unmanagedLimitBackoffs.set(provider, { until, hinted: retryAt !== undefined, refusedThisTask: true });
+				if (autoContinuesThisPrompt === 0 && !deferredUnmanagedModel) {
+					deferredUnmanagedModel = { provider, id: modelId };
+				}
+				// Neither the error body nor Retry-After proves sustained credit exhaustion.
+				// Switch this task, but never arm a wake that retries the same refused provider.
+				await switchToFallback(ctx, failedModel, "external provider rate or quota limit", 0,
+					{ allowFailedRouteResume: false, cooldownCause: "rate or quota limit" });
+				return;
+			}
 			if (failureKind === "auth" && !isRefreshable(provider)) {
 				// API-key rejection belongs to this credential, not a six-hour quota forecast.
 				// Persist its fingerprint so replacement also recovers across process restarts.
@@ -12982,10 +13174,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					: markAuthFailure(provider, errorText);
 				await switchToFallback(ctx, failedModel,
 					`external provider authentication failed: ${errorText.slice(0, 100)}`, killed ? 0 : config.transientCooldownMs,
-					{ scope: "provider" });
+					{ scope: "provider", cooldownCause: "authentication failed" });
 				return;
 			}
-			const accountLevel = failureKind === "auth" || (failureKind === "limit" && !/^google-antigravity(?:-account-\d+)?$/.test(provider));
+			const accountLevel = failureKind === "auth" || (failureKind === "limit" && usageFamily(provider) !== "antigravity");
 			if (accountLevel || failureKind === "model" || failureKind === "limit") {
 				await switchToFallback(
 					ctx,
@@ -12995,6 +13187,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					{
 						scope: accountLevel ? "provider" : "model",
 						waitForQuotaRecovery: failureKind === "limit",
+						cooldownCause: failureKind === "auth" ? "authentication failed" :
+							failureKind === "model" ? "model unavailable" : "rate or quota limit",
 					},
 				);
 			}
@@ -13068,6 +13262,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					? `auth invalid: ${reason.slice(0, 100)}`
 					: `transient auth failure: ${reason.slice(0, 100)}`,
 				cooldownMs,
+				{ cooldownCause: "authentication failed" },
 			);
 			return;
 		}
@@ -13090,7 +13285,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				failedModel,
 				`model unavailable: ${errorText.slice(0, 120)}`,
 				config.transientCooldownMs,
-				{ scope: "model" },
+				{ scope: "model", cooldownCause: "model unavailable" },
 			);
 			return;
 		}

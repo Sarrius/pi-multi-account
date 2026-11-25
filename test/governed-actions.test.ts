@@ -47,7 +47,7 @@ const ALLOWED: Record<string, string> = {
 	// Reached only from a gated caller.
 	dispatchContextGuardContinuation:
 		"gated by allowAction after the context-guard compaction completion callback",
-	setModelEnsuringVisible: "only called by activateFallback, which is gated",
+	setModelEnsuringVisible: "automatic failover and deferred unmanaged restoration are gated at their callers",
 	injectContinuationPrompt:
 		"only called from resumeWithExistingContext, which is gated — the fallback half of one gated action",
 	// Explicitly exempt, with the reason.
@@ -65,6 +65,7 @@ const ALLOWED: Record<string, string> = {
  */
 const GATED = [
 	"activateFallback",
+	"retryDeferredUnmanagedModel",
 	"resumeWithExistingContext",
 	"attemptQueuedInputResume",
 	"on:session_compact",

@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
+### Changed
+
+- A rate or quota refusal from an unmanaged provider without quota telemetry (for example `claude-code`) no longer writes a six-hour provider cooldown to disk. The current task fails over and does not return to that provider; the next user message tries the original model again, unless the provider sent `Retry-After` and that delay is still running. This applies to every such refusal, including "out of credits" responses: the extension cannot measure these providers, and it no longer decides from the wording of the error. A provider that really is out of credits therefore costs one refused request per new message until it is topped up, excluded, or listed in `neverFailoverProviders`. Authentication failures keep their existing cooldowns.
+- While a `Retry-After` delay is running and no fallback is ready, a new prompt is not sent. Its text goes back into the editor instead of being dropped.
+
+### Added
+
+- `/multi-account reset <provider>` clears only that provider's cooldowns. An unknown provider name is reported and changes nothing.
+- Cooldown notices name the provider, the cause, and the local expiry time with the remaining delay, plus the reset command.
+
 ## [1.29.0] — 2026-11-24
 
 ### Added
