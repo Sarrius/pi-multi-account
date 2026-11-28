@@ -8,6 +8,7 @@ export interface CompletionContext {
 	rotation: readonly string[];
 	invalidated?: readonly string[];
 	excluded?: readonly string[];
+	cooldownProviders?: readonly string[];
 }
 
 interface Choice {
@@ -76,7 +77,9 @@ const SUBCOMMANDS: readonly Subcommand[] = [
 	},
 	{ name: "rediscover", description: "Rescan auth.json and rebuild the rotation" },
 	{ name: "reload", description: "Reload config from disk and rediscover accounts" },
-	{ name: "reset", description: "Clear cooldowns, invalidations and pending auto-resume" },
+	{ name: "reset", description: "Clear one provider's cooldowns, or reset all recovery state", takesArgument: true,
+		choices: context => [...new Set([...(context.cooldownProviders ?? []), ...context.rotation])]
+			.map(value => ({ value, description: "Clear this provider's cooldowns only" })) },
 	{ name: "stop", description: "Stop automatic failover and resume for the current task" },
 	{ name: "enable", description: "Turn failover on for this pi process" },
 	{ name: "disable", description: "Turn failover off for this pi process" },

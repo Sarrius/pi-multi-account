@@ -7,6 +7,7 @@ import { completeCommandArguments, type CompletionItem } from "../command-comple
 const rotation = ["anthropic", "anthropic-account-2", "pi-sub-anthropic"];
 const complete = (prefix: string) => completeCommandArguments(prefix, {
 	rotation, invalidated: ["dead-account"], excluded: ["excluded-account", "anthropic/hidden-model"],
+	cooldownProviders: ["anthropic", "claude-code"],
 });
 const values = (items: CompletionItem[] | null) => items?.map(item => item.value);
 
@@ -19,7 +20,7 @@ test("an empty prefix offers every subcommand with a description", () => {
 
 test("a partial subcommand narrows the list", () => {
 	assert.deepEqual(values(complete("sw")), ["switch "]);
-	assert.deepEqual(values(complete("re"))?.sort(), ["rediscover", "reload", "remove ", "reset", "revive "]);
+	assert.deepEqual(values(complete("re"))?.sort(), ["rediscover", "reload", "remove ", "reset ", "revive "]);
 	assert.deepEqual(complete("zzz"), []);
 });
 
@@ -45,6 +46,11 @@ test("add and remove offer the account families", () => {
 	assert.deepEqual(values(complete("add ")), ["add anthropic", "add openai", "add codex", "add kimi", "add cursor", "add ollama", "add qwen"]);
 	assert.deepEqual(values(complete("remove k")), ["remove kimi"]);
 	assert.ok(values(complete("remove "))?.includes("remove anthropic-account-2"));
+});
+
+test("reset completes provider IDs, including cooled providers outside rotation", () => {
+	assert.deepEqual(values(complete("reset claude")), ["reset claude-code"]);
+	assert.deepEqual(values(complete("reset anthropic")), ["reset anthropic", "reset anthropic-account-2"]);
 });
 
 test("priority offers reset and none", () => {
