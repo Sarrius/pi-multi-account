@@ -859,6 +859,7 @@ function setup(opts: {
 
 	return {
 		ctx,
+		pi,
 		rec,
 		fire,
 		setIdle,
@@ -7863,10 +7864,17 @@ for (const [label, error] of [["with a body", EXTERNAL_CLAUDE_429], ["without a 
 			await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, error);
 			assert.equal(t.ctx.model.provider, "anthropic");
 			assert.equal(t.readState().exhaustedUntilByProvider?.[EXTERNAL_CLAUDE_MODEL.provider], undefined);
-			await t.input("next prompt");
-			assert.deepEqual(t.ctx.model, EXTERNAL_CLAUDE_MODEL, "restore before the host validates the route");
+			await t.input("prompt five seconds later");
 			await t.fire("before_agent_start", { messageType: "user" });
-			assert.deepEqual(t.ctx.model, EXTERNAL_CLAUDE_MODEL);
+			assert.equal(t.ctx.model.provider, "anthropic", "a fresh prompt cannot cut the refusal's deadline short");
+			const realNow = Date.now;
+			try {
+				Date.now = () => realNow() + 61_000;
+				await t.input("next prompt after the deadline");
+				assert.deepEqual(t.ctx.model, EXTERNAL_CLAUDE_MODEL, "restore before the host validates the route");
+				await t.fire("before_agent_start", { messageType: "user" });
+				assert.deepEqual(t.ctx.model, EXTERNAL_CLAUDE_MODEL);
+			} finally { Date.now = realNow; }
 		} finally { await t.fire("session_shutdown"); }
 	});
 }
@@ -7925,11 +7933,243 @@ test("unmanaged Retry-After blocks a new dispatch if no fallback is ready", asyn
 		assert.deepEqual(await t.input("should not dispatch"), { action: "handled" });
 		const notices = t.rec.notifies.slice(since).join("\n");
 		assert.match(notices, /claude-code.*rate or quota limit.*expires at.*\/multi-account reset claude-code/i);
-		assert.match(notices, /prompt was not sent.*Retry-After.*back in the editor/i);
+		assert.match(notices, /prompt was not sent.*Retry-After.*expires at.*back in the editor/i);
 		assert.deepEqual(editor, ["should not dispatch"], "the held prompt is handed back, not dropped");
 		assert.doesNotMatch(notices, /resume automatically/i);
 		await t.command("reset claude-code");
 		assert.deepEqual(await t.input("retry now"), { action: "continue" });
+	} finally { await t.fire("session_shutdown"); }
+});
+
+function withClock<T>(offsetMs: number, run: () => Promise<T>): Promise<T> {
+	const realNow = Date.now;
+	Date.now = () => realNow() + offsetMs;
+	return run().finally(() => { Date.now = realNow; });
+}
+
+const IN_FLIGHT_402 = '402: {"message":"Insufficient in-flight budget","code":402,"metadata":{"reason":"in_flight_budget_exhausted"}}';
+
+test("an unmanaged 429 without Retry-After keeps a fixed 60 s deadline from the refusal", async () => {
+	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
+	try {
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
+		// A fresh prompt five seconds later neither shortens nor restarts the deadline.
+		const editor: string[] = [];
+		t.ctx.ui.setEditorText = (text: string) => { editor.push(text); };
+		t.ctx.ui.getEditorText = () => "";
+		assert.deepEqual(await withClock(5_000, () => t.input("five seconds later")), { action: "handled" });
+		assert.deepEqual(editor, ["five seconds later"]);
+		assert.deepEqual(await withClock(30_000, () => t.input("thirty seconds later")), { action: "handled" });
+		// The deadline belongs to the refusal, not to the last prompt: at +60 s it is over.
+		assert.deepEqual(await withClock(60_500, () => t.input("after the deadline")), { action: "continue" });
+		assert.equal(t.readState().exhaustedUntilByProvider?.[EXTERNAL_CLAUDE_MODEL.provider], undefined);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("a 12 h Retry-After is honoured in full for the session, not capped at 6 h", async () => {
+	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
+	try {
+		await t.fire("after_provider_response", { status: 429, headers: { "retry-after": "43200" } });
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
+		assert.equal(t.readState().exhaustedUntilByProvider?.[EXTERNAL_CLAUDE_MODEL.provider], undefined, "nothing is persisted");
+		assert.deepEqual(await withClock(7 * 60 * 60_000, () => t.input("seven hours later")), { action: "handled" });
+		assert.match(t.rec.notifies.at(-1) ?? "", /Retry-After.*\(in ~5h/);
+		assert.deepEqual(await withClock(12 * 60 * 60_000 + 1_000, () => t.input("after twelve hours")), { action: "continue" });
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("a waiting provider with no ready fallback blocks preflight after the fallback also refuses", async () => {
+	// Reviewer scenario: claude-code 429 Retry-After 120 moves the task to Anthropic, then
+	// Anthropic refuses too. The next prompt must not be sent anywhere until a route is ready.
+	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: ["anthropic", EXTERNAL_CLAUDE_MODEL.provider] });
+	try {
+		await t.fire("after_provider_response", { status: 429, headers: { "Retry-After": "120" } });
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
+		assert.equal(t.ctx.model.provider, "anthropic");
+		await t.fire("after_provider_response", { status: 429, headers: { "Retry-After": "120" } });
+		await finishError(t, "anthropic", t.ctx.model.id, "429 rate_limit_error: This request would exceed your account's rate limit");
+		t.ctx.ui.setEditorText = () => {};
+		t.ctx.ui.getEditorText = () => "";
+		assert.deepEqual(await t.input("blocked prompt"), { action: "handled" });
+		assert.match(t.rec.notifies.at(-1) ?? "", /prompt was not sent because (claude-code|anthropic)/);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("the wait gate keeps a newer editor draft and still blocks prompt templates, not commands", async () => {
+	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
+	t.pi.getCommands = () => [{ name: "review", source: "prompt" }, { name: "skill:audit", source: "skill" },
+		{ name: "multi-account", source: "extension" }];
+	try {
+		await t.fire("after_provider_response", { status: 429, headers: { "Retry-After": "120" } });
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
+		const editor: string[] = [];
+		t.ctx.ui.setEditorText = (text: string) => { editor.push(text); };
+		t.ctx.ui.getEditorText = () => "another draft the user started";
+		assert.deepEqual(await t.input("held prompt"), { action: "handled" });
+		assert.deepEqual(editor, [], "an existing draft is never clobbered");
+		assert.match(t.rec.notifies.at(-1) ?? "", /already had a draft/);
+		assert.deepEqual(await t.input("/review this file"), { action: "handled" });
+		assert.deepEqual(await t.input("/skill:audit"), { action: "handled" });
+		assert.deepEqual(await t.input("/multi-account status"), { action: "continue" });
+		assert.deepEqual(await t.input("/model"), { action: "continue" });
+		assert.deepEqual(await t.input("!ls"), { action: "continue" });
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("a busy session cannot queue a prompt past the wait gate", async () => {
+	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
+	try {
+		await t.fire("after_provider_response", { status: 429, headers: { "Retry-After": "120" } });
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
+		t.setIdle(false);
+		const sentBefore = t.rec.sent.length;
+		assert.deepEqual(await t.input("while busy"), { action: "handled" });
+		assert.equal(t.rec.sent.length, sentBefore, "no follow-up copy is queued as an extension message");
+	} finally { await t.fire("session_shutdown"); }
+});
+
+for (const mode of ["print", "json"]) test(`headless ${mode} mode rejects a waiting prompt visibly on stderr`, async () => {
+	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
+	const writes: string[] = [];
+	const realWrite = process.stderr.write;
+	const realExit = process.exitCode;
+	try {
+		await t.fire("after_provider_response", { status: 429, headers: { "Retry-After": "120" } });
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
+		t.ctx.mode = mode;
+		t.ctx.hasUI = false;
+		const notices = t.rec.notifies.length;
+		process.stderr.write = ((chunk: any) => { writes.push(String(chunk)); return true; }) as any;
+		assert.deepEqual(await t.input("headless prompt text"), { action: "handled" });
+		process.stderr.write = realWrite;
+		assert.match(writes.join(""), /prompt was not sent because claude-code/);
+		assert.doesNotMatch(writes.join(""), /headless prompt text/, "the prompt itself is never echoed");
+		assert.equal(process.exitCode, 1);
+		assert.ok(!t.rec.notifies.slice(notices).some(n => /prompt was not sent/.test(n)),
+			"the rejection cannot depend on a no-op UI notify");
+		assert.doesNotMatch(readFileSync(DEBUG_LOG, "utf8"), /headless prompt text/);
+	} finally {
+		process.stderr.write = realWrite;
+		process.exitCode = realExit;
+		await t.fire("session_shutdown");
+	}
+});
+
+test("RPC mode notifies and does not try to restore a client-side draft", async () => {
+	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
+	try {
+		await t.fire("after_provider_response", { status: 429, headers: { "Retry-After": "120" } });
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
+		t.ctx.mode = "rpc";
+		t.ctx.hasUI = true;
+		const editor: string[] = [];
+		t.ctx.ui.setEditorText = (text: string) => { editor.push(text); };
+		t.ctx.ui.getEditorText = () => "";
+		assert.deepEqual(await t.input("rpc prompt"), { action: "handled" });
+		assert.deepEqual(editor, []);
+		assert.match(t.rec.notifies.at(-1) ?? "", /prompt was not sent.*Send it again after that time/);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("an OpenRouter credit-limit 402 keeps its persisted cooldown across a restart", async () => {
+	const accounts = { anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+		openrouter: { type: "api_key", key: "or-key" } };
+	const first = setup({ accounts, current: { provider: "openrouter", id: "ai21/jamba-large-1.7" }, config: { autoContinue: false } });
+	await first.fire("session_start");
+	await finishError(first, "openrouter", "ai21/jamba-large-1.7", OPENROUTER_402);
+	const until = first.readState().exhaustedUntilByProvider?.openrouter ?? 0;
+	assert.ok(until > Date.now() + 60 * 60_000);
+	await first.fire("session_shutdown");
+	const second = setup({ accounts, current: { provider: "openrouter", id: "ai21/jamba-large-1.7" },
+		seedState: first.readState(), preserveConfig: true });
+	try {
+		await second.fire("session_start");
+		assert.equal(second.readState().exhaustedUntilByProvider?.openrouter, until);
+		assert.notEqual(second.ctx.model.provider, "openrouter", "the restarted session still skips it");
+	} finally { await second.fire("session_shutdown"); }
+});
+
+test("an OpenRouter in-flight 402 without a usable Retry-After records nothing and arms no wake", async () => {
+	const t = setup({ accounts: { ...TWO_ACCOUNTS, openrouter: { type: "api_key", key: "or-key" } },
+		current: { provider: "openrouter", id: "ai21/jamba-large-1.7" } });
+	try {
+		await t.fire("session_start");
+		await finishError(t, "openrouter", "ai21/jamba-large-1.7", IN_FLIGHT_402);
+		const state = t.readState();
+		assert.equal(state.exhaustedUntilByProvider?.openrouter, undefined);
+		assert.equal(state.pendingFrom, undefined, "no invented deadline, no blind wake");
+		assert.deepEqual(t.rec.setModels, [], "a positive balance is not a reason to leave the route");
+		assert.match(t.rec.notifies.at(-1) ?? "", /in-flight budget.*did not send a usable Retry-After/);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("a stale 429 Retry-After cannot be borrowed by an in-flight 402", async () => {
+	const t = setup({ accounts: { ...TWO_ACCOUNTS, openrouter: { type: "api_key", key: "or-key" } },
+		current: { provider: "openrouter", id: "ai21/jamba-large-1.7" } });
+	try {
+		await t.fire("session_start");
+		await t.fire("after_provider_response", { status: 429, headers: { "retry-after": "5" } });
+		await finishError(t, "openrouter", "ai21/jamba-large-1.7", IN_FLIGHT_402);
+		assert.equal(t.readState().pendingFrom, undefined);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+for (const answered of [false, true]) test(`an in-flight 402 with Retry-After retries the same route only if the task is ${answered ? "already answered" : "still unanswered"}`, async () => {
+	const model = { provider: "openrouter", id: "ai21/jamba-large-1.7" };
+	const t = setup({ accounts: { ...TWO_ACCOUNTS, openrouter: { type: "api_key", key: "or-key" } },
+		current: model, config: { transientCooldownMs: 25, pendingPollMs: 25 } });
+	const branch: any[] = [{ type: "message", message: { role: "user" } }];
+	t.ctx.sessionManager = { getBranch: () => branch };
+	try {
+		await t.fire("session_start");
+		await t.fire("after_provider_response", { status: 402, headers: { "retry-after": "1" } });
+		const error = await finishError(t, model.provider, model.id, IN_FLIGHT_402);
+		branch.push({ type: "message", message: error });
+		assert.equal(t.readState().pendingFrom, `${model.provider}/${model.id}`);
+		assert.equal(t.readState().exhaustedUntilByProvider?.openrouter, undefined);
+		if (answered) branch.push({ type: "message", message: { role: "assistant", stopReason: "stop" } });
+		await wait(1_400);
+		const resumed = t.rec.continueCalls.length + t.rec.sent.length;
+		if (answered) assert.equal(resumed, 0, "an answered task is never replayed");
+		else assert.ok(resumed > 0, "the unanswered task is retried at the server's deadline");
+		assert.deepEqual(t.rec.setModels.filter(target => !target.startsWith("openrouter/")), []);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("reset <provider> under an occupied state lock changes nothing and reports failure; a retry succeeds", async () => {
+	const target = EXTERNAL_CLAUDE_MODEL.provider, sibling = "claude-code-account-2";
+	const until = Date.now() + 60 * 60_000;
+	const t = setup({ current: EXTERNAL_CLAUDE_MODEL, seedState: { stateVersion: 5,
+		exhaustedUntilByProvider: { [target]: until, [sibling]: until },
+		exhaustedUntilByModel: { [`${target}/m`]: until, [`${sibling}/m`]: until } } });
+	const lockfile = createRequire(import.meta.url)("proper-lockfile");
+	try {
+		await t.fire("session_start");
+		const release = lockfile.lockSync(STATE, { realpath: false });
+		try {
+			await t.command(`reset ${target}`);
+		} finally { release(); }
+		assert.match(t.rec.notifies.at(-1) ?? "", /could not reset claude-code.*Nothing was changed/);
+		assert.doesNotMatch(t.rec.notifies.join("\n"), /cleared cooldowns for claude-code/);
+		assert.equal(t.readState().exhaustedUntilByProvider?.[target], until);
+		const status = await t.command("status");
+		void status;
+		// Memory was not cleared either: the next ordinary write must not drop the target.
+		await t.command(`reset unrelated-provider-that-does-not-exist`);
+		assert.equal(t.readState().exhaustedUntilByProvider?.[target], until);
+		// Another session adds a cooldown to the sibling meanwhile; the retried reset keeps it.
+		const disk = t.readState();
+		disk.exhaustedUntilByProvider[sibling] = until + 1;
+		writeFileSync(STATE, JSON.stringify(disk));
+		await t.command(`reset ${target}`);
+		assert.match(t.rec.notifies.at(-1) ?? "", /cleared cooldowns for claude-code/);
+		const state = t.readState();
+		assert.equal(state.exhaustedUntilByProvider?.[target], undefined);
+		assert.equal(state.exhaustedUntilByProvider?.[sibling], until + 1);
+		assert.deepEqual(state.exhaustedUntilByModel, { [`${sibling}/m`]: until });
+		// The merge baseline moved with the reset, so a later unrelated write cannot resurrect it.
+		await finishError(t, "anthropic", "claude-opus-4-8", "503 service unavailable");
+		assert.equal(t.readState().exhaustedUntilByProvider?.[target], undefined);
 	} finally { await t.fire("session_shutdown"); }
 });
 
@@ -10637,7 +10877,8 @@ test("a provider that is out of credits is benched, so failover cannot land back
 	await t.fire("session_start");
 	await finishError(t, "openrouter", "ai21/jamba-large-1.7", OPENROUTER_402);
 
-	assert.equal(t.readState().exhaustedUntilByProvider?.openrouter, undefined);
+	assert.ok((t.readState().exhaustedUntilByProvider?.openrouter ?? 0) > Date.now() + 60 * 60_000,
+		"the provider's own credit-limit metadata is account state and keeps the persisted cooldown");
 	const fallback = t.ctx.model;
 	assert.notEqual(fallback.provider, "openrouter");
 	// Even if the short backoff has elapsed, an exhausted provider cannot return in this task.
