@@ -14290,8 +14290,14 @@ test("the proxy refuses a caller that did not come from a slot we published", as
 	try {
 		await t.fire("session_start");
 		const slot = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"];
-		globalThis.fetch = (async () => {
-			upstreamCalls++;
+		globalThis.fetch = (async (input, init) => {
+			const url = new URL(input instanceof Request ? input.url : String(input));
+			const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+			// Other background fetches can overlap this fixture. Count only inference
+			// dispatch, and never let any of these calls escape to the network.
+			if (method === "POST" && (url.pathname.endsWith("/codex/responses") || url.pathname.endsWith("/v1/messages"))) {
+				upstreamCalls++;
+			}
 			return new Response("{}", { status: 200 });
 		}) as typeof fetch;
 
@@ -14312,9 +14318,14 @@ test("the proxy refuses a caller that did not come from a slot we published", as
 
 		assert.equal(upstreamCalls, 0, "no refused request may reach an upstream");
 	} finally {
-		globalThis.fetch = realFetch;
-		await t.fire("session_shutdown");
-		rmSync(MODELS, { force: true });
+		// Keep the stub in place through shutdown, so nothing this session fires on its way out
+		// can reach the network either.
+		try {
+			await t.fire("session_shutdown");
+		} finally {
+			globalThis.fetch = realFetch;
+			rmSync(MODELS, { force: true });
+		}
 	}
 });
 
@@ -14596,31 +14607,47 @@ test("one /multi-account stop is enough to end a rotation", async () => {
 			},
 		}),
 	});
-	await t.fire("session_start");
-	await t.fire("agent_start");
-	await finishError(
-		t,
-		"openai-codex",
-		"gpt-5.5",
-		"Codex error: The usage limit has been reached",
-	);
-	await wait(80);
+	try {
+		await t.fire("session_start");
+		await t.fire("agent_start");
+		await finishError(
+			t,
+			"openai-codex",
+			"gpt-5.5",
+			"Codex error: The usage limit has been reached",
+		);
+		await wait(80);
 
-	await t.command("stop");
-	const atStop = t.rec.setModels.length;
-	await wait(300);
+		// The state file is shared by every fixture in this process, and an earlier fixture's
+		// session may still write its own pending marker there. Judge this session by the marker
+		// it armed itself, identified by owner, rather than by whatever marker the file holds.
+		const armed = t.readState();
+		const ownOwner = armed.pendingOwner;
+		assert.ok(
+			typeof ownOwner === "string" && armed.pendingFrom,
+			`precondition: this session armed its own retry before stop; got ${JSON.stringify({ pendingFrom: armed.pendingFrom, pendingOwner: ownOwner })}`,
+		);
 
-	assert.equal(
-		t.rec.setModels.length,
-		atStop,
-		`stop must take on the first attempt; ${t.rec.setModels.length - atStop} further switches happened`,
-	);
-	assert.equal(
-		t.readState().pendingFrom,
-		undefined,
-		"and nothing may be left armed to restart it",
-	);
-	await t.fire("session_shutdown");
+		await t.command("stop");
+		const atStop = t.rec.setModels.length;
+		await wait(300);
+
+		assert.equal(
+			t.rec.setModels.length,
+			atStop,
+			`stop must take on the first attempt; ${t.rec.setModels.length - atStop} further switches happened`,
+		);
+		const after = t.readState();
+		assert.ok(
+			after.pendingOwner !== ownOwner || (!after.pendingFrom && !after.pendingReason),
+			`and nothing this session owns may be left armed to restart it; got ${JSON.stringify({ pendingFrom: after.pendingFrom, pendingReason: after.pendingReason, pendingOwner: after.pendingOwner })}`,
+		);
+		if (after.pendingOwner === undefined) {
+			assert.equal(after.pendingFrom, undefined, "an ownerless marker would read as this session's");
+		}
+	} finally {
+		await t.fire("session_shutdown");
+	}
 });
 
 // ---------------------------------------------------------------------------
@@ -14991,6 +15018,7 @@ const WIDE_FLEET: Account = {
 };
 
 test("a session that acts and acts without a single request reaching a provider stops itself", async () => {
+	const createdFrom = Date.now();
 	const t = setup({
 		accounts: WIDE_FLEET,
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
@@ -15032,7 +15060,16 @@ test("a session that acts and acts without a single request reaching a provider 
 		settled,
 		"nothing may keep switching after the governor has stopped the session",
 	);
-	assert.equal(t.readState().pendingFrom, undefined, "and nothing may be left armed");
+	// The state file is shared with every earlier fixture in this process, and one of their
+	// sessions may still write its own marker. Only a marker this session armed (its owner id is
+	// stamped no earlier than this fixture was created) or an ownerless one counts against it.
+	const left = t.readState();
+	const ownerStamp = Number(String(left.pendingOwner ?? "").split(":")[1]);
+	const armedHere = left.pendingOwner === undefined || !(ownerStamp < createdFrom);
+	assert.ok(
+		!armedHere || (left.pendingFrom === undefined && left.pendingReason === undefined),
+		`and nothing may be left armed; got ${JSON.stringify({ pendingFrom: left.pendingFrom, pendingOwner: left.pendingOwner, createdFrom })}`,
+	);
 	await t.fire("session_shutdown");
 });
 
