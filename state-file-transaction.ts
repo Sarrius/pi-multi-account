@@ -64,6 +64,9 @@ function mutateJsonFile<T extends State>(path: string, transform: (disk: T) => T
     }
   }
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  // After the rename the file has changed. A cleanup failure from then on must not be reported
+  // as a failed write, or a caller would claim nothing changed.
+  let committed = false;
   try {
     let disk: T;
     try {
@@ -79,8 +82,13 @@ function mutateJsonFile<T extends State>(path: string, transform: (disk: T) => T
     const next = transform(disk);
     writeFileSync(temp, `${JSON.stringify(next, null, "\t")}\n`, { mode: 0o600, flag: "wx" });
     renameSync(temp, path);
+    committed = true;
     return next;
   } finally {
-    try { rmSync(temp, { force: true }); } finally { release(); }
+    try {
+      try { rmSync(temp, { force: true }); } finally { release(); }
+    } catch (error) {
+      if (!committed) throw error;
+    }
   }
 }

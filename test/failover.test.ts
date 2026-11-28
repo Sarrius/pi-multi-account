@@ -8114,25 +8114,222 @@ test("a stale 429 Retry-After cannot be borrowed by an in-flight 402", async () 
 	} finally { await t.fire("session_shutdown"); }
 });
 
-for (const answered of [false, true]) test(`an in-flight 402 with Retry-After retries the same route only if the task is ${answered ? "already answered" : "still unanswered"}`, async () => {
+function inFlightSetup(config: Record<string, unknown> = {}) {
 	const model = { provider: "openrouter", id: "ai21/jamba-large-1.7" };
 	const t = setup({ accounts: { ...TWO_ACCOUNTS, openrouter: { type: "api_key", key: "or-key" } },
-		current: model, config: { transientCooldownMs: 25, pendingPollMs: 25 } });
+		current: model, config: { transientCooldownMs: 25, pendingPollMs: 25, ...config } });
 	const branch: any[] = [{ type: "message", message: { role: "user" } }];
 	t.ctx.sessionManager = { getBranch: () => branch };
-	try {
-		await t.fire("session_start");
+	const fail = async () => {
 		await t.fire("after_provider_response", { status: 402, headers: { "retry-after": "1" } });
 		const error = await finishError(t, model.provider, model.id, IN_FLIGHT_402);
 		branch.push({ type: "message", message: error });
-		assert.equal(t.readState().pendingFrom, `${model.provider}/${model.id}`);
+		return error;
+	};
+	return { t, model, branch, fail, resumed: () => t.rec.continueCalls.length + t.rec.sent.length };
+}
+
+for (const answered of [false, true]) test(`an in-flight 402 with Retry-After retries the same route only if the task is ${answered ? "already answered" : "still unanswered"}`, async () => {
+	const { t, model, branch, fail, resumed } = inFlightSetup();
+	try {
+		await t.fire("session_start");
+		await fail();
+		assert.equal(t.readState().pendingFrom, undefined, "the session-local retry marker is never persisted");
 		assert.equal(t.readState().exhaustedUntilByProvider?.openrouter, undefined);
 		if (answered) branch.push({ type: "message", message: { role: "assistant", stopReason: "stop" } });
 		await wait(1_400);
-		const resumed = t.rec.continueCalls.length + t.rec.sent.length;
-		if (answered) assert.equal(resumed, 0, "an answered task is never replayed");
-		else assert.ok(resumed > 0, "the unanswered task is retried at the server's deadline");
-		assert.deepEqual(t.rec.setModels.filter(target => !target.startsWith("openrouter/")), []);
+		if (answered) assert.equal(resumed(), 0, "an answered task is never replayed");
+		else assert.ok(resumed() > 0, "the unanswered task is retried at the server's deadline");
+		assert.deepEqual(t.rec.setModels.filter(target => !target.startsWith(`${model.provider}/`)), []);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("an in-flight 402 retry fails closed when the host has no session branch", async () => {
+	const { t, fail, resumed } = inFlightSetup();
+	t.ctx.sessionManager = undefined;
+	try {
+		await t.fire("session_start");
+		await fail().catch(() => {});
+		assert.match(t.rec.notifies.at(-1) ?? "", /cannot show whether the task was answered/);
+		await wait(1_300);
+		assert.equal(resumed(), 0);
+		assert.equal(t.readState().pendingFrom, undefined);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("an in-flight 402 retry fails closed when the branch API disappears or no longer ends at the failed turn", async () => {
+	for (const mutate of ["drop-api", "other-error", "throws"] as const) {
+		const { t, branch, fail, resumed } = inFlightSetup();
+		try {
+			await t.fire("session_start");
+			await fail();
+			if (mutate === "drop-api") t.ctx.sessionManager = {};
+			else if (mutate === "throws") t.ctx.sessionManager = { getBranch: () => { throw new Error("gone"); } };
+			else branch.push({ type: "message", message: { role: "assistant", stopReason: "error",
+				provider: "openrouter", model: "ai21/jamba-large-1.7", timestamp: -1 } });
+			await wait(1_300);
+			assert.equal(resumed(), 0, `${mutate}: no dispatch without the exact failed turn`);
+		} finally { await t.fire("session_shutdown"); }
+	}
+});
+
+test("an in-flight 402 retry answered during the model switch does not dispatch or re-arm", async () => {
+	const { t, branch, fail, resumed } = inFlightSetup();
+	try {
+		await t.fire("session_start");
+		await fail();
+		// The wake moves back to the failed route. Meanwhile another route answers the task.
+		t.setCurrent("anthropic", "claude-opus-4-8");
+		const realSetModel = t.pi.setModel;
+		t.pi.setModel = async (model: any) => {
+			branch.push({ type: "message", message: { role: "assistant", stopReason: "stop" } });
+			return realSetModel(model);
+		};
+		await wait(1_400);
+		assert.equal(resumed(), 0, "no dispatch after the answer");
+		assert.equal(t.readState().pendingFrom, undefined, "no guard-less marker is re-armed");
+		await wait(200);
+		assert.equal(resumed(), 0);
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("an in-flight 402 deadline gates a new prompt even with auto-continue off", async () => {
+	const { t, fail } = inFlightSetup({ autoContinue: false, autoDiscover: false, fallbacks: ["openrouter"] });
+	t.ctx.ui.setEditorText = () => {};
+	t.ctx.ui.getEditorText = () => "";
+	try {
+		await t.fire("session_start");
+		await fail();
+		assert.match(t.rec.notifies.at(-1) ?? "", /automatic retry is disabled/);
+		assert.deepEqual(await t.input("during the 402 wait"), { action: "handled" });
+		assert.match(t.rec.notifies.at(-1) ?? "", /prompt was not sent because openrouter.*Retry-After/);
+		assert.deepEqual(await withClock(1_500, () => t.input("after the 402 wait")), { action: "continue" });
+		assert.equal(t.readState().exhaustedUntilByProvider?.openrouter, undefined, "still nothing persisted");
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("a cached 402 Retry-After cannot set the deadline of an explicit final 429", async () => {
+	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
+	try {
+		await t.fire("after_provider_response", { status: 402, headers: { "retry-after": "3600" } });
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id,
+			"429 rate_limit_error: This request would exceed your account's rate limit");
+		t.ctx.ui.setEditorText = () => {};
+		t.ctx.ui.getEditorText = () => "";
+		assert.deepEqual(await withClock(5_000, () => t.input("inside the default window")), { action: "handled" });
+		assert.doesNotMatch(t.rec.notifies.at(-1) ?? "", /Retry-After/, "the 402 hint is not attributed to the 429");
+		assert.deepEqual(await withClock(61_000, () => t.input("after the default window")), { action: "continue" });
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("a cached 429 Retry-After cannot set the deadline of a 402 in-flight refusal", async () => {
+	const { t } = inFlightSetup({ autoContinue: false, autoDiscover: false, fallbacks: ["openrouter"] });
+	try {
+		await t.fire("session_start");
+		await t.fire("after_provider_response", { status: 429, headers: { "retry-after": "3600" } });
+		await finishError(t, "openrouter", "ai21/jamba-large-1.7", IN_FLIGHT_402);
+		assert.match(t.rec.notifies.at(-1) ?? "", /did not send a usable Retry-After/);
+		assert.deepEqual(await t.input("no 402 deadline to wait for"), { action: "continue" });
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("text that only starts with / or ! is a prompt and faces the wait gate; real commands do not", async () => {
+	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
+	t.pi.getCommands = () => [{ name: "multi-account", source: "extension" }, { name: "review", source: "prompt" }];
+	try {
+		await t.fire("after_provider_response", { status: 429, headers: { "Retry-After": "120" } });
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
+		t.ctx.ui.setEditorText = () => {};
+		t.ctx.ui.getEditorText = () => "";
+		t.ctx.mode = "tui";
+		assert.deepEqual(await t.input("/tmp/Second request text"), { action: "handled" });
+		assert.deepEqual(await t.input("/unknown-thing please"), { action: "handled" });
+		assert.deepEqual(await t.input("/multi-account status"), { action: "continue" });
+		assert.deepEqual(await t.input("/model"), { action: "continue" });
+		assert.deepEqual(await t.input("!ls"), { action: "continue" });
+		const realWrite = process.stderr.write;
+		const realExit = process.exitCode;
+		try {
+			process.stderr.write = (() => true) as any;
+			for (const mode of ["print", "json", "rpc"]) {
+				t.ctx.mode = mode;
+				t.ctx.hasUI = mode === "rpc";
+				assert.deepEqual(await t.input("/tmp/Second request text"), { action: "handled" }, mode);
+				assert.deepEqual(await t.input("!ls"), { action: "handled" }, `${mode}: no shell shortcut outside the TUI`);
+				assert.deepEqual(await t.input("/model"), { action: "handled" }, `${mode}: TUI built-ins are prompts here`);
+				assert.deepEqual(await t.input("/multi-account status"), { action: "continue" }, `${mode}: registered command`);
+			}
+		} finally {
+			process.stderr.write = realWrite;
+			process.exitCode = realExit;
+		}
+	} finally { t.ctx.mode = undefined; t.ctx.hasUI = undefined; await t.fire("session_shutdown"); }
+});
+
+for (const streamingBehavior of ["steer", "followUp"]) test(`a busy ${streamingBehavior} input cannot bypass the wait gate`, async () => {
+	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
+	try {
+		await t.fire("after_provider_response", { status: 429, headers: { "Retry-After": "120" } });
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
+		t.ctx.ui.setEditorText = () => {};
+		t.ctx.ui.getEditorText = () => "";
+		t.setIdle(false);
+		const result = await t.fire("input", { type: "input", text: "queued while busy", source: "interactive", streamingBehavior });
+		assert.deepEqual(result, { action: "handled" });
+	} finally { await t.fire("session_shutdown"); }
+});
+
+test("an embedding SDK host in print mode with a UI gets the notice and keeps its exit status", async () => {
+	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
+	const writes: string[] = [];
+	const realWrite = process.stderr.write;
+	const realExit = process.exitCode;
+	try {
+		await t.fire("after_provider_response", { status: 429, headers: { "Retry-After": "120" } });
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
+		t.ctx.mode = "print";
+		t.ctx.hasUI = true;
+		const editor: string[] = [];
+		t.ctx.ui.setEditorText = (text: string) => { editor.push(text); };
+		t.ctx.ui.getEditorText = () => "";
+		process.exitCode = undefined;
+		process.stderr.write = ((chunk: any) => { writes.push(String(chunk)); return true; }) as any;
+		assert.deepEqual(await t.input("embedded prompt"), { action: "handled" });
+		process.stderr.write = realWrite;
+		assert.match(t.rec.notifies.at(-1) ?? "", /prompt was not sent because claude-code.*Send it again/);
+		assert.equal(process.exitCode, undefined, "the host owns its exit status");
+		assert.doesNotMatch(writes.join(""), /prompt was not sent/);
+		assert.deepEqual(editor, [], "print mode has no editor to restore into");
+	} finally {
+		process.stderr.write = realWrite;
+		process.exitCode = realExit;
+		t.ctx.mode = undefined;
+		await t.fire("session_shutdown");
+	}
+});
+
+test("reset <provider> after the write commits never reports 'Nothing was changed' when adoption fails", async () => {
+	const target = EXTERNAL_CLAUDE_MODEL.provider;
+	const until = Date.now() + 60 * 60_000;
+	const t = setup({ current: EXTERNAL_CLAUDE_MODEL, seedState: { stateVersion: 5,
+		exhaustedUntilByProvider: { [target]: until } } });
+	try {
+		await t.fire("session_start");
+		// Another session writes a catalog entry this build cannot read.
+		const disk = t.readState();
+		disk.codexModelCatalogByProvider = { ...(disk.codexModelCatalogByProvider ?? {}),
+			"openai-codex-account-9": { fetchedAt: Date.now(), models: "not-an-array" } };
+		writeFileSync(STATE, JSON.stringify(disk));
+		await t.command(`reset ${target}`);
+		assert.doesNotMatch(t.rec.notifies.join("\n"), /Nothing was changed/);
+		assert.match(t.rec.notifies.at(-1) ?? "", /cleared cooldowns for claude-code/);
+		const state = t.readState();
+		assert.equal(state.exhaustedUntilByProvider?.[target], undefined, "the reset is on disk");
+		assert.equal(state.codexModelCatalogByProvider?.["openai-codex-account-9"]?.models, "not-an-array",
+			"the sibling's entry is left alone");
+		await finishError(t, "anthropic", "claude-opus-4-8", "503 service unavailable");
+		assert.equal(t.readState().exhaustedUntilByProvider?.[target], undefined, "a later write does not resurrect it");
+		assert.equal(t.readState().codexModelCatalogByProvider?.["openai-codex-account-9"]?.models, "not-an-array");
 	} finally { await t.fire("session_shutdown"); }
 });
 

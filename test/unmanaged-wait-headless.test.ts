@@ -19,12 +19,13 @@ const model = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
 
-test("real Pi print mode rejects a prompt during an unmanaged wait visibly, not silently", async () => {
+async function waitingSession() {
 	writeFileSync(join(dir, "auth.json"), JSON.stringify({ "claude-code": { type: "api_key", key: "fixture-only" } }));
 	writeFileSync(join(dir, "provider-failover.json"), JSON.stringify({
 		includeCursor: false, childProxy: false, autoDiscover: false, autoDiscoverModels: false, showUsage: false,
 		autoContinue: false, fallbacks: ["claude-code"],
 	}));
+	writeFileSync(join(dir, "provider-failover-state.json"), "{}\n");
 	const requests: string[] = [];
 	const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
 	const loader = new DefaultResourceLoader({ cwd: dir, agentDir: dir, settingsManager: settings,
@@ -54,28 +55,70 @@ test("real Pi print mode rejects a prompt during an unmanaged wait visibly, not 
 	const result = await createAgentSession({ cwd: dir, agentDir: dir, resourceLoader: loader,
 		settingsManager: settings, sessionManager: SessionManager.inMemory(dir), model, tools: [] });
 	assert.deepEqual(result.extensionsResult.errors, []);
-	const session = result.session;
-	const stderr: string[] = [];
+	return { session: result.session, requests };
+}
+
+function captureStderr() {
+	const chunks: string[] = [];
 	const realWrite = process.stderr.write;
+	process.stderr.write = ((chunk: any) => { chunks.push(String(chunk)); return true; }) as any;
+	return { output: () => chunks.join(""), restore: () => { process.stderr.write = realWrite; } };
+}
+
+test("real Pi print mode rejects a prompt during an unmanaged wait visibly, not silently", async () => {
+	const { session, requests } = await waitingSession();
 	const realExit = process.exitCode;
+	let stderr: ReturnType<typeof captureStderr> | undefined;
 	try {
 		await session.bindExtensions({ mode: "print", onError: (error: any) => { throw new Error(JSON.stringify(error)); } });
 		assert.equal(session.extensionRunner.hasUI(), false, "print mode runs with Pi's no-op UI");
 		await session.prompt("First request");
 		assert.deepEqual(requests, ["claude-code"]);
-		process.stderr.write = ((chunk: any) => { stderr.push(String(chunk)); return true; }) as any;
+		stderr = captureStderr();
 		await session.prompt("Second request text");
-		process.stderr.write = realWrite;
-		assert.deepEqual(requests, ["claude-code"], "the second prompt is not sent during Retry-After");
-		const output = stderr.join("");
-		assert.match(output, /prompt was not sent because claude-code/);
+		// Print mode sends a leading slash path as a prompt, so it faces the same gate.
+		await session.prompt("/tmp/Second request text");
+		stderr.restore();
+		assert.deepEqual(requests, ["claude-code"], "neither prompt is sent during Retry-After");
+		const output = stderr.output();
+		assert.equal(output.match(/prompt was not sent because claude-code/g)?.length, 2);
 		assert.doesNotMatch(output, /Second request text/);
 		assert.equal(process.exitCode, 1, "print mode reports the rejection through its exit status");
 		const log = readFileSync(join(dir, "provider-failover-debug.log"), "utf8");
 		assert.match(log, /prompt_rejected_during_wait/);
 		assert.doesNotMatch(log, /Second request text|First request/, "prompt content never reaches the log");
 	} finally {
-		process.stderr.write = realWrite;
+		stderr?.restore();
+		process.exitCode = realExit;
+		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+		session.dispose();
+	}
+});
+
+test("an embedding SDK host in print mode with its own UI gets the notice and keeps its exit status", async () => {
+	const { session, requests } = await waitingSession();
+	const realExit = process.exitCode;
+	const notices: string[] = [];
+	const ui: any = new Proxy({ notify: (message: string) => { notices.push(message); },
+		getEditorText: () => "", setEditorText: () => {} }, {
+		get: (target, key) => key in target ? (target as any)[key] : () => undefined,
+	});
+	let stderr: ReturnType<typeof captureStderr> | undefined;
+	try {
+		await session.bindExtensions({ mode: "print", uiContext: ui,
+			onError: (error: any) => { throw new Error(JSON.stringify(error)); } });
+		assert.equal(session.extensionRunner.hasUI(), true);
+		await session.prompt("First request");
+		process.exitCode = undefined;
+		stderr = captureStderr();
+		await session.prompt("Second request text");
+		stderr.restore();
+		assert.deepEqual(requests, ["claude-code"]);
+		assert.ok(notices.some(notice => /prompt was not sent because claude-code/.test(notice)), "the host UI is told");
+		assert.doesNotMatch(stderr.output(), /prompt was not sent/);
+		assert.equal(process.exitCode, undefined, "an embedding host owns process.exitCode");
+	} finally {
+		stderr?.restore();
 		process.exitCode = realExit;
 		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 		session.dispose();
