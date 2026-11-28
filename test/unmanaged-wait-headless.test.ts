@@ -19,6 +19,8 @@ const model = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
 
+const commandRuns: string[] = [];
+
 async function waitingSession() {
 	writeFileSync(join(dir, "auth.json"), JSON.stringify({ "claude-code": { type: "api_key", key: "fixture-only" } }));
 	writeFileSync(join(dir, "provider-failover.json"), JSON.stringify({
@@ -31,6 +33,7 @@ async function waitingSession() {
 	const loader = new DefaultResourceLoader({ cwd: dir, agentDir: dir, settingsManager: settings,
 		noExtensions: true, noSkills: true, noPromptTemplates: true,
 		extensionFactories: [(pi) => {
+			pi.registerCommand("fixture-cmd", { description: "fixture", handler: async (args: string) => { commandRuns.push(args); } });
 			pi.registerProvider(model.provider, {
 				api: "openai-completions", baseUrl: model.baseUrl, apiKey: "fixture-only", models: [model],
 				streamSimple: (selected: any, _context: any, options: any) => {
@@ -83,7 +86,8 @@ test("real Pi print mode rejects a prompt during an unmanaged wait visibly, not 
 		const output = stderr.output();
 		assert.equal(output.match(/prompt was not sent because claude-code/g)?.length, 2);
 		assert.doesNotMatch(output, /Second request text/);
-		assert.equal(process.exitCode, 1, "print mode reports the rejection through its exit status");
+		// pi -p and an SDK host that binds print mode without a UI look the same to an extension.
+		assert.equal(process.exitCode, realExit, "the exit status is left to the host");
 		const log = readFileSync(join(dir, "provider-failover-debug.log"), "utf8");
 		assert.match(log, /prompt_rejected_during_wait/);
 		assert.doesNotMatch(log, /Second request text|First request/, "prompt content never reaches the log");
@@ -120,6 +124,33 @@ test("an embedding SDK host in print mode with its own UI gets the notice and ke
 	} finally {
 		stderr?.restore();
 		process.exitCode = realExit;
+		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+		session.dispose();
+	}
+});
+
+test("real Pi: a registered command runs before the gate; command-looking text that reaches it is held", async () => {
+	const { session, requests } = await waitingSession();
+	let stderr: ReturnType<typeof captureStderr> | undefined;
+	try {
+		await session.bindExtensions({ mode: "print", onError: (error: any) => { throw new Error(JSON.stringify(error)); } });
+		await session.prompt("First request");
+		assert.deepEqual(requests, ["claude-code"]);
+		commandRuns.length = 0;
+		stderr = captureStderr();
+		// Pi consumes the real command before any input hook runs.
+		await session.prompt("/fixture-cmd real");
+		assert.deepEqual(commandRuns, ["real"]);
+		// These reach the hook, and Pi would send each to the model as text.
+		await session.prompt(" /fixture-cmd leading space");
+		await session.prompt("\t/fixture-cmd leading tab");
+		await session.prompt("/fixture-cmd raw", { expandPromptTemplates: false });
+		stderr.restore();
+		assert.deepEqual(commandRuns, ["real"], "none of them ran the command");
+		assert.deepEqual(requests, ["claude-code"], "and none reached the waiting provider");
+		assert.equal(stderr.output().match(/prompt was not sent because claude-code/g)?.length, 3);
+	} finally {
+		stderr?.restore();
 		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 		session.dispose();
 	}

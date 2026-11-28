@@ -7995,7 +7995,7 @@ test("a waiting provider with no ready fallback blocks preflight after the fallb
 	} finally { await t.fire("session_shutdown"); }
 });
 
-test("the wait gate keeps a newer editor draft and still blocks prompt templates, not commands", async () => {
+test("the wait gate keeps a newer editor draft and blocks everything that reaches the input hook", async () => {
 	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
 	t.pi.getCommands = () => [{ name: "review", source: "prompt" }, { name: "skill:audit", source: "skill" },
 		{ name: "multi-account", source: "extension" }];
@@ -8010,9 +8010,11 @@ test("the wait gate keeps a newer editor draft and still blocks prompt templates
 		assert.match(t.rec.notifies.at(-1) ?? "", /already had a draft/);
 		assert.deepEqual(await t.input("/review this file"), { action: "handled" });
 		assert.deepEqual(await t.input("/skill:audit"), { action: "handled" });
-		assert.deepEqual(await t.input("/multi-account status"), { action: "continue" });
-		assert.deepEqual(await t.input("/model"), { action: "continue" });
-		assert.deepEqual(await t.input("!ls"), { action: "continue" });
+		// Pi runs a real registered command before `input`, and the TUI editor runs /model and !ls
+		// before prompt(). If such text reaches this hook, Pi is about to send it to a model.
+		assert.deepEqual(await t.input("/multi-account status"), { action: "handled" });
+		assert.deepEqual(await t.input("/model"), { action: "handled" });
+		assert.deepEqual(await t.input("!ls"), { action: "handled" });
 	} finally { await t.fire("session_shutdown"); }
 });
 
@@ -8028,7 +8030,7 @@ test("a busy session cannot queue a prompt past the wait gate", async () => {
 	} finally { await t.fire("session_shutdown"); }
 });
 
-for (const mode of ["print", "json"]) test(`headless ${mode} mode rejects a waiting prompt visibly on stderr`, async () => {
+for (const mode of ["print", "json"]) test(`headless ${mode} mode rejects a waiting prompt visibly on stderr without touching the exit status`, async () => {
 	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
 	const writes: string[] = [];
 	const realWrite = process.stderr.write;
@@ -8039,12 +8041,14 @@ for (const mode of ["print", "json"]) test(`headless ${mode} mode rejects a wait
 		t.ctx.mode = mode;
 		t.ctx.hasUI = false;
 		const notices = t.rec.notifies.length;
+		process.exitCode = undefined;
 		process.stderr.write = ((chunk: any) => { writes.push(String(chunk)); return true; }) as any;
 		assert.deepEqual(await t.input("headless prompt text"), { action: "handled" });
 		process.stderr.write = realWrite;
 		assert.match(writes.join(""), /prompt was not sent because claude-code/);
 		assert.doesNotMatch(writes.join(""), /headless prompt text/, "the prompt itself is never echoed");
-		assert.equal(process.exitCode, 1);
+		// pi -p and an SDK host binding print mode without a UI are indistinguishable here.
+		assert.equal(process.exitCode, undefined, "the exit status is left to the host");
 		assert.ok(!t.rec.notifies.slice(notices).some(n => /prompt was not sent/.test(n)),
 			"the rejection cannot depend on a no-op UI notify");
 		assert.doesNotMatch(readFileSync(DEBUG_LOG, "utf8"), /headless prompt text/);
@@ -8114,19 +8118,25 @@ test("a stale 429 Retry-After cannot be borrowed by an in-flight 402", async () 
 	} finally { await t.fire("session_shutdown"); }
 });
 
-function inFlightSetup(config: Record<string, unknown> = {}) {
+function inFlightSetup(config: Record<string, unknown> = {}, extra: Partial<Parameters<typeof setup>[0]> = {}) {
 	const model = { provider: "openrouter", id: "ai21/jamba-large-1.7" };
 	const t = setup({ accounts: { ...TWO_ACCOUNTS, openrouter: { type: "api_key", key: "or-key" } },
-		current: model, config: { transientCooldownMs: 25, pendingPollMs: 25, ...config } });
-	const branch: any[] = [{ type: "message", message: { role: "user" } }];
+		current: model, config: { transientCooldownMs: 25, pendingPollMs: 25, ...config }, ...extra });
+	let nextId = 0;
+	// Pi's SessionManager wraps each message in an entry with its own id; the message object is the same.
+	const branch: any[] = [{ type: "message", id: `e${nextId++}`, message: { role: "user" } }];
+	const append = (message: any) => { branch.push({ type: "message", id: `e${nextId++}`, message }); };
 	t.ctx.sessionManager = { getBranch: () => branch };
 	const fail = async () => {
 		await t.fire("after_provider_response", { status: 402, headers: { "retry-after": "1" } });
-		const error = await finishError(t, model.provider, model.id, IN_FLIGHT_402);
-		branch.push({ type: "message", message: error });
-		return error;
+		const message = assistantError(model.provider, model.id, IN_FLIGHT_402);
+		await t.fire("message_end", { message });
+		append(message);
+		t.setIdle(true);
+		await t.fire("agent_end", { messages: [message] });
+		return message;
 	};
-	return { t, model, branch, fail, resumed: () => t.rec.continueCalls.length + t.rec.sent.length };
+	return { t, model, branch, append, fail, resumed: () => t.rec.continueCalls.length + t.rec.sent.length };
 }
 
 for (const answered of [false, true]) test(`an in-flight 402 with Retry-After retries the same route only if the task is ${answered ? "already answered" : "still unanswered"}`, async () => {
@@ -8136,7 +8146,7 @@ for (const answered of [false, true]) test(`an in-flight 402 with Retry-After re
 		await fail();
 		assert.equal(t.readState().pendingFrom, undefined, "the session-local retry marker is never persisted");
 		assert.equal(t.readState().exhaustedUntilByProvider?.openrouter, undefined);
-		if (answered) branch.push({ type: "message", message: { role: "assistant", stopReason: "stop" } });
+		if (answered) branch.push({ type: "message", id: "answer", message: { role: "assistant", stopReason: "stop" } });
 		await wait(1_400);
 		if (answered) assert.equal(resumed(), 0, "an answered task is never replayed");
 		else assert.ok(resumed() > 0, "the unanswered task is retried at the server's deadline");
@@ -8165,7 +8175,7 @@ test("an in-flight 402 retry fails closed when the branch API disappears or no l
 			await fail();
 			if (mutate === "drop-api") t.ctx.sessionManager = {};
 			else if (mutate === "throws") t.ctx.sessionManager = { getBranch: () => { throw new Error("gone"); } };
-			else branch.push({ type: "message", message: { role: "assistant", stopReason: "error",
+			else branch.push({ type: "message", id: "later", message: { role: "assistant", stopReason: "error",
 				provider: "openrouter", model: "ai21/jamba-large-1.7", timestamp: -1 } });
 			await wait(1_300);
 			assert.equal(resumed(), 0, `${mutate}: no dispatch without the exact failed turn`);
@@ -8182,7 +8192,7 @@ test("an in-flight 402 retry answered during the model switch does not dispatch 
 		t.setCurrent("anthropic", "claude-opus-4-8");
 		const realSetModel = t.pi.setModel;
 		t.pi.setModel = async (model: any) => {
-			branch.push({ type: "message", message: { role: "assistant", stopReason: "stop" } });
+			branch.push({ type: "message", id: "answer", message: { role: "assistant", stopReason: "stop" } });
 			return realSetModel(model);
 		};
 		await wait(1_400);
@@ -8191,6 +8201,67 @@ test("an in-flight 402 retry answered during the model switch does not dispatch 
 		await wait(200);
 		assert.equal(resumed(), 0);
 	} finally { await t.fire("session_shutdown"); }
+});
+
+test("an in-flight 402 retry fails closed when another branch entry collides with the failed turn", async () => {
+	for (const collision of ["copy-of-turn", "same-object-new-entry"] as const) {
+		const { t, branch, fail, resumed } = inFlightSetup();
+		try {
+			await t.fire("session_start");
+			const failed = await fail();
+			// A different turn with the same provider, model and timestamp (a fork, an import, a
+			// restored copy), or the same object re-appended under another entry id.
+			const last = branch.pop();
+			if (collision === "copy-of-turn") branch.push({ type: "message", id: "copy", message: { ...failed } }, last);
+			else branch.push({ type: "message", id: "other-entry", message: failed });
+			await wait(1_300);
+			assert.equal(resumed(), 0, `${collision}: an ambiguous binding never dispatches`);
+			assert.equal(t.readState().pendingFrom, undefined);
+		} finally { await t.fire("session_shutdown"); }
+	}
+});
+
+test("an in-flight 402 retry never injects a prompt when continueAgent rejects, even if the task was answered meanwhile", async () => {
+	for (const message of ["Cannot continue from message role: assistant", "host refused"]) {
+		let branchRef: any[] = [];
+		const { t, branch, fail } = inFlightSetup({}, { continueThrows: message });
+		branchRef = branch;
+		const realContinue = t.pi.continueAgent;
+		t.pi.continueAgent = async (options: any) => {
+			// Another route answers while the host is refusing to continue.
+			branchRef.push({ type: "message", id: "answer", message: { role: "assistant", stopReason: "stop" } });
+			return realContinue(options);
+		};
+		try {
+			await t.fire("session_start");
+			await fail();
+			await wait(1_400);
+			assert.equal(t.rec.continueCalls.length, 1, `${message}: one continue attempt`);
+			assert.equal(t.rec.sent.length, 0, `${message}: no continuation prompt is injected`);
+			assert.equal(t.readState().pendingFrom, undefined, `${message}: nothing re-armed`);
+			assert.match(t.rec.notifies.join("\n"), /could not continue the refused turn, so nothing was sent/);
+			await wait(200);
+			assert.equal(t.rec.continueCalls.length + t.rec.sent.length, 1);
+		} finally { await t.fire("session_shutdown"); }
+	}
+});
+
+test("an in-flight 402 retry does not dispatch when the host cannot select the exact failed route", async () => {
+	for (const failure of ["returns-false", "selects-other"] as const) {
+		const { t, fail, resumed } = inFlightSetup({}, failure === "returns-false"
+			? { setModelFailures: ["openrouter/ai21/jamba-large-1.7"] } : {});
+		try {
+			await t.fire("session_start");
+			await fail();
+			t.setCurrent("anthropic", "claude-opus-4-8");
+			if (failure === "selects-other") t.pi.setModel = async () => true; // reports success, changes nothing
+			await wait(1_400);
+			assert.equal(resumed(), 0, `${failure}: nothing is sent on another route`);
+			assert.equal(t.ctx.model.provider, "anthropic");
+			assert.match(t.rec.notifies.at(-1) ?? "", /could not switch back to openrouter.*nothing was sent/);
+			assert.equal(t.readState().pendingFrom, undefined);
+		} finally { await t.fire("session_shutdown"); }
+	}
 });
 
 test("an in-flight 402 deadline gates a new prompt even with auto-continue off", async () => {
@@ -8222,6 +8293,34 @@ test("a cached 402 Retry-After cannot set the deadline of an explicit final 429"
 	} finally { await t.fire("session_shutdown"); }
 });
 
+for (const [label, finalError] of [
+	["HTTP 429 Too Many Requests", "HTTP 429 Too Many Requests"],
+	["status 429", "Request failed with status code 429"],
+	["503 Service Unavailable", "503 Service Unavailable"],
+	["HTTP 503 Service Unavailable", "HTTP 503 Service Unavailable"],
+] as const) test(`a cached 402 is discarded before classification when the final error is ${label}`, async () => {
+	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
+	try {
+		await t.fire("after_provider_response", { status: 402, headers: { "retry-after": "3600" } });
+		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, finalError);
+		const log = readFileSync(DEBUG_LOG, "utf8");
+		assert.match(log, /cached_response_discarded/);
+		const classified = [...log.matchAll(/"assistant_error".*?"classified":"(\w+)"/g)].at(-1)?.[1];
+		const transient = finalError.includes("503");
+		assert.equal(classified, transient ? "transient" : "limit", "the cached 402 does not decide the class");
+		t.ctx.ui.setEditorText = () => {};
+		t.ctx.ui.getEditorText = () => "";
+		if (transient) {
+			assert.deepEqual(await withClock(5_000, () => t.input("after a 503")), { action: "continue" },
+				"a 503 sets no 402 deadline");
+		} else {
+			assert.deepEqual(await withClock(5_000, () => t.input("inside the default window")), { action: "handled" });
+			assert.doesNotMatch(t.rec.notifies.at(-1) ?? "", /Retry-After/);
+			assert.deepEqual(await withClock(61_000, () => t.input("after the default window")), { action: "continue" });
+		}
+	} finally { await t.fire("session_shutdown"); }
+});
+
 test("a cached 429 Retry-After cannot set the deadline of a 402 in-flight refusal", async () => {
 	const { t } = inFlightSetup({ autoContinue: false, autoDiscover: false, fallbacks: ["openrouter"] });
 	try {
@@ -8233,37 +8332,29 @@ test("a cached 429 Retry-After cannot set the deadline of a 402 in-flight refusa
 	} finally { await t.fire("session_shutdown"); }
 });
 
-test("text that only starts with / or ! is a prompt and faces the wait gate; real commands do not", async () => {
+test("command-looking text that reaches the input hook faces the wait gate in every mode", async () => {
 	const t = externalClaudeSetup({ autoDiscover: false, fallbacks: [EXTERNAL_CLAUDE_MODEL.provider] });
 	t.pi.getCommands = () => [{ name: "multi-account", source: "extension" }, { name: "review", source: "prompt" }];
+	const realWrite = process.stderr.write;
 	try {
 		await t.fire("after_provider_response", { status: 429, headers: { "Retry-After": "120" } });
 		await finishError(t, EXTERNAL_CLAUDE_MODEL.provider, EXTERNAL_CLAUDE_MODEL.id, EXTERNAL_CLAUDE_429);
 		t.ctx.ui.setEditorText = () => {};
 		t.ctx.ui.getEditorText = () => "";
-		t.ctx.mode = "tui";
-		assert.deepEqual(await t.input("/tmp/Second request text"), { action: "handled" });
-		assert.deepEqual(await t.input("/unknown-thing please"), { action: "handled" });
-		assert.deepEqual(await t.input("/multi-account status"), { action: "continue" });
-		assert.deepEqual(await t.input("/model"), { action: "continue" });
-		assert.deepEqual(await t.input("!ls"), { action: "continue" });
-		const realWrite = process.stderr.write;
-		const realExit = process.exitCode;
-		try {
-			process.stderr.write = (() => true) as any;
-			for (const mode of ["print", "json", "rpc"]) {
-				t.ctx.mode = mode;
-				t.ctx.hasUI = mode === "rpc";
-				assert.deepEqual(await t.input("/tmp/Second request text"), { action: "handled" }, mode);
-				assert.deepEqual(await t.input("!ls"), { action: "handled" }, `${mode}: no shell shortcut outside the TUI`);
-				assert.deepEqual(await t.input("/model"), { action: "handled" }, `${mode}: TUI built-ins are prompts here`);
-				assert.deepEqual(await t.input("/multi-account status"), { action: "continue" }, `${mode}: registered command`);
+		process.stderr.write = (() => true) as any;
+		for (const mode of ["tui", "print", "json", "rpc"]) {
+			t.ctx.mode = mode;
+			t.ctx.hasUI = mode === "tui" || mode === "rpc";
+			for (const text of ["/tmp/Second request text", "/unknown-thing please", " /multi-account status",
+				"\t/multi-account status", "/multi-account status", "/model", "!ls"]) {
+				assert.deepEqual(await t.input(text), { action: "handled" }, `${mode}: ${JSON.stringify(text)}`);
 			}
-		} finally {
-			process.stderr.write = realWrite;
-			process.exitCode = realExit;
 		}
-	} finally { t.ctx.mode = undefined; t.ctx.hasUI = undefined; await t.fire("session_shutdown"); }
+	} finally {
+		process.stderr.write = realWrite;
+		t.ctx.mode = undefined; t.ctx.hasUI = undefined;
+		await t.fire("session_shutdown");
+	}
 });
 
 for (const streamingBehavior of ["steer", "followUp"]) test(`a busy ${streamingBehavior} input cannot bypass the wait gate`, async () => {

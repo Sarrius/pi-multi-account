@@ -1123,11 +1123,6 @@ const SELECTED_FALLBACK_PENDING_PREFIX = "selected fallback:";
 // Same-route retry after a 402 in-flight budget refusal. It must not replay a task that another
 // route has already answered, so the wake re-checks the branch before it continues.
 const IN_FLIGHT_PENDING_REASON = `${TRANSIENT_PENDING_PREFIX} in-flight budget exhausted (402)`;
-// Pi 1.6 interactive built-ins (core/slash-commands.ts plus editor-only names). Pi handles them
-// in the TUI editor; RPC and print mode send the same text to the model.
-const PI_BUILTIN_SLASH_COMMANDS = new Set(["settings", "model", "tree", "thinking", "scoped-models", "export",
-	"import", "share", "bug", "copy", "name", "session", "changelog", "hotkeys", "fork", "clone", "trust",
-	"login", "logout", "new", "compact", "resume", "reload", "quit", "debug"]);
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
 // a failure of the current model (doing so would downgrade it to an older sibling on the same
@@ -3380,7 +3375,9 @@ function structuredPaymentRefusal(errorMessage: unknown): "credits" | "in_flight
 /** The HTTP status an error message names explicitly (`429 ...`, `status 429`), if any. */
 function explicitHttpStatus(errorText: unknown): number | undefined {
 	if (typeof errorText !== "string") return undefined;
-	const match = /^\s*([45]\d\d)\b/.exec(errorText) ?? /\bstatus(?: code)?[\s:=]+([45]\d\d)\b/i.exec(errorText);
+	const match = /^\s*([45]\d\d)\b/.exec(errorText) ??
+		/^\s*(?:error:\s*)?HTTP(?:\/\d(?:\.\d)?)?\s+([45]\d\d)\b/i.exec(errorText) ??
+		/\bstatus(?: code)?[\s:=]+([45]\d\d)\b/i.exec(errorText);
 	return match ? Number(match[1]) : undefined;
 }
 
@@ -4026,7 +4023,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let deferredUnmanagedModel: { provider: string; id: string } | undefined;
 	// The exact failed turn a 402 in-flight retry belongs to. Session-local and never persisted:
 	// another window or a restarted session cannot see the transcript it was bound to.
-	let inFlightRetry: { epoch: number; provider: string; model: string; timestamp: unknown } | undefined;
+	// `message` is the failed assistant object Pi appends to the session branch; `entryId` is the
+	// branch entry it landed in, recorded the first time the wake finds it.
+	let inFlightRetry: { epoch: number; provider: string; model: string; timestamp: unknown;
+		message: object; entryId?: string } | undefined;
 	const handledAssistantErrors = new Set<string>();
 	// Consecutive limit-error accounting per provider (in-memory, reset on any success). Two limit
 	// errors in a row prove the usage-% window is not seeing this account's real limit, so usage is
@@ -8460,6 +8460,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			from?: ModelRef;
 			reason?: string;
 			allowWhenAutoContinueDisabled?: boolean;
+			/**
+			 * Continue the existing turn or do nothing. Never inject a continuation prompt and
+			 * never re-arm a generic busy retry: the caller has proven a specific failed turn is
+			 * still pending, and an injected prompt would be a new task the proof does not cover.
+			 */
+			continueOnly?: boolean;
 		},
 	): Promise<boolean> {
 		const resumeEpoch = chainEpoch;
@@ -8475,6 +8481,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				}) => Promise<void>;
 			}
 		).continueAgent;
+		if (typeof continueAgent !== "function" && resumeFrom?.continueOnly) {
+			logEvent("continue_only_declined", { reason: "host has no pi.continueAgent" });
+			return false;
+		}
+		if (resumeFrom?.continueOnly && !ctx.isIdle()) {
+			logEvent("continue_only_declined", { reason: "session busy" });
+			return false;
+		}
 		if (typeof continueAgent !== "function") {
 			// Host build predates pi.continueAgent() (seamless in-place resume was added in a later
 			// @earendil-works/pi-coding-agent). Do NOT dead-end the failover with a red error that
@@ -8552,6 +8566,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// "Cannot continue from message role: assistant" means the transcript tail is a
 			// COMPLETED assistant message (a finished reply OR a turn we aborted for recovery),
 			// so continueAgent cannot pick it up.
+			if (resumeFrom?.continueOnly) {
+				// The host refused to continue the bound turn. Whatever the reason, the proof that
+				// this exact turn is pending no longer stands; do not start a new one.
+				logEvent("continue_only_declined", { reason: "continueAgent rejected" });
+				return false;
+			}
 			if (/cannot continue from message role/i.test(text)) {
 				// If a switch/recovery is genuinely in progress, the work is NOT done — inject the
 				// continuation prompt as a user message instead. That always starts a turn, so the
@@ -9037,16 +9057,29 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					automaticModelTarget = same;
 					if (onlyActiveModels) unhideProvider(sourceModel.provider);
 					internalModelChanges++;
+					let selected: unknown;
 					try {
-						await pi.setModel(
+						selected = await pi.setModel(
 							ctx.modelRegistry.find(sourceModel.provider, sourceModel.id) ?? {
 								provider: sourceModel.provider,
 								id: sourceModel.id,
 							},
 						);
+					} catch (error) {
+						if (!inFlight) throw error;
+						selected = false;
 					} finally {
 						internalModelChanges--;
 						if (automaticModelTarget === same) automaticModelTarget = undefined;
+					}
+					if (inFlight && (selected === false || ctx.model?.provider !== sourceModel.provider ||
+						ctx.model?.id !== sourceModel.id)) {
+						// The retry is valid only on the exact route that refused. Any other model is a
+						// different request the 402 says nothing about.
+						inFlightRetry = undefined;
+						logEvent("in_flight_retry_skipped", { reason: "route not selected" });
+						if (epoch === chainEpoch && !sessionClosed) ctx.ui.notify(`Provider retry: could not switch back to ${same} for the in-flight budget retry, so nothing was sent. Select it and send the message again.`, "warning");
+						return;
 					}
 				}
 				// Same-account resume: no rotation happened, so there is no currentPromptSwitch.
@@ -9063,9 +9096,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						logEvent("in_flight_retry_skipped", { reason: "failed turn answered before dispatch" });
 						return;
 					}
-					const resumed = await resumeWithExistingContext(ctx, { from: same, reason: resumeReason });
+					if (ctx.model?.provider !== sourceModel.provider || ctx.model?.id !== sourceModel.id) {
+						logEvent("in_flight_retry_skipped", { reason: "route not selected" });
+						return;
+					}
+					const resumed = await resumeWithExistingContext(ctx, { from: same, reason: resumeReason, continueOnly: true });
 					if (!resumed && epoch === chainEpoch && !sessionClosed) {
 						logEvent("in_flight_retry_skipped", { reason: "resume declined" });
+						ctx.ui.notify(`Provider retry: ${same} could not continue the refused turn, so nothing was sent. Send the message again.`, "warning");
 					}
 					return;
 				}
@@ -9276,20 +9314,49 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	function inFlightRetryStillBound(ctx: any): boolean {
 		const bound = inFlightRetry;
 		if (!bound || bound.epoch !== chainEpoch || sessionClosed || userAbortedChain) return false;
-		let branch: unknown;
+		if (bound.entryId === undefined && !bindInFlightRetryEntry(ctx)) return false;
+		const branch = inFlightBranch(ctx);
+		if (!branch) return false;
+		const candidates = inFlightCandidates(branch, bound);
+		if (candidates.length !== 1) return false;
+		const [entry] = candidates;
+		if (entry.id !== bound.entryId || entry.message !== bound.message || entry.message.stopReason !== "error") return false;
+		let last: any;
+		for (let i = branch.length - 1; i >= 0 && !last; i--) if (branch[i]?.type === "message") last = branch[i];
+		return last === entry;
+	}
+
+	function inFlightBranch(ctx: any): any[] | undefined {
 		try {
-			branch = typeof ctx?.sessionManager?.getBranch === "function" ? ctx.sessionManager.getBranch() : undefined;
-		} catch { return false; }
-		if (!Array.isArray(branch)) return false;
-		for (let i = branch.length - 1; i >= 0; i--) {
-			const entry = branch[i];
-			if (entry?.type !== "message") continue;
-			const message = entry.message;
-			return message?.role === "assistant" && message.stopReason === "error" &&
-				message.provider === bound.provider && message.model === bound.model &&
-				message.timestamp === bound.timestamp;
+			const branch = typeof ctx?.sessionManager?.getBranch === "function" ? ctx.sessionManager.getBranch() : undefined;
+			return Array.isArray(branch) ? branch : undefined;
+		} catch { return undefined; }
+	}
+
+	/** Every branch entry that could be the failed turn: the same object, or one that looks like it. */
+	function inFlightCandidates(branch: any[], bound: NonNullable<typeof inFlightRetry>) {
+		return branch.filter(entry => entry?.type === "message" && (entry.message === bound.message ||
+			(entry.message?.role === "assistant" && entry.message.provider === bound.provider &&
+				entry.message.model === bound.model && entry.message.timestamp === bound.timestamp)));
+	}
+
+	/**
+	 * Record the branch entry id of the failed turn. Exactly one entry may match, it must hold the
+	 * very message object that failed, and it must have an id; otherwise the retry is dropped.
+	 */
+	function bindInFlightRetryEntry(ctx: any): boolean {
+		const bound = inFlightRetry;
+		if (!bound) return false;
+		const branch = inFlightBranch(ctx);
+		const candidates = branch ? inFlightCandidates(branch, bound) : [];
+		const entry = candidates.length === 1 ? candidates[0] : undefined;
+		if (!entry || entry.message !== bound.message || typeof entry.id !== "string" || !entry.id) {
+			logEvent("in_flight_retry_skipped", { reason: "failed turn has no unique branch entry" });
+			inFlightRetry = undefined;
+			return false;
 		}
-		return false;
+		bound.entryId = entry.id;
+		return true;
 	}
 
 	/**
@@ -9304,7 +9371,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	async function handleInFlightBudgetRefusal(
 		ctx: any,
 		failedModel: { provider: string; id: string },
-		failedTurn: { timestamp?: unknown },
+		failedTurn: { timestamp?: unknown } & object,
 		refusal: { status: number; retryAt?: number } | undefined,
 	) {
 		const target = `${failedModel.provider}/${failedModel.id}`;
@@ -9328,7 +9395,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		inFlightRetry = { epoch: chainEpoch, provider: failedModel.provider, model: failedModel.id,
-			timestamp: failedTurn.timestamp };
+			timestamp: failedTurn.timestamp, message: failedTurn };
 		setPendingContinuation(ctx, failedModel, IN_FLIGHT_PENDING_REASON,
 			{ retryDelayMs: Math.max(0, retryAt - Date.now()), sessionOnly: true });
 	}
@@ -9399,23 +9466,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return Math.max(MIN_PENDING_WAKE_MS, nextAt - now);
 	}
 
-	/**
-	 * Input that Pi runs locally instead of sending to a model. A leading `/` or `!` alone proves
-	 * nothing: a print-mode prompt such as `/tmp/notes.txt` is ordinary model input. Local means a
-	 * registered extension command, a built-in command of the interactive editor, or an
-	 * interactive `!` shell shortcut. Prompt templates and skills expand into a model prompt, so
-	 * they are never local.
-	 */
-	function isLocalCommandInput(ctx: any, text: string): boolean {
-		const interactive = ctx?.mode === undefined || ctx.mode === "tui";
-		if (/^\s*!/.test(text)) return interactive;
-		const match = /^\s*\/(\S+)/.exec(text);
-		if (!match) return false;
-		let commands: Array<{ name?: string; source?: string }> = [];
-		try { commands = (pi as any).getCommands?.() ?? []; } catch { commands = []; }
-		if (commands.some(command => command?.name === match[1] && command.source === "extension")) return true;
-		return interactive && PI_BUILTIN_SLASH_COMMANDS.has(match[1]);
-	}
 
 	/**
 	 * The provider the user is waiting on, when no other route is ready right now. That is the
@@ -9444,8 +9494,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * kept in extension memory. TUI: put it back in the editor only if the editor is empty, so a
 	 * newer draft is never overwritten. RPC, or an embedding SDK host with a UI: notify; the
 	 * client still holds what it sent. Headless print/JSON (Pi's no-op UI, `hasUI` false): write
-	 * to stderr and mark the run as failed. An embedding host owns its process exit status, so it
-	 * is only touched when Pi itself runs headless.
+	 * to stderr. `process.exitCode` is never touched: `pi -p` and an SDK host that binds print mode
+	 * without a UI look the same to an extension, and the embedding host owns its exit status.
 	 */
 	function rejectPromptDuringWait(ctx: any, text: string, images: any[] | undefined,
 		wait: { provider: string; until: number; hinted: boolean }) {
@@ -9471,7 +9521,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		logEvent("prompt_rejected_during_wait", { provider: wait.provider, until: wait.until, mode: mode ?? "unknown", restored });
 		if (headless) {
 			process.stderr.write(`${notice}\n`);
-			if (mode === "print" || mode === "json") process.exitCode = 1;
 		} else {
 			ctx.ui.notify(notice, "warning");
 		}
@@ -12953,11 +13002,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return { action: "continue" as const };
 		const text =
 			typeof (event as any).text === "string" ? (event as any).text : "";
-		// Real local commands belong to Pi itself. Holding them in the cooldown queue makes /login,
-		// /model, /export, and even recovery commands appear completely broken. Everything else,
-		// including prompt templates, skills and text that merely starts with `/` or `!`, becomes a
-		// model request and faces the wait gate below.
-		if (isLocalCommandInput(ctx, text)) return { action: "continue" as const };
+		// Local commands never reach this hook. AgentSession.prompt() runs a registered extension
+		// command before emitting `input`, and the TUI editor handles its built-ins (/model, /login)
+		// and `!` shell shortcuts before calling prompt() (Pi 0.85.1, 1.4.0, 1.6.0). Whatever
+		// arrives here goes to a model: prompt templates, skills, text that only starts with `/` or
+		// `!`, a command name after leading whitespace, prompt(..., { expandPromptTemplates: false }),
+		// or an Alt+Enter follow-up while streaming. Matching names here would let those through.
 		claimUserControl("interactive input");
 		noteRecoveryProgress(); // a fresh user prompt → clean slate, re-enable auto-continue
 		// A manual choice is owed ONE message. This is the next one, so a reprieve that already
@@ -13349,9 +13399,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// errors from unmanaged providers that are NOT the model the user is currently on (those
 		// are unrelated background errors we must not hijack).
 		const managed = !!classifyProvider(provider, config.qwenProvider);
-		const externalRefusal = unmanagedRefusal?.model === ref(provider, modelId) && unmanagedRefusal.epoch === chainEpoch
+		const cachedRefusal = unmanagedRefusal?.model === ref(provider, modelId) && unmanagedRefusal.epoch === chainEpoch
 			? unmanagedRefusal : undefined;
-		if (externalRefusal) unmanagedRefusal = undefined;
+		if (cachedRefusal) unmanagedRefusal = undefined;
+		// A cached response only speaks for this error if the final error does not name another
+		// HTTP status. Decide before classification: a cached 402 must not turn a final 503 into a
+		// limit, and its Retry-After must not set the deadline of a final 429.
+		const finalStatus = explicitHttpStatus(errorText);
+		const externalRefusal = cachedRefusal && (finalStatus === undefined || finalStatus === cachedRefusal.status)
+			? cachedRefusal : undefined;
+		if (cachedRefusal && !externalRefusal) {
+			logEvent("cached_response_discarded", { provider, model: modelId, cached: cachedRefusal.status, final: finalStatus });
+		}
 		const isCurrentModelProvider = provider === ctx.model?.provider;
 		if (!managed && !isCurrentModelProvider) return;
 		// A manual selection owns the route. Automatic preflight may also have moved ctx.model,
@@ -13432,14 +13491,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				return;
 			}
 			if (failureKind === "limit" && !hasTelemetry) {
-				// A cached response only speaks for this error if the error does not name another
-				// status: a 402's Retry-After cannot set the deadline of an explicit final 429.
-				const finalStatus = explicitHttpStatus(errorText);
-				const attributable = externalRefusal && (finalStatus === undefined || finalStatus === externalRefusal.status)
-					? externalRefusal : undefined;
-				const retryAt = attributable?.retryAt;
+				const retryAt = externalRefusal?.retryAt;
 				// A fixed deadline from the refusal itself. Later prompts cannot move it.
-				const until = retryAt ?? (attributable?.at ?? Date.now()) + config.transientCooldownMs;
+				const until = retryAt ?? (externalRefusal?.at ?? Date.now()) + config.transientCooldownMs;
 				unmanagedLimitBackoffs.set(provider, { until, hinted: retryAt !== undefined, refusedThisTask: true });
 				if (autoContinuesThisPrompt === 0 && !deferredUnmanagedModel) {
 					deferredUnmanagedModel = { provider, id: modelId };
@@ -13581,6 +13635,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	});
 
 	safeOn("agent_end", async (event, ctx) => {
+		// Pi appends the failed turn to the branch after message_end; bind its entry id now, before
+		// any later entry can make the binding ambiguous.
+		if (inFlightRetry && inFlightRetry.entryId === undefined) bindInFlightRetryEntry(ctx);
 		if (!isAccountChatModel(ctx.model)) return;
 		if (!automaticFailoverEnabled()) return;
 		const messages = (event as any).messages ?? [];
